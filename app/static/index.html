@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FO Intelligence Agent — Lead Qualification</title>
+<style>
+  :root {
+    --ink: #14171c;
+    --ink-soft: #1c2028;
+    --paper: #eef0f0;
+    --paper-soft: #e2e5e4;
+    --text: #1b1f23;
+    --text-dim: #52585f;
+    --line: #d3d7d6;
+    --accent: #b8862e;
+    --accent-text: #7a5a1c;
+    --reject: #a8462f;
+    --reject-bg: #f4e3de;
+    --pursue: #3f6e52;
+    --pursue-bg: #e1ebe3;
+    --pursue-low: #5f6f7a;
+    --pursue-low-bg: #e6e9ea;
+    --phase-supervisor: #b8862e;
+    --phase-researcher: #4a6d8c;
+    --phase-tool: #5f7a6a;
+    --phase-compress: #7a5a8c;
+    --phase-verdict: #a8462f;
+  }
+
+  :root[data-theme="dark"] {
+    --text: #e7e9ea;
+    --text-dim: #9aa0a6;
+    --line: #2c3138;
+    --paper: var(--ink);
+    --paper-soft: var(--ink-soft);
+    --accent-text: #d8ac5c;
+    --reject-bg: #3a231d;
+    --pursue-bg: #1f2e24;
+    --pursue-low-bg: #262b2f;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --text: #e7e9ea;
+      --text-dim: #9aa0a6;
+      --line: #2c3138;
+      --paper: var(--ink);
+      --paper-soft: var(--ink-soft);
+      --accent-text: #d8ac5c;
+      --reject-bg: #3a231d;
+      --pursue-bg: #1f2e24;
+      --pursue-low-bg: #262b2f;
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .mono {
+    font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+
+  main {
+    max-width: 920px;
+    margin: 0 auto;
+    padding: 2.5rem 1.25rem 6rem;
+  }
+
+  header.page-head {
+    margin-bottom: 2rem;
+  }
+
+  .eyebrow {
+    font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent-text);
+    margin: 0 0 0.5rem;
+  }
+
+  h1 {
+    font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: clamp(1.5rem, 4vw, 2.1rem);
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    margin: 0 0 0.6rem;
+    text-wrap: balance;
+  }
+
+  .subhead {
+    color: var(--text-dim);
+    font-size: 0.95rem;
+    max-width: 62ch;
+    margin: 0;
+  }
+
+  .summary-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+    margin: 1.5rem 0 0;
+    padding: 1rem 1.1rem;
+    background: var(--paper-soft);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+  }
+
+  .stat {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    padding-right: 1.1rem;
+    border-right: 1px solid var(--line);
+  }
+  .stat:last-child { border-right: none; padding-right: 0; }
+
+  .stat .n {
+    font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    font-variant-numeric: tabular-nums;
+    font-size: 1.3rem;
+    font-weight: 700;
+  }
+  .stat .l {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+  }
+
+  .leads {
+    margin-top: 1.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.65rem;
+  }
+
+  details.lead {
+    background: var(--paper-soft);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+
+  details.lead[open] summary {
+    border-bottom: 1px solid var(--line);
+  }
+
+  summary.lead-head {
+    cursor: pointer;
+    list-style: none;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto auto auto;
+    align-items: center;
+    gap: 0.9rem;
+    padding: 0.85rem 1.1rem;
+    user-select: none;
+  }
+  summary.lead-head::-webkit-details-marker { display: none; }
+  summary.lead-head:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+
+  .chev {
+    width: 0.6rem;
+    height: 0.6rem;
+    border-right: 2px solid var(--text-dim);
+    border-bottom: 2px solid var(--text-dim);
+    transform: rotate(-45deg);
+    transition: transform 0.15s ease;
+    flex: none;
+  }
+  details.lead[open] .chev { transform: rotate(45deg); }
+
+  .pill {
+    font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 0.22rem 0.55rem;
+    border-radius: 4px;
+    white-space: nowrap;
+  }
+  .pill.reject { background: var(--reject-bg); color: var(--reject); }
+  .pill.pursue { background: var(--pursue-bg); color: var(--pursue); }
+  .pill.pursue_low { background: var(--pursue-low-bg); color: var(--pursue-low); }
+  .pill.queued { background: var(--pursue-low-bg); color: var(--pursue-low); }
+  .pill.running { background: var(--pursue-low-bg); color: var(--pursue-low); }
+  .pill.failed { background: var(--reject-bg); color: var(--reject); }
+
+  .lead-name {
+    font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    font-weight: 600;
+    font-size: 0.92rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .lead-meta {
+    font-size: 0.76rem;
+    color: var(--text-dim);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .reason {
+    font-size: 0.76rem;
+    color: var(--text-dim);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 22ch;
+  }
+
+  .lead-body {
+    padding: 0.9rem 1.1rem 1.2rem;
+  }
+
+  .event {
+    position: relative;
+    padding: 0.45rem 0 0.45rem 0.85rem;
+    border-left: 2px solid var(--line);
+    margin-left: 0.1rem;
+  }
+  .event + .event { margin-top: 0.15rem; }
+  .event.p-supervisor { border-left-color: var(--phase-supervisor); }
+  .event.p-researcher { border-left-color: var(--phase-researcher); }
+  .event.p-researcher_tool { border-left-color: var(--phase-tool); }
+  .event.p-compress { border-left-color: var(--phase-compress); }
+  .event.p-verdict { border-left-color: var(--phase-verdict); }
+
+  .tag {
+    font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    margin-right: 0.5rem;
+  }
+  .p-supervisor .tag { color: var(--phase-supervisor); }
+  .p-researcher .tag { color: var(--phase-researcher); }
+  .p-researcher_tool .tag { color: var(--phase-tool); }
+  .p-compress .tag { color: var(--phase-compress); }
+  .p-verdict .tag { color: var(--phase-verdict); }
+
+  .ev-body {
+    font-size: 0.86rem;
+  }
+
+  .ev-body .think {
+    font-style: italic;
+    color: var(--text-dim);
+  }
+
+  .toolcall {
+    font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.8rem;
+    display: block;
+    margin-top: 0.25rem;
+  }
+
+  .result {
+    margin-top: 0.35rem;
+    padding: 0.5rem 0.65rem;
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.76rem;
+    color: var(--text-dim);
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 9rem;
+    overflow-y: auto;
+  }
+  .result.err { color: var(--reject); border-color: var(--reject-bg); }
+
+  .claims {
+    margin: 0.35rem 0 0;
+    padding: 0;
+    list-style: none;
+  }
+  .claims li {
+    padding: 0.15rem 0;
+    font-size: 0.82rem;
+  }
+  .claims .qid {
+    font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    font-weight: 700;
+    margin-right: 0.4rem;
+  }
+  .claims .status-confirmed { color: var(--pursue); }
+  .claims .status-could_not_verify { color: var(--text-dim); }
+  .claims .status-contradicted { color: var(--reject); }
+
+  .rationale-box {
+    margin-top: 0.35rem;
+    padding: 0.55rem 0.7rem;
+    background: var(--paper);
+    border-left: 3px solid var(--phase-verdict);
+    border-radius: 0 4px 4px 0;
+    font-size: 0.85rem;
+  }
+
+  .hint {
+    font-size: 0.7rem;
+    color: var(--text-dim);
+    margin-left: 0.5rem;
+  }
+
+  ::selection { background: var(--accent); color: var(--ink); }
+
+  /* ---- start view ---- */
+  .start-card {
+    background: var(--paper-soft);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 1.6rem 1.4rem;
+    margin-top: 1.5rem;
+    max-width: 30rem;
+  }
+  .start-card .count-line {
+    font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 1.05rem;
+    margin: 0 0 0.4rem;
+  }
+  .start-card .count-line .n {
+    font-size: 1.4rem;
+    font-weight: 700;
+    color: var(--accent-text);
+  }
+  .sample-names {
+    margin: 0 0 1.4rem;
+    padding: 0;
+    list-style: none;
+    color: var(--text-dim);
+    font-size: 0.82rem;
+  }
+  .sample-names li {
+    font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    padding: 0.12rem 0;
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 0.8rem;
+    flex-wrap: wrap;
+    margin: 0.4rem 0;
+  }
+  input[type="number"] {
+    font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 1rem;
+    padding: 0.45rem 0.6rem;
+    width: 7rem;
+    background: var(--paper);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+  }
+  input[type="number"]:disabled { opacity: 0.45; }
+  label.run-all {
+    font-size: 0.86rem;
+    color: var(--text-dim);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    cursor: pointer;
+  }
+  .estimate {
+    color: var(--text-dim);
+    font-size: 0.84rem;
+    margin: 0.6rem 0 0.2rem;
+    font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  .estimate .lbl { color: var(--text-dim); }
+  button.start-btn {
+    font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.92rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 0.6rem 1.4rem;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    background: var(--accent);
+    color: var(--paper);
+    cursor: pointer;
+    margin-top: 0.8rem;
+  }
+  button.start-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .err-msg {
+    color: var(--reject);
+    font-size: 0.82rem;
+    margin-top: 0.6rem;
+  }
+  .trace-loading {
+    color: var(--text-dim);
+    font-style: italic;
+    padding: 0.6rem 0;
+  }
+</style>
+</head>
+<body>
+<main>
+  <header class="page-head">
+    <p class="eyebrow">FO Intelligence Agent — Research Layer</p>
+    <h1>Lead qualification</h1>
+    <p class="subhead">Run the research-layer graph across a slice of the discovery feed and watch each lead qualify in real time — supervisor turns, lane dispatches, tool calls, and the final verdict.</p>
+  </header>
+
+  <!-- start view -->
+  <section id="start-view">
+    <div class="start-card">
+      <p class="count-line"><span class="n" id="avail-count">…</span> leads available in the discovery data</p>
+      <ul class="sample-names" id="sample-names"></ul>
+      <div class="row">
+        <input type="number" id="count-input" placeholder="10" min="1">
+        <label class="run-all"><input type="checkbox" id="run-all-toggle"> Run all</label>
+      </div>
+      <p class="estimate" id="estimate"></p>
+      <button class="start-btn" id="start-btn" disabled>Start</button>
+      <p class="err-msg" id="err-msg" hidden></p>
+    </div>
+  </section>
+
+  <!-- results view -->
+  <section id="results-view" hidden>
+    <div class="summary-bar" id="summary-bar"></div>
+    <div class="leads" id="leads"></div>
+  </section>
+</main>
+
+<script>
+(function () {
+  // ---- copied verbatim from the validated reference trace-viewer ----
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+  function truncate(val, limit) {
+    limit = limit || 340;
+    const text = typeof val === 'string' ? val : JSON.stringify(val);
+    if (!text) return '';
+    if (text.length <= limit) return text;
+    return text.slice(0, limit) + '… [truncated, ' + text.length + ' chars total]';
+  }
+  function fmtCost(n) {
+    return '$' + Number(n || 0).toFixed(4);
+  }
+  function toolCallsInline(tcs) {
+    if (!tcs || !tcs.length) return '';
+    return tcs.map(tc => {
+      const args = Object.entries(tc.args || {}).map(([k, v]) => k + '=' + JSON.stringify(v)).join(', ');
+      return esc(tc.name) + '(' + esc(args) + ')';
+    }).join(', ');
+  }
+  function renderEvent(ev) {
+    const phase = ev.phase || '?';
+    const kind = ev.event || '?';
+    const lane = ev.lane ? '/' + ev.lane : '';
+    const tag = phase + lane;
+    let body = '';
+    if (kind === 'ai_message') {
+      const content = ev.content && ev.content.trim() ? esc(truncate(ev.content)) : '<span class="hint">(no text)</span>';
+      const turn = ev.iteration != null ? 'turn ' + ev.iteration + ': ' : '';
+      const calls = toolCallsInline(ev.tool_calls);
+      body = turn + content + (calls ? '<span class="toolcall">→ ' + calls + '</span>' : '');
+    } else if (kind === 'think') {
+      body = '<span class="think">' + esc(truncate(ev.reflection)) + '</span>';
+    } else if (kind === 'dispatch') {
+      body = '<strong>dispatch</strong> ' + esc(ev.lane) + ' — ' + esc(truncate(ev.instructions));
+    } else if (kind === 'dispatch_skipped') {
+      body = '<strong>dispatch skipped</strong> ' + esc(ev.lane) + ' (already dispatched ' + ev.already_dispatched + 'x, at cap)';
+    } else if (kind === 'tool_call') {
+      const args = Object.entries(ev.args || {}).map(([k, v]) => k + '=' + JSON.stringify(v)).join(', ');
+      const err = ev.result && ev.result.error;
+      body = '<span class="toolcall">' + esc(ev.tool) + '(' + esc(args) + ')</span>' +
+        '<div class="result' + (err ? ' err' : '') + '">' + (err ? 'ERROR: ' + esc(err) : esc(truncate(ev.result, 600))) + '</div>';
+    } else if (kind === 'compress_output') {
+      const claims = (ev.claims || []).map(c =>
+        '<li><span class="qid">' + esc(c.question_id) + '</span><span class="status-' + esc(c.status) + '">' + esc(c.status) + '</span> (' + esc(c.confidence) + ') — ' + esc(truncate(c.answer, 200)) + '</li>'
+      ).join('');
+      body = '<strong>' + (ev.claims || []).length + ' claim(s)</strong> compressed (attempt ' + ((ev.attempt || 0) + 1) + ')<ul class="claims">' + claims + '</ul>';
+    } else if (kind === 'compress_parse_failed') {
+      body = '<span class="think">compression failed twice — fell back to uncompressed / could_not_verify</span>';
+    } else if (kind === 'lane_complete') {
+      body = 'lane complete — status=<strong>' + esc(ev.lane_status) + '</strong>, ' + ev.claim_count + ' claim(s)';
+    } else if (kind === 'lane_timeout') {
+      body = '<strong>lane timed out</strong> after ' + ev.timeout_seconds + 's';
+    } else if (kind === 'lane_crash') {
+      body = '<strong>lane crashed:</strong> ' + esc(ev.error);
+    } else if (kind === 'research_complete_blocked') {
+      body = 'research_complete <strong>blocked</strong> — unanswered HARD gates: ' + esc((ev.unanswered || []).join(', '));
+    } else if (kind === 'research_complete_accepted') {
+      body = 'research_complete <strong>accepted</strong> (budget_exhausted=' + ev.budget_exhausted + ')';
+    } else if (kind === 'code_gate_reject') {
+      body = '<strong>code-gate reject</strong> — reason_code=<code>' + esc(ev.reason_code) + '</code>';
+    } else if (kind === 'verdict_output') {
+      body = '<strong>verdict: ' + esc(ev.final_verdict) + '</strong> (LLM said ' + esc(ev.llm_verdict) + ', force_low=' + ev.force_low + ')' +
+        '<div class="rationale-box">' + esc(truncate(ev.rationale, 500)) + '</div>';
+    } else {
+      body = esc(kind) + ' ' + esc(truncate(ev));
+    }
+    return '<div class="event p-' + esc(phase) + '"><span class="tag">' + esc(tag) + '</span><span class="ev-body">' + body + '</span></div>';
+  }
+  function verdictPillClass(v) {
+    return v === 'pursue' ? 'pursue' : v === 'pursue_low' ? 'pursue_low' : 'reject';
+  }
+
+  // ---- start view ----
+  const startView = document.getElementById('start-view');
+  const resultsView = document.getElementById('results-view');
+  const availCount = document.getElementById('avail-count');
+  const sampleNames = document.getElementById('sample-names');
+  const countInput = document.getElementById('count-input');
+  const runAllToggle = document.getElementById('run-all-toggle');
+  const estimate = document.getElementById('estimate');
+  const startBtn = document.getElementById('start-btn');
+  const errMsg = document.getElementById('err-msg');
+  let totalAvailable = 0;
+
+  function updateEstimate() {
+    const runAll = runAllToggle.checked;
+    const n = runAll ? totalAvailable : (parseInt(countInput.value, 10) || 0);
+    if (!n || n < 1) { estimate.textContent = ''; return; }
+    const cost = (n * 0.01).toFixed(2);
+    const mins = Math.ceil(n / 8) * 3.5;
+    estimate.innerHTML = '<span class="lbl">~$' + esc(cost) + ' estimated cost · ~' + esc(mins) + ' min estimated time</span> <span class="hint">(rough estimates, not exact)</span>';
+  }
+
+  function validate() {
+    const runAll = runAllToggle.checked;
+    let ok = true;
+    let msg = '';
+    if (runAll) {
+      if (!totalAvailable) ok = false;
+    } else {
+      const n = parseInt(countInput.value, 10);
+      if (!n || n < 1) { ok = false; }
+      else if (totalAvailable && n > totalAvailable) { ok = false; msg = 'max is ' + totalAvailable; }
+    }
+    startBtn.disabled = !ok;
+    errMsg.hidden = !msg;
+    if (msg) errMsg.textContent = msg;
+  }
+
+  runAllToggle.addEventListener('change', () => {
+    countInput.disabled = runAllToggle.checked;
+    updateEstimate();
+    validate();
+  });
+  countInput.addEventListener('input', () => { updateEstimate(); validate(); });
+
+  fetch('/api/leads/available').then(r => r.json()).then(d => {
+    totalAvailable = d.total || 0;
+    availCount.textContent = totalAvailable;
+    countInput.max = totalAvailable;
+    (d.sample_names || []).forEach(name => {
+      const li = document.createElement('li');
+      li.textContent = '· ' + name;
+      sampleNames.appendChild(li);
+    });
+    updateEstimate();
+    validate();
+  }).catch(() => { availCount.textContent = '—'; });
+
+  // ---- results view ----
+  const summaryBar = document.getElementById('summary-bar');
+  const leadsEl = document.getElementById('leads');
+  let currentRunId = null;
+  let pollTimer = null;
+  let leadCards = {};          // entity_id -> {details, nameEl, pillEl, reasonEl, metaEl, loaded}
+  let leadOrder = [];
+
+  function pillClassForStatus(status, verdict) {
+    if (status === 'verdict_done' && verdict) return verdictPillClass(verdict);
+    if (status === 'failed') return 'failed';
+    if (status === 'running') return 'running';
+    return 'queued';
+  }
+  function pillLabel(status, verdict) {
+    if (status === 'verdict_done' && verdict) return verdict;
+    if (status === 'failed') return 'failed';
+    if (status === 'running') return 'running';
+    return 'queued';
+  }
+
+  function summaryLine(lead) {
+    // summary text placed in the card header; updates in place per poll
+    return lead.name + ' — ' + (lead.verdict ? lead.verdict : lead.status) +
+      (lead.reason ? ' · ' + truncate(lead.reason, 80) : '') + ' · ' + fmtCost(lead.cost_usd);
+  }
+
+  function buildCards(entityIds) {
+    leadsEl.innerHTML = '';
+    leadCards = {};
+    leadOrder = entityIds;
+    entityIds.forEach(eid => {
+      const details = document.createElement('details');
+      details.className = 'lead';
+      details.innerHTML =
+        '<summary class="lead-head">' +
+          '<span class="chev"></span>' +
+          '<span class="lead-name">' + esc(eid) + '</span>' +
+          '<span class="reason"></span>' +
+          '<span class="pill queued">queued</span>' +
+          '<span class="lead-meta">—</span>' +
+        '</summary>' +
+        '<div class="lead-body"></div>';
+      details.addEventListener('toggle', () => {
+        if (details.open && !leadCards[eid].loaded) loadTrace(eid);
+      });
+      leadsEl.appendChild(details);
+      leadCards[eid] = {
+        details,
+        nameEl: details.querySelector('.lead-name'),
+        reasonEl: details.querySelector('.reason'),
+        pillEl: details.querySelector('.pill'),
+        metaEl: details.querySelector('.lead-meta'),
+        bodyEl: details.querySelector('.lead-body'),
+        loaded: false,
+      };
+    });
+  }
+
+  function updateCards(status) {
+    let done = 0, failed = 0, processed = 0, totalCost = 0;
+    const summary = { pursue: 0, pursue_low: 0, reject: 0 };
+    status.leads.forEach(lead => {
+      totalCost += lead.cost_usd || 0;
+      const card = leadCards[lead.entity_id];
+      if (!card) return;
+      if (lead.status === 'verdict_done') {
+        processed++;
+        if (lead.verdict) summary[lead.verdict] = (summary[lead.verdict] || 0) + 1;
+      }
+      if (lead.status === 'failed') failed++;
+      // update summary line / pills in place — never replace the whole card so an
+      // expanded trace stays expanded
+      card.nameEl.textContent = lead.name || lead.entity_id;
+      const cls = pillClassForStatus(lead.status, lead.verdict);
+      card.pillEl.className = 'pill ' + cls;
+      card.pillEl.textContent = pillLabel(lead.status, lead.verdict);
+      const reasonText = lead.reason ? truncate(lead.reason, 60) : '';
+      card.reasonEl.textContent = reasonText;
+      card.reasonEl.title = lead.reason || '';
+      card.metaEl.textContent = fmtCost(lead.cost_usd);
+    });
+    summaryBar.innerHTML =
+      '<div class="stat"><span class="n">' + processed + '/' + status.total + '</span><span class="l">Processed</span></div>' +
+      '<div class="stat"><span class="n">' + failed + '</span><span class="l">Failed</span></div>' +
+      '<div class="stat"><span class="n">' + (summary.pursue + summary.pursue_low) + '</span><span class="l">Pursue</span></div>' +
+      '<div class="stat"><span class="n">' + summary.reject + '</span><span class="l">Rejected</span></div>' +
+      '<div class="stat"><span class="n">' + fmtCost(totalCost) + '</span><span class="l">Cost</span></div>';
+  }
+
+  async function loadTrace(eid) {
+    const card = leadCards[eid];
+    card.loaded = true;
+    card.bodyEl.innerHTML = '<div class="trace-loading">loading trace…</div>';
+    try {
+      const r = await fetch('/api/lead/' + encodeURIComponent(eid) + '/trace');
+      if (!r.ok) { card.bodyEl.innerHTML = '<div class="trace-loading">no trace available (' + r.status + ')</div>'; return; }
+      const d = await r.json();
+      card.bodyEl.innerHTML = (d.trace || []).map(renderEvent).join('') || '<div class="trace-loading">(empty trace)</div>';
+    } catch (e) {
+      card.bodyEl.innerHTML = '<div class="trace-loading">failed to load trace</div>';
+    }
+  }
+
+  async function pollOnce() {
+    try {
+      const r = await fetch('/api/run/' + currentRunId + '/status');
+      if (!r.ok) return;
+      const status = await r.json();
+      updateCards(status);
+      if (status.status === 'done') {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    } catch (e) { /* keep polling on transient errors */ }
+  }
+
+  startBtn.addEventListener('click', async () => {
+    startBtn.disabled = true;
+    const runAll = runAllToggle.checked;
+    const body = runAll ? { count: null } : { count: parseInt(countInput.value, 10) };
+    try {
+      const r = await fetch('/api/run', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) { errMsg.hidden = false; errMsg.textContent = 'start failed (' + r.status + ')'; startBtn.disabled = false; return; }
+      const d = await r.json();
+      currentRunId = d.run_id;
+      startView.hidden = true;
+      resultsView.hidden = false;
+      buildCards(d.entity_ids);
+      pollOnce();
+      pollTimer = setInterval(pollOnce, 2000);
+    } catch (e) {
+      errMsg.hidden = false; errMsg.textContent = 'start failed: ' + e; startBtn.disabled = false;
+    }
+  });
+})();
+</script>
+</body>
+</html>
