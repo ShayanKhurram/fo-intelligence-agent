@@ -1,0 +1,172 @@
+"""process_entity / run_pipeline — the DB-wired orchestration
+(enrichment_validation_dataset_plan.md §4/§8 build-order steps 3-10). All external
+tools (EDGAR, Serper, Hunter, GDELT, DNS, the LLM) are monkeypatched so this suite stays
+fully offline like the rest of the project."""
+from __future__ import annotations
+
+from langchain_core.messages import AIMessage
+
+import app.enrichment as enrichment_module
+import app.validation as validation_module
+from app.db import (
+    add_entity_source,
+    connection,
+    get_claims,
+    get_findings,
+    upsert_claims,
+    upsert_entity,
+    write_decision,
+)
+from app.enrichment import process_entity, run_pipeline
+
+
+def _patch_all_network(monkeypatch, *, edgar_hits=1, jsonld_html=None, page_content="",
+                        search_results=None, hunter_emails=None, gdelt_results=None):
+    async def _fake_edgar(query, forms=None):
+        results = [{"url": "http://sec.gov/x"}] * edgar_hits
+        return {"results": results, "query": query}
+
+    async def _fake_mx(domain):
+        return True
+
+    async def _fake_raw_html(url):
+        return jsonld_html
+
+    async def _fake_free_fetch(url, paid_fallback):
+        return {"url": url, "content": page_content, "extraction_method": "httpx_trafilatura"}
+
+    async def _fake_search(query, topic="general", max_results=5):
+        return {"results": search_results or [], "query": query}
+
+    async def _fake_hunter(domain):
+        return {"domain": domain, "pattern": None, "emails": hunter_emails or []}
+
+    async def _fake_gdelt(query, lookback_days=365, max_records=75):
+        return {"results": gdelt_results or [], "query": query}
+
+    monkeypatch.setattr(enrichment_module, "edgar_full_text_search_raw", _fake_edgar)
+    monkeypatch.setattr(enrichment_module, "check_domain_mx_exists", _fake_mx)
+    monkeypatch.setattr(enrichment_module, "fetch_raw_html", _fake_raw_html)
+    monkeypatch.setattr(enrichment_module, "fetch_page_free_first", _fake_free_fetch)
+    monkeypatch.setattr(enrichment_module, "serper_search_raw", _fake_search)
+    monkeypatch.setattr(enrichment_module, "hunter_domain_search_raw", _fake_hunter)
+    monkeypatch.setattr(enrichment_module, "news_search_raw", _fake_gdelt)
+    monkeypatch.setattr(validation_module, "fetch_page_free_first", _fake_free_fetch)
+
+
+def _seed_pursue_entity(conn, entity_id, name, *, verdict="pursue", thin_reason=None, with_domain=True):
+    upsert_entity(conn, entity_id, name)
+    add_entity_source(conn, entity_id, "13f_filing", {"quarter": "2026Q1", "value_usd": 100_000_000}, url="http://sec.gov/13f")
+    if with_domain:
+        add_entity_source(conn, entity_id, "domain_check", {"domain": "acmecap.com", "mx_present": True})
+    claims = [
+        {"question_id": "G1.Q3", "answer": "yes, operates as a family office", "status": "confirmed",
+         "source_url": "http://x", "confidence": "high"},
+        {"question_id": "G1.Q5", "answer": "no", "status": "confirmed", "confidence": "high"},
+    ]
+    upsert_claims(conn, entity_id, claims)  # mirrors app.verdict.persist_verdict's real write path
+    write_decision(conn, entity_id, verdict=verdict, rationale="r", gate_results={}, claim_ledger=claims,
+                    dead_ends=[], thin_reason=thin_reason)
+
+
+async def test_process_entity_records_contradiction_as_caveat_not_reject(db_path, fake_model, monkeypatch):
+    """A genuine family office (G1.Q5="no", not RIA-in-costume) with a real AUM
+    contradiction ships WITH CAVEATS, not reject (relaxations 2026-07-29 — see
+    PROJECT_LOG.md): a V4 contradiction is recorded and the claim flips to "contradicted",
+    but a contradiction is a caveat (ship_with_caveats), not grounds to reject; and
+    completeness (no dated signal here) is advisory now, not fatal. Only the V5 firm-is-FO
+    identity gate rejects, and this entity passes it. The V4_contradiction finding must
+    still be persisted either way."""
+    _patch_all_network(monkeypatch)
+    with connection(db_path) as conn:
+        upsert_entity(conn, "e1", "Acme Capital Partners")
+        add_entity_source(conn, "e1", "13f_filing", {"quarter": "2026Q1", "value_usd": 100_000_000})
+        claims = [
+            {"question_id": "G1.Q3", "answer": "yes, operates as a family office", "status": "confirmed",
+             "source_url": "http://x", "confidence": "high"},
+            {"question_id": "G1.Q5", "answer": "no", "status": "confirmed", "confidence": "high"},
+            {"field_name": "aum_usd", "answer": 100_000_000, "status": "confirmed",
+             "source_class": "13f_filing", "confidence": "high"},
+            {"field_name": "aum_usd", "answer": 5_000_000, "status": "confirmed",
+             "source_class": "site_scrape", "confidence": "high"},
+        ]
+        upsert_claims(conn, "e1", claims)
+        write_decision(conn, "e1", verdict="pursue", rationale="r", gate_results={}, claim_ledger=claims, dead_ends=[])
+
+    with connection(db_path) as conn:
+        result = await process_entity(conn, "e1", fake_model)
+
+    assert result["outcome"] == "ship_with_caveats"
+    with connection(db_path) as conn:
+        findings = get_findings(conn, "e1")
+    assert any(f["check_id"] == "V4_contradiction" for f in findings)
+
+
+async def test_process_entity_ships_full_happy_path(db_path, fake_model, monkeypatch):
+    with connection(db_path) as conn:
+        _seed_pursue_entity(conn, "e1", "Acme Capital Partners")
+
+    _patch_all_network(
+        monkeypatch,
+        jsonld_html='<script type="application/ld+json">{"@type":"Person","name":"Jane Doe","jobTitle":"CIO"}</script>',
+        page_content="Contact us at jane@acmecap.com for inquiries.",
+        gdelt_results=[{"url": "http://news.example/x", "title": "Acme raises fund", "seendate": "20260101000000"}],
+    )
+    # route() (content-addressed) rather than the flat FIFO queue: wave 2's narrative
+    # extraction call needs a JSON ARRAY response, V1's per-claim checks need JSON
+    # OBJECT responses, and the exact count/interleaving of V1 calls (one per settled,
+    # sourced claim) isn't something a test should have to predict — see
+    # app.llm.FakeChatModel.route()'s own docstring for why this exists.
+    fake_model.route(
+        lambda msgs: any("extracting structured facts" in str(m.content) for m in msgs),
+        AIMessage(content="[]"),
+    )
+    fake_model.route(
+        lambda msgs: any("checking whether a web page" in str(m.content) for m in msgs),
+        *[AIMessage(content='{"supported": true, "reason": "confirmed on page"}') for _ in range(10)],
+    )
+
+    with connection(db_path) as conn:
+        result = await process_entity(conn, "e1", fake_model)
+
+    assert result["outcome"] in ("ship", "ship_with_caveats")
+    with connection(db_path) as conn:
+        claims = get_claims(conn, "e1")
+    fields = {c["field_name"] for c in claims}
+    assert "principal_name" in fields
+    assert "principal_email" in fields
+    assert "aum_usd" in fields  # wave -1 claim persisted too
+
+
+async def test_run_pipeline_promotes_pursue_low_when_wave_minus_1_fills_gate(db_path, fake_model, monkeypatch):
+    with connection(db_path) as conn:
+        _seed_pursue_entity(conn, "e1", "Beta Family Office", verdict="pursue_low", thin_reason="fixable")
+        # people list on a pass-through source -> wave -1 derives a principal_name
+        add_entity_source(conn, "e1", "fec_employer", {"signals": {}, "people": [{"name": "Jane Doe", "title": "CIO"}]})
+
+    _patch_all_network(monkeypatch, page_content="Reach the team at ops@acmecap.com.")
+    fake_model.route(
+        lambda msgs: any("extracting structured facts" in str(m.content) for m in msgs),
+        AIMessage(content="[]"),
+    )
+    fake_model.route(
+        lambda msgs: any("checking whether a web page" in str(m.content) for m in msgs),
+        *[AIMessage(content='{"supported": true, "reason": "ok"}') for _ in range(10)],
+    )
+
+    with connection(db_path) as conn:
+        summary = await run_pipeline(conn, fake_model, target_survivors=1)
+
+    assert "e1" in {p["entity_id"] for p in summary["processed"]}  # promoted into the pursue queue, actually processed
+
+
+async def test_run_pipeline_never_processes_structural_thin_reserve(db_path, fake_model, monkeypatch):
+    with connection(db_path) as conn:
+        _seed_pursue_entity(conn, "e1", "Structural Co", verdict="pursue_low", thin_reason="structural", with_domain=False)
+
+    _patch_all_network(monkeypatch)
+    with connection(db_path) as conn:
+        summary = await run_pipeline(conn, fake_model, target_survivors=50)
+
+    assert summary["processed"] == []  # structural-thin, not promotable, never drawn
+    assert summary["reserve_draws"] == 0
