@@ -1,0 +1,9 @@
+# Normalize line endings to LF in the repo (consistent across Linux/macOS/Windows checkouts).
+* text=auto eol=lf
+
+# Binary / generated — never diff or normalize.
+*.onnx binary
+*.png binary
+*.jpg binary
+*.ico binary
+package-lock.json linguist-generated=true -diff

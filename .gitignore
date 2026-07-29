@@ -1,0 +1,58 @@
+# ── Secrets & credentials (NEVER commit) ────────────────────────────────
+.env
+.env.*
+!.env.example
+!**/*.example
+**/.env.local
+**/.env*.local
+*dbpass*
+scratch_*.tmp
+.vercel/
+**/.vercel/
+
+# ── Python ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# ── Node / Next.js (micro_rag/web) ──────────────────────────────────────
+node_modules/
+.next/
+out/
+build/
+next-env.d.ts
+*.tsbuildinfo
+
+# ── Local embedding model weights (fetched, not vendored) ───────────────
+# ~23 MB ONNX binaries — see micro_rag/web/scripts/fetch-model.sh
+micro_rag/web/models/
+
+# ── Data & databases (real entity/contact data — not for a public repo) ─
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# ── Logs, traces, scratch ───────────────────────────────────────────────
+*.log
+*_traces_export.json
+
+# ── Internal working notes (dev diaries — not product) ──────────────────
+PROJECT_LOG.md
+PLAN.md
+DEBUG_PLAN.md
+
+# ── Tooling & agent state ───────────────────────────────────────────────
+.claude/
+.pi-sessions/
+supabase/
+
+# ── OS / editor ─────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

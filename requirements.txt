@@ -1,0 +1,22 @@
+langgraph>=1.2,<2
+langchain-core>=1.4,<2
+pydantic>=2.7,<3
+httpx>=0.27,<1
+aiosqlite>=0.20,<1
+phonenumbers>=8.13,<10
+pytest>=8,<10
+pytest-asyncio>=0.24,<2
+
+# Enrichment / Validation / Dataset layers (enrichment_validation_dataset_plan.md)
+dnspython>=2.6,<3     # V5 domain/MX existence check (app/validation.py)
+trafilatura>=1.12,<3  # free-path page extraction, "free fetch first" (app/tools/freefetch.py)
+openpyxl>=3.1,<4       # Layer D XLSX workbook writer (app/dataset.py)
+
+# Web frontend (T10)
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+
+# vendor/linkedin_scraper (python-scrapy-playbook/linkedin-python-scrapy-scraper)
+scrapy>=2.13,<3
+scrapeops-scrapy
+scrapeops-scrapy-proxy-sdk
