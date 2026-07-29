@@ -1,63 +1,220 @@
 @import "tailwindcss";
 
-/* micro_rag_plan.md §7.1 — filing vernacular, not the navy-and-gold private-wealth
-   default. Palette encodes epistemic state: this is the functional core, not decoration. */
+/* ui_plan.md — "Dark Glass." Supersedes micro_rag_plan.md §7's light filing-vernacular
+   palette. This is deliberately single-theme (no prefers-color-scheme light variant):
+   ui_plan.md §1 commits to dark+glass as the whole point ("colour carries meaning
+   instead of decoration"), not a toggleable preference. */
 :root {
-  --ink-900: #12161c;
-  --ink-700: #1e2530;
-  --ink-500: #3a4553;
-  --ink-300: #7c8899;
-  --paper: #f6f7f9;
-  --rule: #d8dde4;
+  color-scheme: dark;
 
-  --confirmed: #17694a;
-  --partial: #9a6b12;
-  --unknown: #8892a0;
-  --live: #2f5fd0;
+  /* surfaces — cool slate, not neutral black */
+  --bg-base: #0d1014;
+  --bg-raised: #141a21;
+  --bg-glass: rgba(26, 33, 42, 0.68);
+  --bg-glass-hi: rgba(34, 43, 54, 0.78);
+  --scrim: rgba(13, 16, 20, 0.55);
 
-  --background: var(--paper);
-  --foreground: var(--ink-900);
+  --edge: rgba(255, 255, 255, 0.08);
+  --edge-soft: rgba(255, 255, 255, 0.05);
+  --edge-lit: rgba(255, 255, 255, 0.14);
+
+  /* type */
+  --text-hi: #e9edf2;
+  --text-mid: #98a3b2;
+  --text-low: #67717f;
+
+  /* functional verification palette — never used decoratively */
+  --confirmed: #2fb88a;
+  --partial: #c8912f;
+  --unknown: #67717f;
+  --live: #5b9cff;
+  --urgent: #e8734a;
+
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 18px;
+  --r-pill: 999px;
+  --shadow-drawer: 0 24px 64px rgba(0, 0, 0, 0.55);
+
+  --background: var(--bg-base);
+  --foreground: var(--text-hi);
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --color-ink-900: var(--ink-900);
-  --color-ink-700: var(--ink-700);
-  --color-ink-500: var(--ink-500);
-  --color-ink-300: var(--ink-300);
-  --color-paper: var(--paper);
-  --color-rule: var(--rule);
-  --color-confirmed: var(--confirmed);
-  --color-partial: var(--partial);
-  --color-unknown: var(--unknown);
-  --color-live: var(--live);
   --font-mono: var(--font-geist-mono);
+  --font-sans: var(--font-inter);
+  --font-display: var(--font-bricolage);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --ink-900: #eef1f5;
-    --ink-700: #d3d9e2;
-    --ink-500: #a9b3c1;
-    --ink-300: #7c8899;
-    --paper: #12161c;
-    --rule: #2a323d;
-    --background: var(--paper);
-    --foreground: var(--ink-900);
-  }
+* {
+  border-color: var(--edge);
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--bg-base);
+  color: var(--text-hi);
+  font-family: var(--font-inter), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-weight: 400; /* dark-mode weight correction — 400 here reads like 450 would on light */
+}
+
+h1, h2, h3, .display {
+  font-family: var(--font-display), var(--font-inter), ui-sans-serif, sans-serif;
+  font-weight: 550; /* not 600 — dark-mode weight correction */
 }
 
 .mono {
-  font-family: var(--font-mono), ui-monospace, monospace;
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
 }
 
+/* ---- status colour + glyph (never colour alone — ui_plan.md §8) ---- */
 .status-confirmed { color: var(--confirmed); }
 .status-partial { color: var(--partial); }
 .status-unknown { color: var(--unknown); }
+.status-live { color: var(--live); }
+.status-urgent { color: var(--urgent); }
+
+.status-dot::before {
+  display: inline-block;
+  margin-right: 0.35em;
+  font-size: 0.85em;
+}
+.status-dot--confirmed::before { content: "●"; color: var(--confirmed); }
+.status-dot--partial::before { content: "◐"; color: var(--partial); }
+.status-dot--unknown::before { content: "○"; color: var(--unknown); }
+
+/* ---- glass surfaces — ui_plan.md §3. Max three on screen at once: records rail,
+   input bar, evidence drawer. Nothing else gets blur. ---- */
+/* Text on glass must never sit on blur alone — every glass surface carries the scrim as
+   a second, topmost background layer (not just the drawer) so contrast is guaranteed
+   over arbitrarily busy content behind it (ui_plan.md §3/§8). Verified against the worst
+   case in scripts/contrast-check.mjs — --text-mid on bare --bg-glass alone measured
+   2.30:1 over a bright background, well under the 4.5:1 floor; layering --scrim under it
+   the same way the drawer already did brings every checked combination well past 4.5:1. */
+.glass {
+  background-image: linear-gradient(var(--scrim), var(--scrim)), linear-gradient(var(--bg-glass), var(--bg-glass));
+  backdrop-filter: blur(20px) saturate(140%);
+  -webkit-backdrop-filter: blur(20px) saturate(140%);
+  border: 1px solid var(--edge);
+  border-top-color: var(--edge-lit);
+  border-radius: var(--r-md);
+}
+.glass-hi {
+  background-image: linear-gradient(var(--scrim), var(--scrim)), linear-gradient(var(--bg-glass-hi), var(--bg-glass-hi));
+  backdrop-filter: blur(20px) saturate(140%);
+  -webkit-backdrop-filter: blur(20px) saturate(140%);
+  border: 1px solid var(--edge);
+  border-top-color: var(--edge-lit);
+}
+@supports not (backdrop-filter: blur(1px)) {
+  .glass { background-image: none; background-color: var(--bg-raised); }
+  .glass-hi { background-image: none; background-color: var(--bg-raised); }
+}
+.scrim {
+  background: var(--scrim);
+}
+
+/* ---- shimmer skeleton (2.2s linear infinite, 12% white diagonal sweep) ---- */
+@keyframes shimmer-sweep {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background: var(--bg-raised);
+  border-radius: var(--r-md);
+}
+.skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    115deg,
+    transparent 30%,
+    rgba(255, 255, 255, 0.12) 50%,
+    transparent 70%
+  );
+  background-size: 200% 100%;
+  animation: shimmer-sweep 2.2s ease-in-out infinite;
+}
+
+/* ---- streaming cursor: 2px jade bar, 1s blink ---- */
+@keyframes cursor-blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+.stream-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--confirmed);
+  animation: cursor-blink 1s step-end infinite;
+}
+
+/* ---- evidence drawer entrance — 240ms cubic-bezier(0.32,0.72,0,1), ui_plan.md §6 ---- */
+@keyframes drawer-in {
+  from { transform: translateX(24px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+.drawer-enter {
+  animation: drawer-in 240ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+@media (prefers-reduced-motion: reduce) {
+  .drawer-enter {
+    animation: none;
+  }
+}
+
+/* ---- entrances / stage pulse ---- */
+@keyframes enter-scale {
+  from { opacity: 0; transform: scale(0.92); }
+  to { opacity: 1; transform: scale(1); }
+}
+.enter-pill {
+  animation: enter-scale 140ms ease-out;
+}
+@keyframes stage-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.stage-dot--active {
+  animation: stage-pulse 1.4s ease-in-out infinite;
+}
+
+/* ---- focus ring — visible on glass, 2px --live with a 1px dark inner ring ---- */
+:focus-visible {
+  outline: 2px solid var(--live);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 1px var(--bg-base) inset;
+  border-radius: var(--r-sm);
+}
+
+::selection {
+  background: color-mix(in srgb, var(--live) 35%, transparent);
+}
+
+/* ---- reduced motion — ui_plan.md §7 ---- */
+@media (prefers-reduced-motion: reduce) {
+  .skeleton::after {
+    animation: none;
+    background: rgba(255, 255, 255, 0.08);
+  }
+  .stream-cursor {
+    animation: none;
+    opacity: 1;
+  }
+  .stage-dot--active {
+    animation: none;
+  }
+  .enter-pill {
+    animation: none;
+  }
+  *, *::before, *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}

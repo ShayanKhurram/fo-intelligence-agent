@@ -10,6 +10,8 @@
 
 **Live demo:** https://fo-micro-rag.vercel.app
 
+![System architecture — discovery through supervisor/researcher agents, enrichment, and the validator gate](./sys_pic.png)
+
 ---
 
 ## Table of contents
@@ -193,10 +195,10 @@ Two data sources coexist in `records` via a `source` column (`pipeline` vs `csv_
 │   │   ├── ingest_csv.py    #   external CSV ingest (co-resident source)
 │   │   └── schema.sql       #   records / chunks / provenance / query_log
 │   └── web/                 # Next.js 16 app (retrieval + grounding + UI)
-│       ├── app/api/         #   /query, /health, /record/[id]
+│       ├── app/api/         #   /query (SSE stream), /health, /record/[id]
 │       ├── lib/             #   retrieval, grounding, ollama, embeddings, ...
-│       ├── components/      #   SearchApp, ProvenanceDrawer
-│       └── scripts/         #   fetch-model.sh
+│       ├── components/      #   SearchApp, EvidenceDrawer, RecordCard, ...
+│       └── scripts/         #   fetch-model.sh, contrast-check.mjs
 ├── tests/                   # 242 offline tests (pytest)
 ├── vendor/                  # vendored LinkedIn scraper (Scrapy)
 ├── docs/                    # design specs (the "why" behind each layer)

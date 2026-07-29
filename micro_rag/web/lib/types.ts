@@ -8,6 +8,46 @@ export type QueryResponse = {
   error?: boolean;
 };
 
+// ui_plan.md §9 — the SSE contract. The client renders each event type independently;
+// this union is the source of truth both the route (producer) and SearchApp (consumer)
+// import, so the two ends can't drift out of sync on shape.
+import type { ParsedFilters } from "./query-understanding";
+
+export type FilterChip = { key: string; label: string };
+
+export type ClaimVerifiedPayload = {
+  sentence: string;
+  recordId: string;
+  field: string;
+  value: string;
+  status: string;
+};
+
+export type StageId = "understanding" | "filtering" | "matching" | "checking";
+export type StageStatus = "active" | "done";
+
+export type QueryStreamEvent =
+  | { type: "stage"; id: StageId; label: string; status: StageStatus; detail?: string }
+  // parsedFilters is the authoritative structured state — chips are a lossy display
+  // projection of it (e.g. aum_min's raw number vs its "$500M" label). The client keeps
+  // parsedFilters as its own state so a LATER chip removal (deleting one key and
+  // resubmitting) starts from what the server actually parsed, not an empty object.
+  | { type: "filters"; filters: FilterChip[]; parsedFilters: ParsedFilters }
+  | { type: "records"; records: RecordRow[]; candidateCount: number }
+  | { type: "token"; text: string; kind: "claim" | "neutral" }
+  | { type: "claim_verified"; claim: ClaimVerifiedPayload }
+  | {
+      type: "done";
+      records: string[];
+      relaxedFilters: string[];
+      strippedFraction?: number;
+      declined?: boolean;
+      discarded?: boolean;
+      count?: number;
+      finalAnswerFallback?: string; // used only for declined/aggregate/discarded paths that never streamed sentence tokens
+      error?: boolean;
+    };
+
 export type RecordRow = {
   record_id: string;
   entity_name: string;
@@ -31,6 +71,7 @@ export type RecordRow = {
   urgency_tier: string | null;
   record_confidence: string;
   outcome: string;
+  outreach_hook: string | null; // provenance-only field, not a records column — see lib/records.ts
 };
 
 export type ProvenanceRow = {

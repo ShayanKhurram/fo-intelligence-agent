@@ -124,10 +124,15 @@ function reciprocalRankFusion(rankLists: { chunk_id: string; rank: number }[][])
   return scores;
 }
 
-export async function hybridRetrieve(semanticQuery: string, filters: ParsedFilters): Promise<RetrievalResult> {
+export async function hybridRetrieve(
+  semanticQuery: string,
+  filters: ParsedFilters,
+  onCandidateStep?: (count: number) => void
+): Promise<RetrievalResult> {
   let currentFilters = filters;
   const relaxedFilters: string[] = [];
   let recordIds = await candidateRecordIds(currentFilters);
+  onCandidateStep?.(recordIds.length);
 
   // Filter relaxation: never fall through to unfiltered search silently (plan §4.2).
   while (recordIds.length === 0) {
@@ -136,6 +141,7 @@ export async function hybridRetrieve(semanticQuery: string, filters: ParsedFilte
     currentFilters = relaxed.next;
     relaxedFilters.push(relaxed.description);
     recordIds = await candidateRecordIds(currentFilters);
+    onCandidateStep?.(recordIds.length);
   }
 
   if (recordIds.length === 0) {

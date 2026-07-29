@@ -60,3 +60,74 @@ export async function ollamaChat(messages: ChatMessage[], tier: "cheapest" | "mi
   }
   throw new Error(`Ollama Cloud request failed after ${MAX_ATTEMPTS} attempts: ${lastText}`);
 }
+
+/** Streaming twin of `ollamaChat` — powers the SSE answer stream (ui_plan.md's `token`
+ * events). Ollama Cloud's endpoint is OpenAI-compatible, so `stream: true` returns an
+ * SSE body of `data: {...}\n\n` chunks (delta text in `choices[0].delta.content`)
+ * terminated by a literal `data: [DONE]` line. Retry is only attempted before the first
+ * byte arrives — once content has started streaming to the caller there's no way to
+ * "retry" without re-emitting duplicate text, so a mid-stream failure just throws (the
+ * route's catch-all turns that into the existing timeout/error message, same as any
+ * other generation failure today). */
+export async function* ollamaChatStream(
+  messages: ChatMessage[],
+  tier: "cheapest" | "mid" = "cheapest"
+): AsyncGenerator<string> {
+  const apiKey = process.env.OLLAMA_API_KEY;
+  if (!apiKey) {
+    throw new Error("OLLAMA_API_KEY not set");
+  }
+
+  let resp: Response | null = null;
+  let lastText = "";
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    resp = await fetch(OLLAMA_BASE_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: TIER_MODEL[tier],
+        messages,
+        temperature: 0,
+        stream: true,
+      }),
+    });
+    if (resp.ok) break;
+    lastText = await resp.text();
+    const retryable = resp.status === 429 || resp.status >= 500;
+    if (!retryable || attempt === MAX_ATTEMPTS) {
+      throw new Error(`Ollama Cloud stream request failed: ${resp.status} ${lastText}`);
+    }
+    await sleep(500 * 2 ** (attempt - 1) + Math.random() * 250);
+  }
+  if (!resp || !resp.ok || !resp.body) {
+    throw new Error(`Ollama Cloud stream request failed after ${MAX_ATTEMPTS} attempts: ${lastText}`);
+  }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? ""; // last element may be a partial line — keep it for next read
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) continue;
+      const payload = trimmed.slice("data:".length).trim();
+      if (payload === "[DONE]") return;
+      let parsed: { choices?: { delta?: { content?: string } }[] };
+      try {
+        parsed = JSON.parse(payload);
+      } catch {
+        continue; // a malformed/partial JSON chunk — skip rather than crash the whole stream
+      }
+      const delta = parsed.choices?.[0]?.delta?.content;
+      if (delta) yield delta;
+    }
+  }
+}

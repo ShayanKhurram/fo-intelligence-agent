@@ -21,6 +21,46 @@ export type QueryUnderstanding = {
   intent: "search" | "lookup" | "aggregate" | "out_of_scope";
 };
 
+/** Turns a parsed filter set into removable UI chips (ui_plan.md §6 "Filter chips" —
+ * "parsed from the query, removable, mono labels. Removing one re-runs the search").
+ * `key` matches the ParsedFilters property name so the client can delete exactly that
+ * key and resubmit as an `overrideFilters` override, skipping re-parsing from text. */
+export function filtersToChips(filters: ParsedFilters): { key: string; label: string }[] {
+  const chips: { key: string; label: string }[] = [];
+  if (filters.entity_type) chips.push({ key: "entity_type", label: filters.entity_type });
+  if (filters.hq_state) chips.push({ key: "hq_state", label: filters.hq_state });
+  if (filters.aum_min != null && filters.aum_max != null) {
+    chips.push({ key: "aum_range", label: `$${fmtUsd(filters.aum_min)}–$${fmtUsd(filters.aum_max)}` });
+  } else {
+    if (filters.aum_min != null) chips.push({ key: "aum_min", label: `≥ $${fmtUsd(filters.aum_min)}` });
+    if (filters.aum_max != null) chips.push({ key: "aum_max", label: `≤ $${fmtUsd(filters.aum_max)}` });
+  }
+  if (filters.mandates_any && filters.mandates_any.length > 0) {
+    chips.push({ key: "mandates_any", label: filters.mandates_any.join(", ") });
+  }
+  return chips;
+}
+
+/** Inverse of a chip's `key` — deletes exactly what that chip represents. `aum_range`
+ * is a synthetic key covering both aum_min/aum_max together (see filtersToChips). */
+export function removeFilterKey(filters: ParsedFilters, key: string): ParsedFilters {
+  const next = { ...filters };
+  if (key === "aum_range") {
+    delete next.aum_min;
+    delete next.aum_max;
+  } else {
+    delete next[key as keyof ParsedFilters];
+  }
+  return next;
+}
+
+function fmtUsd(n: number): string {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(n % 1e9 === 0 ? 0 : 1)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(n % 1e6 === 0 ? 0 : 1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(0)}K`;
+  return String(n);
+}
+
 const STATE_CODES = new Set([
   "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA","KS","KY","LA",
   "ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH","OK",
