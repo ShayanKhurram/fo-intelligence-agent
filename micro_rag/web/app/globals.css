@@ -1,0 +1,63 @@
+@import "tailwindcss";
+
+/* micro_rag_plan.md §7.1 — filing vernacular, not the navy-and-gold private-wealth
+   default. Palette encodes epistemic state: this is the functional core, not decoration. */
+:root {
+  --ink-900: #12161c;
+  --ink-700: #1e2530;
+  --ink-500: #3a4553;
+  --ink-300: #7c8899;
+  --paper: #f6f7f9;
+  --rule: #d8dde4;
+
+  --confirmed: #17694a;
+  --partial: #9a6b12;
+  --unknown: #8892a0;
+  --live: #2f5fd0;
+
+  --background: var(--paper);
+  --foreground: var(--ink-900);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-ink-900: var(--ink-900);
+  --color-ink-700: var(--ink-700);
+  --color-ink-500: var(--ink-500);
+  --color-ink-300: var(--ink-300);
+  --color-paper: var(--paper);
+  --color-rule: var(--rule);
+  --color-confirmed: var(--confirmed);
+  --color-partial: var(--partial);
+  --color-unknown: var(--unknown);
+  --color-live: var(--live);
+  --font-mono: var(--font-geist-mono);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink-900: #eef1f5;
+    --ink-700: #d3d9e2;
+    --ink-500: #a9b3c1;
+    --ink-300: #7c8899;
+    --paper: #12161c;
+    --rule: #2a323d;
+    --background: var(--paper);
+    --foreground: var(--ink-900);
+  }
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.mono {
+  font-family: var(--font-mono), ui-monospace, monospace;
+}
+
+.status-confirmed { color: var(--confirmed); }
+.status-partial { color: var(--partial); }
+.status-unknown { color: var(--unknown); }
