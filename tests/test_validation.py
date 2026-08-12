@@ -6,6 +6,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import dns.resolver
+import pytest
 from langchain_core.messages import AIMessage
 
 import app.validation as validation_module
@@ -446,6 +447,47 @@ async def test_run_validation_type_final_from_g1q4():
     vi = ValidationInput(entity_id="e1", claim_ledger=claims, waves_completed=["-1", "0"], wave0_findings=[])
     dataset_input, _, _ = await run_validation(vi, None, fetch_fn=_supportive_fetch)
     assert dataset_input.type_final == "SFO"
+
+
+# --- decide_type_final: dict (DB rows) and Claim inputs must agree (T17.1) ---
+
+from app.validation import decide_type_final  # noqa: E402  (kept near the tests it serves)
+
+
+def _dict_claim(question_id="G1.Q4", status="confirmed", answer="x", **kw):
+    d = {"question_id": question_id, "status": status, "answer": answer}
+    d.update(kw)
+    return d
+
+# (status, answer, expected) across every disqualifying status + the three
+# decidable outcomes. `superseded` was added to the codebase in 6666dab but missed
+# here at the time — it must disqualify, just like contradicted.
+_TYPE_FINAL_CASES = [
+    # no G1.Q4 claim at all
+    ([_dict_claim(question_id="G1.Q3", answer="irrelevant")], "type_unconfirmed"),
+    # disqualifying statuses (all five)
+    ([_dict_claim(status="could_not_verify", answer="MFO")], "type_unconfirmed"),
+    ([_dict_claim(status="removed_failed_validation", answer="MFO")], "type_unconfirmed"),
+    ([_dict_claim(status="contradicted", answer="MFO")], "type_unconfirmed"),
+    ([_dict_claim(status="superseded", answer="MFO")], "type_unconfirmed"),
+    # settled MFO / SFO
+    ([_dict_claim(status="single_source", answer="It is a multi-family office (MFO).")], "MFO"),
+    ([_dict_claim(status="verified", answer="SFO (ADV client_count=1)")], "SFO"),
+    # settled but unparseable answer
+    ([_dict_claim(status="confirmed", answer="family office")], "type_unconfirmed"),
+]
+
+
+@pytest.mark.parametrize("claims, expected", _TYPE_FINAL_CASES)
+def test_decide_type_final_dict_and_claim_inputs_agree(claims, expected):
+    # Build a matching list of pydantic Claims for the same case — same question_id/
+    # status/answer — and assert both shapes give the identical result.
+    claim_objs = [
+        _claim(question_id=c["question_id"], status=c["status"], answer=c["answer"])
+        for c in claims
+    ]
+    assert decide_type_final(claims) == expected           # raw dict (DB row) path
+    assert decide_type_final(claim_objs) == expected       # pydantic Claim path
 
 
 # --- regression coverage for 2 real bugs found live-testing (2026-07-28, see PROJECT_LOG.md) ---

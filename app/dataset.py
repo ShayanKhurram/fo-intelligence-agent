@@ -29,7 +29,7 @@ from app.db import (
     get_rejections,
     write_production_record,
 )
-from app.validation import _MULTI_VALUED_FIELDS
+from app.validation import _MULTI_VALUED_FIELDS, decide_type_final
 
 MAX_PER_CLASS = 15  # 30% of 50 — plan §6.1
 
@@ -119,7 +119,13 @@ def _discovery_class_info(claims: list[dict[str, Any]]) -> tuple[str | None, int
     return (classes[0] if classes else None, len(classes))
 
 
-def build_candidate(entity: dict[str, Any], claims: list[dict[str, Any]], outcome: str, type_final: str) -> ProductionCandidate:
+def build_candidate(entity: dict[str, Any], claims: list[dict[str, Any]], outcome: str, type_final: str | None = None) -> ProductionCandidate:
+    # type_final defaults to None = "derive it from the ledger", distinct from a
+    # literal "type_unconfirmed" = "we decided it is unconfirmed". Layer V (which
+    # has already run the rule and persisted nothing) can still pass an explicit
+    # value and have it win — that path is what the existing tests exercise.
+    if type_final is None:
+        type_final = decide_type_final(claims)
     score, verified = _score_claims(claims)
     primary, count = _discovery_class_info(claims)
     return ProductionCandidate(
@@ -175,13 +181,19 @@ def persist_selection(
                                  excluded_by_quota=True)
 
 
-def gather_survivors(conn, entity_outcomes: list[tuple[str, str, str]]) -> list[ProductionCandidate]:
-    """`entity_outcomes` is [(entity_id, outcome, type_final), ...] for ship/
+def gather_survivors(conn, entity_outcomes: list[tuple[str, str] | tuple[str, str, str]]) -> list[ProductionCandidate]:
+    """`entity_outcomes` is [(entity_id, outcome[, type_final]), ...] for ship/
     ship_with_caveats entities — the caller (app.enrichment.run_pipeline's summary,
     or a fresh DB scan) is the source of truth for which entities reached which
-    outcome, since that isn't itself persisted as a queryable column anywhere."""
+    outcome, since that isn't itself persisted as a queryable column anywhere. A
+    2-tuple (entity_id, outcome) means "derive type_final from the ledger"; a
+    3-tuple supplies it explicitly and wins. Either way `type_final` is now produced
+    from the claim ledger, never invented by the caller — the column used to ship
+    empty because no persisted value existed and every caller had to guess."""
     candidates = []
-    for entity_id, outcome, type_final in entity_outcomes:
+    for item in entity_outcomes:
+        entity_id, outcome = item[0], item[1]
+        type_final = item[2] if len(item) > 2 else None
         entity = get_entity(conn, entity_id)
         if entity is None:
             continue
@@ -227,9 +239,9 @@ def _records_rows(selected: list[ProductionCandidate]) -> tuple[list[str], list[
     ordered = [f for f in _COLUMN_ORDER if f in all_fields]
     ordered += sorted(all_fields - set(ordered))
 
-    columns: list[str] = ["entity_id", "canonical_name", "type_final", "outcome"]
+    columns: list[str] = ["entity_id", "canonical_name", "type_final", "lead_origin_source_class", "outcome"]
     for f in ordered:
-        if f in ("entity_id", "canonical_name", "type_final"):
+        if f in ("entity_id", "canonical_name", "type_final", "lead_origin_source_class"):
             continue
         columns.append(f)
         if f in _HIGH_VALUE_FIELDS:
@@ -258,10 +270,17 @@ def _records_rows(selected: list[ProductionCandidate]) -> tuple[list[str], list[
                     bucket = multi.setdefault(fname, [])
                     if str(answer) not in bucket:
                         bucket.append(str(answer))
+        # lead_origin_source_class is a candidate-level attribute (which discovery feed
+        # this lead came from), NOT a claim field_name — so it follows the type_final
+        # precedent: a literal header entry + a literal row entry, never derived from
+        # the claim field_name pivot. Same value that drives the select_50 per-class
+        # quota (c.discovery_class_primary); 'unknown' when no discovery_class_* claim.
         row: dict[str, Any] = {"entity_id": c.entity_id, "canonical_name": c.canonical_name,
-                                "type_final": c.type_final, "outcome": c.outcome}
+                                "type_final": c.type_final,
+                                "lead_origin_source_class": c.discovery_class_primary or "unknown",
+                                "outcome": c.outcome}
         for f in ordered:
-            if f in ("entity_id", "canonical_name", "type_final"):
+            if f in ("entity_id", "canonical_name", "type_final", "lead_origin_source_class"):
                 continue
             claim = latest.get(f)
             if f in _MULTI_VALUED_FIELDS and multi.get(f):
@@ -331,6 +350,7 @@ _DATA_DICTIONARY: list[dict[str, str]] = [
     {"field": "why_now_trigger", "description": "The reason this is a live opportunity now (concentration_pain | fresh_liquidity | access_window).", "inclusion_standard": "derived from 13F QoQ deltas or a future-dated conference sighting; never guessed."},
     {"field": "outreach_hook", "description": "One-sentence first-contact hook, authored only from an existing why_now_trigger claim.", "inclusion_standard": "left blank if no trigger exists — never invented."},
     {"field": "type_final", "description": "SFO | MFO | type_unconfirmed, from the G1.Q4 claim's final validated status.", "inclusion_standard": "type_unconfirmed if G1.Q4 was never settled or was contradicted."},
+    {"field": "lead_origin_source_class", "description": "Discovery feed class this lead originally came from (13f_filing | fec_employer | 5500_filing | ppp_loans); 'unknown' if the lead carries no discovery_class_* claim.", "inclusion_standard": "derived from the discovery_class_* claims written by wave -1; the same value that drives the select_50 per-class quota."},
 ]
 
 _STATUS_VOCAB_NOTES: list[dict[str, str]] = [

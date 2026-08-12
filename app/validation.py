@@ -564,16 +564,36 @@ def _build_field_statuses(claims: list[Claim], now: datetime) -> list[FieldStatu
     ]
 
 
-def _decide_type_final(claims: list[Claim]) -> str:
-    g1q4 = next((c for c in claims if c.question_id == "G1.Q4"), None)
-    if g1q4 is None or g1q4.status in ("could_not_verify", "removed_failed_validation", "contradicted"):
+def decide_type_final(claims) -> str:
+    """SFO | MFO | type_unconfirmed from the G1.Q4 claim's final validated status.
+
+    Accepts EITHER a list of pydantic Claim objects (as Layer V holds them) OR a list
+    of plain dicts (raw sqlite rows, as Layer D's dataset.py holds them) — it reads
+    only `question_id`, `status`, `answer`, and normalizes access with a tiny local
+    helper rather than converting whole objects. The SFO/MFO rule is a correctness
+    rule and must not be duplicated; this is the one implementation, imported by both
+    layers. `'superseded'` is a disqualifying status (added to the codebase in 6666dab
+    but missed here at the time) — a superseded G1.Q4 has been overwritten and must not
+    decide the type.
+    """
+    def _get(c, key):
+        return c.get(key) if isinstance(c, dict) else getattr(c, key, None)
+
+    g1q4 = next((c for c in claims if _get(c, "question_id") == "G1.Q4"), None)
+    if g1q4 is None or _get(g1q4, "status") in (
+        "could_not_verify", "removed_failed_validation", "contradicted", "superseded",
+    ):
         return "type_unconfirmed"
-    answer = str(g1q4.answer).upper()
+    answer = str(_get(g1q4, "answer")).upper()
     if "MFO" in answer:
         return "MFO"
     if "SFO" in answer:
         return "SFO"
     return "type_unconfirmed"
+
+
+# Private-name alias so anything that imported `_decide_type_final` keeps working.
+_decide_type_final = decide_type_final
 
 
 async def run_validation(
@@ -679,6 +699,6 @@ async def run_validation(
         findings=findings,
         caveats=[f.detail for f in findings if f.severity in ("warn", "fatal") and outcome != "reject"],
         chain=[],
-        type_final=_decide_type_final(claims),
+        type_final=decide_type_final(claims),
     )
     return dataset_input, audit_entries, v1_cost

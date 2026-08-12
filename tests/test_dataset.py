@@ -342,3 +342,47 @@ def test_single_valued_field_is_unaffected_by_multi_value_handling():
     ])
     _, rows = _records_rows([cand])
     assert rows[0]["aum_usd"] == 2, "last write still wins for single-valued fields"
+
+
+# --- T17.3: regression for "a column exists but no producer ever fills it" ---
+
+# `type_final` shipped as a records-sheet column from day one but every caller had
+# to invent the value (nothing persisted it), and `lead_origin_source_class` is a
+# brand-new column for the same class of defect. Both must be produced from the
+# claim ledger the sheet already pivots, never invented by the caller. These
+# tests assert on the EMITTED SHEET ROW, not the intermediate candidate object,
+# because the defect being locked out is specifically at the sheet-assembly seam.
+
+def test_records_row_derives_type_final_and_lead_origin_from_ledger(db_path):
+    from app.dataset import _records_rows, gather_survivors
+
+    with connection(db_path) as conn:
+        upsert_entity(conn, "e1", "Acme Capital")
+        upsert_claims(conn, "e1", [
+            _claim(None, question_id="G1.Q4", status="single_source", answer="It is a multi-family office (MFO)."),
+            _claim("discovery_class_13f_filing", answer=True, status="confirmed"),
+        ])
+        # 2-tuple: NO caller-supplied type_final — it must be derived from the ledger.
+        candidates = gather_survivors(conn, [("e1", "ship")])
+    cols, rows = _records_rows(candidates)
+    row = rows[0]
+    assert row["type_final"] == "MFO"
+    assert row["lead_origin_source_class"] == "13f_filing"
+    # the column sits immediately after type_final in the emitted header
+    assert "lead_origin_source_class" in cols
+    assert cols.index("lead_origin_source_class") == cols.index("type_final") + 1
+
+
+def test_records_row_unknown_class_and_unconfirmed_type_when_ledger_lacks_them(db_path):
+    from app.dataset import _records_rows, gather_survivors
+
+    with connection(db_path) as conn:
+        upsert_entity(conn, "e2", "Mystery Capital")
+        upsert_claims(conn, "e2", [
+            _claim(None, question_id="G1.Q4", status="could_not_verify", answer=None),
+            # no discovery_class_* claim at all
+        ])
+        candidates = gather_survivors(conn, [("e2", "ship")])
+    _, rows = _records_rows(candidates)
+    assert rows[0]["type_final"] == "type_unconfirmed"
+    assert rows[0]["lead_origin_source_class"] == "unknown"
