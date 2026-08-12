@@ -284,3 +284,89 @@ async def test_process_entity_wave0_reject_costs_no_domain_resolution(db_path, f
 
     assert result["outcome"] == "reject"
     assert searched == []
+
+
+# --- force=True supersedes stale derived claims (2026-08-12) ---
+
+
+async def test_force_rerun_supersedes_stale_derived_claim_instead_of_colliding(db_path, fake_model, monkeypatch):
+    """wave_minus_1 is a pure function of entity_sources. On a force re-run after the
+    source data itself was corrected (e.g. the 13F filing-quarter -> holdings-quarter
+    backfill), the freshly-derived value genuinely disagrees with the OLD derived claim
+    still in the ledger. Without superseding, V4 flags the pipeline's own prior output as
+    contradicting itself -- found live: every one of 38 rejects after a real backfill+
+    force re-run carried this artifact."""
+    with connection(db_path) as conn:
+        upsert_entity(conn, "e1", "Acme Capital Partners")
+        # Stale source data -> wave -1 will derive aum_as_of="2026Q3" the first time.
+        add_entity_source(conn, "e1", "13f_filing", {"quarter": "2026Q3", "value_usd": 100_000_000})
+        claims = [
+            {"question_id": "G1.Q3", "answer": "yes, operates as a family office", "status": "confirmed",
+             "source_url": "http://x", "confidence": "high"},
+            {"question_id": "G1.Q5", "answer": "no", "status": "confirmed", "confidence": "high"},
+        ]
+        upsert_claims(conn, "e1", claims)
+        write_decision(conn, "e1", verdict="pursue", rationale="r", gate_results={}, claim_ledger=claims, dead_ends=[])
+
+    _patch_all_network(monkeypatch)
+    fake_model.route(
+        lambda msgs: any("checking whether a web page" in str(m.content) for m in msgs),
+        *[AIMessage(content='{"supported": true, "reason": "ok"}') for _ in range(10)],
+    )
+    with connection(db_path) as conn:
+        await process_entity(conn, "e1", fake_model)
+        old_run_claims = get_claims(conn, "e1")
+    old_aum_as_of = [c for c in old_run_claims if c["field_name"] == "aum_as_of"]
+    assert len(old_aum_as_of) == 1
+    assert old_aum_as_of[0]["answer"] == "2026Q3"
+    assert old_aum_as_of[0]["status"] != "superseded", "nothing to supersede on the first pass"
+
+    # The upstream source is now corrected (mirrors the real 13F-quarter backfill).
+    with connection(db_path) as conn:
+        conn.execute(
+            "UPDATE entity_sources SET payload = ? WHERE entity_id = ? AND source_class = '13f_filing'",
+            ('{"quarter": "2026Q2", "filed_in_quarter": "2026Q3", "value_usd": 100000000}', "e1"),
+        )
+        conn.commit()
+
+    with connection(db_path) as conn:
+        result = await process_entity(conn, "e1", fake_model, force=True)
+        claims_after = get_claims(conn, "e1")
+
+    aum_as_of_claims = [c for c in claims_after if c["field_name"] == "aum_as_of"]
+    assert len(aum_as_of_claims) == 2, "both the old and the corrected claim must survive"
+    by_answer = {c["answer"]: c["status"] for c in aum_as_of_claims}
+    assert by_answer["2026Q3"] == "superseded", "the stale derivation must be retracted, not deleted"
+    assert by_answer["2026Q2"] != "superseded", "the fresh derivation must be live"
+    assert by_answer["2026Q2"] != "contradicted", "must not collide with its own superseded predecessor"
+
+    with connection(db_path) as conn:
+        v4_findings = [f for f in get_findings(conn, "e1") if f["check_id"] == "V4_contradiction" and f["field"] == "aum_as_of"]
+    assert v4_findings == [], "V4 must not fire on a claim vs its own superseded predecessor"
+
+
+async def test_supersede_only_touches_derived_claims(db_path, fake_model, monkeypatch):
+    """Research- and enrichment-produced claims (e.g. a Snov.io-sourced email, a
+    LinkedIn-x-ray'd principal name) must NOT be superseded by a force re-run -- only wave
+    -1's own deterministic output, which is the only thing guaranteed to regenerate
+    identically-or-correctly from source data."""
+    with connection(db_path) as conn:
+        _seed_pursue_entity(conn, "e1", "Acme Capital Partners")
+        extra = [
+            {"field_name": "principal_name", "answer": "Jane Doe", "status": "confirmed",
+             "confidence": "high", "source_class": "site_scrape", "produced_by": "enrichment", "wave": "1"},
+        ]
+        upsert_claims(conn, "e1", extra)
+
+    _patch_all_network(monkeypatch)
+    fake_model.route(
+        lambda msgs: any("checking whether a web page" in str(m.content) for m in msgs),
+        *[AIMessage(content='{"supported": true, "reason": "ok"}') for _ in range(10)],
+    )
+    with connection(db_path) as conn:
+        await process_entity(conn, "e1", fake_model, force=True)
+        claims_after = get_claims(conn, "e1")
+
+    jane = [c for c in claims_after if c["field_name"] == "principal_name" and c["answer"] == "Jane Doe"]
+    assert jane, "the enrichment-produced claim must still be present"
+    assert jane[0]["status"] != "superseded"

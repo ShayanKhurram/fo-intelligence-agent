@@ -193,7 +193,11 @@ def check_v4_contradictions(claims: list[Claim]) -> tuple[list[Claim], list[Find
     }
 
     for key, group in groups.items():
-        settled = [c for c in group if c.status != "could_not_verify"]
+        # "superseded" excluded alongside could_not_verify: a claim wave -1 has already
+        # regenerated (or retracted) this run must never be compared against its own
+        # replacement as if both were live facts — see process_entity's force=True
+        # superseding step (app/enrichment.py).
+        settled = [c for c in group if c.status not in ("could_not_verify", "superseded")]
         for i, a in enumerate(settled):
             for b in settled[i + 1:]:
                 if a.status == "contradicted" and b.status == "contradicted":
@@ -324,7 +328,7 @@ def _any_settled(claims: list[Claim], field_names: tuple[str, ...]) -> bool:
     keys = set(field_names)
     return any(
         (c.field_name in keys or c.question_id in keys)
-        and c.status not in ("could_not_verify", "removed_failed_validation", "contradicted")
+        and c.status not in ("could_not_verify", "removed_failed_validation", "contradicted", "superseded")
         for c in claims
     )
 
@@ -627,7 +631,7 @@ async def run_validation(
     for i, claim in enumerate(claims):
         if credits_spent >= v1_credit_budget:
             break
-        if claim.status in ("contradicted", "removed_failed_validation", "could_not_verify"):
+        if claim.status in ("contradicted", "removed_failed_validation", "could_not_verify", "superseded"):
             continue
         if not claim.source_url:
             continue

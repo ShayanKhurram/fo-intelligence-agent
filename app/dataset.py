@@ -250,7 +250,9 @@ def _records_rows(selected: list[ProductionCandidate]) -> tuple[list[str], list[
             # keeping only the last one silently discards a decision-maker. See
             # app.validation._MULTI_VALUED_FIELDS for why V4 no longer calls these a
             # contradiction.
-            if fname in _MULTI_VALUED_FIELDS and cl.get("status") != "removed_failed_validation":
+            if fname in _MULTI_VALUED_FIELDS and cl.get("status") not in (
+                "removed_failed_validation", "superseded",
+            ):
                 answer = cl.get("answer")
                 if answer not in (None, ""):
                     bucket = multi.setdefault(fname, [])

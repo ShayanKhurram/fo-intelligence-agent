@@ -725,7 +725,8 @@ async def _find_dated_signal(canonical_name: str) -> Claim | None:
 def _settled_fields(claims: list[Claim]) -> set[str]:
     return {
         c.field_name for c in claims
-        if c.field_name and c.status not in ("could_not_verify", "removed_failed_validation")
+        if c.field_name
+        and c.status not in ("could_not_verify", "removed_failed_validation", "superseded")
     }
 
 
@@ -1041,6 +1042,24 @@ async def process_entity(
     domain = injected_facts.get("domain")
 
     existing = [_claim_from_row(r) for r in get_claims(conn, entity_id)]
+
+    if force:
+        # wave_minus_1 is a pure function of entity_sources: same input, same output. On a
+        # plain re-run entity_sources hasn't changed, so it just regenerates identical
+        # claims and V4's compatibility check treats them as confirmations, not conflicts.
+        # But if entity_sources HAS changed since the prior run (a backfilled/corrected
+        # value — exactly what happened after the 2026-08-12 13F-quarter fix), the fresh
+        # derivation now genuinely disagrees with the OLD derived claim still sitting in
+        # `existing`, and V4 correctly-but-uselessly reports the pipeline's own prior
+        # output as contradicting itself. Mark this entity's existing derived claims
+        # superseded before re-deriving, so the stale value is never compared against the
+        # fresh one as if both were live facts. The value and its history are kept (not
+        # blanked, not deleted) — only its authority is retracted.
+        existing = [
+            c.model_copy(update={"status": "superseded"}) if c.produced_by == "derived" else c
+            for c in existing
+        ]
+
     started_at = utcnow()
 
     minus1 = wave_minus_1(sources, canonical_name, entity["aliases"], entity_id=entity_id)

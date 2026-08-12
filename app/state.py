@@ -32,6 +32,16 @@ ClaimStatus = Literal[
     "pattern_inferred",
     "format_only",
     "removed_failed_validation",
+    # A wave -1 `produced_by="derived"` claim that a force=True re-run is about to
+    # regenerate from (possibly corrected) entity_sources. Stamped on the OLD claim
+    # before the fresh one is derived, so the two never sit side by side as equal,
+    # live facts. Not a rejection or a blank — the value and its history are kept, it is
+    # just no longer authoritative. Added 2026-08-12 after a 13F-quarter data backfill:
+    # without it, force-reprocessing left both the stale and corrected `aum_as_of`
+    # claims "confirmed"/"contradicted" side by side, and V4 correctly-but-uselessly
+    # flagged its OWN prior output as contradicting itself — every one of that run's 38
+    # rejects carried this artifact (see PROJECT_LOG.md).
+    "superseded",
 ]
 Confidence = Literal["high", "medium", "low"]
 Verdict = Literal["pursue", "pursue_low", "reject"]
