@@ -3,18 +3,23 @@ lane's tools — context isolation, not just organization: a people-lane researc
 never be tempted to call edgar_search."""
 from __future__ import annotations
 
+from app.tools.adv import adv_lookup
+from app.tools.crawl import fetch_page
 from app.tools.edgar import edgar_search, edgar_submissions
 from app.tools.gdelt import news_search
 from app.tools.linkedin import linkedin_company_profile, linkedin_jobs, linkedin_lookup, linkedin_people_profile
-from app.tools.serper import fetch_page, web_search
+from app.tools.serper import web_search
 from app.tools.propublica import nonprofit_lookup
 from app.tools.think import think_tool
 
 LANE_TOOLS = {
-    # linkedin_company_profile corroborates identity/type (industry, size, founding year)
+    # adv_lookup (SEC IAPD) is the authoritative answer to G1.Q4 (SFO vs MFO) and G1.Q5
+    # (plain RIA in costume) — registration status + branch count are structured facts,
+    # where the firm's own website only offers self-branding.
+    # linkedin_company_profile corroborates identity/type (now via Snov.io: domain).
     "identity_and_type": [
-        edgar_search, edgar_submissions, web_search, fetch_page, nonprofit_lookup,
-        linkedin_company_profile, think_tool,
+        edgar_search, edgar_submissions, adv_lookup, web_search, fetch_page,
+        nonprofit_lookup, linkedin_company_profile, think_tool,
     ],
     # linkedin_lookup (tier 1 SERP x-ray) finds a candidate profile URL;
     # linkedin_people_profile pulls full detail off it once found.
@@ -25,6 +30,7 @@ LANE_TOOLS = {
 
 __all__ = [
     "LANE_TOOLS",
+    "adv_lookup",
     "edgar_search",
     "edgar_submissions",
     "news_search",

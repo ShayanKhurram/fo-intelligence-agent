@@ -46,6 +46,32 @@ def _entity_id_for(normalized_name: str) -> str:
     return "disc_" + hashlib.sha1(normalized_name.encode("utf-8")).hexdigest()[:16]
 
 
+def _holdings_quarter(year: Any, qtr: Any) -> str | None:
+    """Convert the discovery feed's FILING quarter into the quarter the holdings are AS OF.
+
+    The feed's `year`/`qtr` are EDGAR's full-text-search bucket — i.e. when the 13F was
+    *filed*. A 13F is due within 45 days of quarter end, so a filing bucketed 2026Q3
+    reports positions as of **30 June 2026**, the end of 2026Q2.
+
+    Reading the filing quarter as the holdings quarter made every 13F-derived `aum_as_of`
+    exactly one quarter too late. That was not a silent error — Layer V's V1 judge caught it
+    **57 times**, by far its most common fatal finding ("the page shows a filing date of
+    06-30-2026 ... no assets under management for 2026Q3"), and each hit flipped `aum_as_of`
+    to `contradicted`. The findings were right and the data was wrong (2026-08-12).
+
+    Q1 wraps to the prior year's Q4 (a filing made in Jan-Mar reports 31 December holdings).
+    """
+    try:
+        year_i, qtr_i = int(year), int(qtr)
+    except (TypeError, ValueError):
+        return None
+    if not 1 <= qtr_i <= 4:
+        return None
+    if qtr_i == 1:
+        return f"{year_i - 1}Q4"
+    return f"{year_i}Q{qtr_i - 1}"
+
+
 def _map_source(record: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     """Returns (source_class, payload) for one discovery record."""
     discovery_class = record.get("discovery_class", "unknown")
@@ -55,10 +81,13 @@ def _map_source(record: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     if discovery_class == "edgar_13f":
         year = raw.get("year")
         qtr = raw.get("qtr")
-        quarter = f"{year}Q{qtr}" if year and qtr else None
+        quarter = _holdings_quarter(year, qtr)
         value_usd = raw.get("primary_doc", {}).get("tableValueTotal") or signals.get("aum_13f")
         payload = {
             "quarter": quarter,
+            # The filing quarter is kept alongside the holdings quarter so the one-quarter
+            # offset below stays auditable rather than looking like a transcription error.
+            "filed_in_quarter": f"{year}Q{qtr}" if year and qtr else None,
             "value_usd": int(float(value_usd)) if value_usd not in (None, "") else None,
             "position_count": signals.get("position_count"),
             "discovery_source_id": record.get("discovery_source_id"),

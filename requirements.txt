@@ -12,6 +12,14 @@ dnspython>=2.6,<3     # V5 domain/MX existence check (app/validation.py)
 trafilatura>=1.12,<3  # free-path page extraction, "free fetch first" (app/tools/freefetch.py)
 openpyxl>=3.1,<4       # Layer D XLSX workbook writer (app/dataset.py)
 
+# Page fetching (app/tools/crawl.py) — backs the `fetch_page` tool and freefetch's
+# escalation tier. Drives a real headless Chromium via Playwright, so JS-built pages render
+# instead of returning an empty shell. REQUIRES a one-time post-install browser step:
+#     pip install crawl4ai && crawl4ai-setup
+# (verify with `crawl4ai-doctor`). Without that step every fetch_page call degrades to an
+# error result rather than crashing.
+crawl4ai>=0.7,<1
+
 # Web frontend (T10)
 fastapi>=0.115,<1
 uvicorn[standard]>=0.30,<1

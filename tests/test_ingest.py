@@ -29,7 +29,10 @@ def test_ingest_maps_edgar_13f_to_13f_filing(db_path, tmp_path):
         assert len(order) == 1
         sources = get_entity_sources(conn, order[0])
         assert sources[0]["source_class"] == "13f_filing"
-        assert sources[0]["payload"]["quarter"] == "2026Q1"
+        # A 13F FILED in 2026Q1 reports holdings as of 31 Dec 2025 (2025Q4). The feed's
+        # year/qtr is the filing bucket; `quarter` is now the holdings period.
+        assert sources[0]["payload"]["quarter"] == "2025Q4"
+        assert sources[0]["payload"]["filed_in_quarter"] == "2026Q1"
         assert sources[0]["payload"]["value_usd"] == 1000
 
 

@@ -9,7 +9,14 @@ from datetime import date, timedelta
 from langchain_core.messages import AIMessage
 
 import app.enrichment as enrichment_module
-from app.enrichment import extract_jsonld_person, wave_0, wave_1, wave_2, wave_minus_1
+from app.enrichment import (
+    extract_jsonld_person,
+    resolve_domain,
+    wave_0,
+    wave_1,
+    wave_2,
+    wave_minus_1,
+)
 from app.state import Claim
 
 
@@ -217,18 +224,21 @@ def test_extract_jsonld_person_no_blocks():
 # --- wave 1: tiered resolution ---
 
 def _patch_wave1(monkeypatch, *, raw_html=None, free_fetch_content="", search_results=None,
-                  hunter_emails=None, gdelt_results=None, news_results=None):
+                  snov_emails=None, gdelt_results=None, news_results=None):
     async def _fake_raw_html(url):
         return raw_html
 
-    async def _fake_free_fetch(url, paid_fallback):
+    async def _fake_free_fetch(url, fallback=None):
         return {"url": url, "content": free_fetch_content, "extraction_method": "httpx_trafilatura"}
 
     async def _fake_search(query, topic="general", max_results=5):
         return {"results": search_results or [], "query": query}
 
-    async def _fake_hunter(domain):
-        return {"domain": domain, "pattern": None, "emails": hunter_emails or []}
+    async def _fake_snov_by_name(first_name, last_name, domain):
+        return {"results": snov_emails or []}
+
+    async def _fake_snov_domain(domain):
+        return {"results": snov_emails or []}
 
     async def _fake_gdelt(query, lookback_days=365, max_records=75):
         return {"results": gdelt_results or [], "query": query}
@@ -236,7 +246,8 @@ def _patch_wave1(monkeypatch, *, raw_html=None, free_fetch_content="", search_re
     monkeypatch.setattr(enrichment_module, "fetch_raw_html", _fake_raw_html)
     monkeypatch.setattr(enrichment_module, "fetch_page_free_first", _fake_free_fetch)
     monkeypatch.setattr(enrichment_module, "serper_search_raw", _fake_search)
-    monkeypatch.setattr(enrichment_module, "hunter_domain_search_raw", _fake_hunter)
+    monkeypatch.setattr(enrichment_module, "snov_emails_by_name_domain_raw", _fake_snov_by_name)
+    monkeypatch.setattr(enrichment_module, "snov_domain_search_raw", _fake_snov_domain)
     monkeypatch.setattr(enrichment_module, "news_search_raw", _fake_gdelt)
 
 
@@ -279,23 +290,48 @@ async def test_wave_1_skips_already_settled_decision_maker_from_wave_minus_1(mon
     assert gated is False  # existing decision-maker + newly found email channel
 
 
-async def test_wave_1_email_falls_back_to_hunter_when_site_scrape_empty(monkeypatch):
+async def test_wave_1_email_falls_back_to_snov_when_site_scrape_empty(monkeypatch):
+    """Tier 3 is Snov.io (it replaced Hunter.io). A name-targeted hit with a confidence
+    score at/above 70 is 'medium'; the source_class must be "snov" so
+    app/validation.py's cross-class rule scores it as a confirming vendor assertion."""
     _patch_wave1(
         monkeypatch,
         free_fetch_content="No email visible on this page at all.",
-        hunter_emails=[{"value": "jane@acmecap.com", "last_name": "Doe", "first_name": "Jane"}],
+        snov_emails=[
+            {"first_name": "Jane", "last_name": "Doe", "domain": "acmecap.com",
+             "email": "jane@acmecap.com", "confidence": 85, "status": "valid"}
+        ],
     )
     existing = [Claim(field_name="principal_name", answer="Jane Doe", status="confirmed", confidence="high")]
     new_claims, gated = await wave_1(existing, "Acme Capital Partners", domain="acmecap.com")
     email_claim = next(c for c in new_claims if c.field_name == "principal_email")
     assert email_claim.answer == "jane@acmecap.com"
-    assert email_claim.source_class == "hunter"
+    assert email_claim.source_class == "snov"
+    assert email_claim.extraction_method == "snov_emails_by_name_domain"
+    assert email_claim.confidence == "medium"
+
+
+async def test_wave_1_snov_low_confidence_score_downgrades_claim(monkeypatch):
+    """A weak Snov.io score must not be presented as a solid contact — anything under 70
+    stays "low" so a pattern-guessed address can't masquerade as verified."""
+    _patch_wave1(
+        monkeypatch,
+        free_fetch_content="No email visible on this page at all.",
+        snov_emails=[
+            {"first_name": "Jane", "last_name": "Doe", "domain": "acmecap.com",
+             "email": "jane@acmecap.com", "confidence": 20, "status": "unknown"}
+        ],
+    )
+    existing = [Claim(field_name="principal_name", answer="Jane Doe", status="confirmed", confidence="high")]
+    new_claims, _ = await wave_1(existing, "Acme Capital Partners", domain="acmecap.com")
+    email_claim = next(c for c in new_claims if c.field_name == "principal_email")
+    assert email_claim.confidence == "low"
 
 
 # --- wave 2: depth enrichment (survivors only) ---
 
 def _patch_wave2(monkeypatch, *, free_fetch_content="", search_results=None, gdelt_results=None):
-    async def _fake_free_fetch(url, paid_fallback):
+    async def _fake_free_fetch(url, fallback=None):
         return {"url": url, "content": free_fetch_content, "extraction_method": "httpx_trafilatura"}
 
     async def _fake_search(query, topic="general", max_results=5):
@@ -362,3 +398,85 @@ async def test_wave_2_corporate_linkedin_via_xray(monkeypatch, fake_model):
     corp = next((c for c in new_claims if c.field_name == "corporate_linkedin"), None)
     assert corp is not None
     assert corp.answer == "https://linkedin.com/company/acme-capital"
+
+
+# --- domain resolution (PLAN.md T16): the input every wave-1 contact tier is gated on ---
+#
+# All three "real SERP" cases below were captured from live Serper responses on 2026-08-12
+# while diagnosing why principal_email had never once been produced — they are the actual
+# first-five organic results for three entities from that pilot batch, not invented shapes.
+
+
+def _patch_serper(monkeypatch, urls):
+    async def _fake_search(query, topic="general", max_results=5):
+        return {"results": [{"title": u, "url": u, "content": None} for u in urls], "query": query}
+
+    monkeypatch.setattr(enrichment_module, "serper_search_raw", _fake_search)
+
+
+async def test_resolve_domain_takes_firms_own_site_over_aggregators(monkeypatch):
+    _patch_serper(monkeypatch, [
+        "https://icgadvisors.com/",
+        "https://icgadvisors.com/team/",
+        "https://www.linkedin.com/company/icg-advisors-llc",
+        "https://adviserinfo.sec.gov/firm/summary/148066",
+    ])
+    assert await resolve_domain("ICG Advisors, LLC") == "icgadvisors.com"
+
+
+async def test_resolve_domain_matches_when_label_equals_the_distinctive_token(monkeypatch):
+    _patch_serper(monkeypatch, [
+        "https://impactfolio.co/",
+        "https://www.facebook.com/IMPACTfolio/",
+        "https://fintrx.com/firms/firm/impactfolio-llc-291716",
+    ])
+    assert await resolve_domain("IMPACTfolio, LLC") == "impactfolio.co"
+
+
+async def test_resolve_domain_matches_acronym_prefix_of_a_longer_label(monkeypatch):
+    """"IMZ Advisory Inc" -> imzfinancialservices.com. The domain is not the firm name, so
+    a token-equality test would miss it; the label still *starts with* the one distinctive
+    token, which is the anchoring rule."""
+    _patch_serper(monkeypatch, [
+        "https://imzfinancialservices.com/",
+        "https://adviserinfo.sec.gov/firm/summary/314890",
+        "https://www.instagram.com/imz_financial/",
+    ])
+    assert await resolve_domain("IMZ Advisory Inc") == "imzfinancialservices.com"
+
+
+async def test_resolve_domain_returns_none_when_serp_is_all_aggregators(monkeypatch):
+    _patch_serper(monkeypatch, [
+        "https://www.linkedin.com/company/nobody-capital",
+        "https://adviserinfo.sec.gov/firm/summary/999999",
+        "https://m.yelp.com/biz/nobody-capital",
+        "https://www.bloomberg.com/profile/company/NOBODY",
+    ])
+    assert await resolve_domain("Nobody Capital LLC") is None
+
+
+async def test_resolve_domain_rejects_an_unrelated_firms_domain(monkeypatch):
+    """The false-positive this guard exists for: a real, non-aggregator site that simply
+    isn't this entity. Attributing it would poison every contact claim derived from it."""
+    _patch_serper(monkeypatch, ["https://someothercompany.com/", "https://unrelated-fund.io/"])
+    assert await resolve_domain("Bakken Family Office LLC") is None
+
+
+async def test_resolve_domain_ignores_generic_name_tokens(monkeypatch):
+    """"Family"/"Office"/"Capital" match hundreds of unrelated advisers, so a domain that
+    only matches on those is not a match at all (adv.py::distinctive_name_tokens)."""
+    _patch_serper(monkeypatch, ["https://familyoffice.com/", "https://capital.com/"])
+    assert await resolve_domain("Bakken Family Office") is None
+
+
+async def test_resolve_domain_survives_a_serper_error_result(monkeypatch):
+    async def _fake_search(query, topic="general", max_results=5):
+        return {"results": [], "query": query, "error": "SERPER_API_KEY not set"}
+
+    monkeypatch.setattr(enrichment_module, "serper_search_raw", _fake_search)
+    assert await resolve_domain("Acme Capital Partners") is None
+
+
+async def test_resolve_domain_skips_non_http_and_malformed_urls(monkeypatch):
+    _patch_serper(monkeypatch, ["", "not a url", "ftp://acmecap.com/pub", "https://acmecap.com/"])
+    assert await resolve_domain("Acme Capital Partners") == "acmecap.com"

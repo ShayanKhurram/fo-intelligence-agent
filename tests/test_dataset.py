@@ -220,3 +220,125 @@ def test_write_workbook_excluded_by_quota_appears_in_rejected_records(db_path, t
     rejected_rows = list(wb["rejected_records"].iter_rows(min_row=2, values_only=True))
     quota_excluded = [r for r in rejected_rows if r[1] == "quota"]
     assert len(quota_excluded) == 3
+
+
+# --- high-value columns are guaranteed + carry source_class (2026-08-12) ---
+
+
+def _candidate_with_claims(entity_id="e1", claims=None):
+    """Distinct from _candidate() above, which builds by score/class rather than by ledger."""
+    from app.dataset import build_candidate
+
+    entity = {"entity_id": entity_id, "canonical_name": "Acme FO"}
+    return build_candidate(entity, claims or [], "ship", "SFO")
+
+
+def test_high_value_columns_exist_even_when_no_record_has_the_field():
+    """Columns used to be derived only from fields present in the ledger, so when none of
+    the shipped records had an email the principal_email columns vanished from the sheet
+    entirely — the "silently empty" outcome plan §6.3 forbids, and worse than a blank cell
+    because a consumer cannot tell "looked, could not verify" from "not in this dataset".
+    Observed on the real 5-record output, where 0/5 carried any contact field."""
+    from app.dataset import _records_rows
+
+    cand = _candidate_with_claims(claims=[
+        {"field_name": "aum_usd", "answer": 100, "status": "confirmed",
+         "source_class": "13f_filing", "confidence": "high"},
+    ])
+    cols, rows = _records_rows([cand])
+    for f in ("principal_email", "principal_phone", "principal_name", "why_now_trigger"):
+        assert f in cols, f"{f} must always be a column"
+        assert f"{f}_status" in cols
+        assert f"{f}_source_class" in cols
+    assert rows[0]["principal_email"] is None
+    assert rows[0]["principal_email_status"] == "could_not_verify"
+    assert rows[0]["principal_email_source_class"] is None
+
+
+def test_source_class_sits_next_to_the_value():
+    """A principal_email from `snov` is a different proposition from one scraped off
+    `site_scrape`; the distinction must not require cross-referencing the provenance sheet."""
+    from app.dataset import _records_rows
+
+    cand = _candidate_with_claims(claims=[
+        {"field_name": "principal_email", "answer": "jane@acme.com", "status": "confirmed",
+         "source_class": "snov", "confidence": "medium"},
+        {"field_name": "principal_phone", "answer": "+15551234567", "status": "format_only",
+         "source_class": "site_scrape", "confidence": "low"},
+    ])
+    _, rows = _records_rows([cand])
+    assert rows[0]["principal_email"] == "jane@acme.com"
+    assert rows[0]["principal_email_source_class"] == "snov"
+    assert rows[0]["principal_phone_source_class"] == "site_scrape"
+
+
+def test_release_rule_blanks_the_value_but_keeps_its_source_class():
+    """The release rule kills the value, not the record of where it came from — the value
+    itself is preserved in audit_rejected_values. Seen live on First PREMIER Bank, whose
+    Snov-sourced email was blanked as removed_failed_validation."""
+    from app.dataset import _records_rows
+
+    cand = _candidate_with_claims(claims=[
+        {"field_name": "principal_email", "answer": "bad@acme.com",
+         "status": "removed_failed_validation", "source_class": "snov", "confidence": "low"},
+    ])
+    _, rows = _records_rows([cand])
+    assert rows[0]["principal_email"] is None
+    assert rows[0]["principal_email_status"] == "removed_failed_validation"
+    assert rows[0]["principal_email_source_class"] == "snov"
+
+
+def test_non_high_value_fields_get_no_companion_columns():
+    """Only high-value fields get the status/source_class pair; provenance remains the full
+    per-field audit trail for everything else."""
+    from app.dataset import _records_rows
+
+    cand = _candidate_with_claims(claims=[
+        {"field_name": "recent_news", "answer": "headline", "status": "confirmed",
+         "source_class": "news_article", "confidence": "low"},
+    ])
+    cols, _ = _records_rows([cand])
+    assert "recent_news" in cols
+    assert "recent_news_status" not in cols
+    assert "recent_news_source_class" not in cols
+
+
+def test_multiple_principal_names_are_joined_not_dropped():
+    """Layer D used last-write-wins per field, so a firm with two co-managing members
+    shipped only the last one — silently discarding a decision-maker."""
+    from app.dataset import _records_rows
+
+    cand = _candidate_with_claims(claims=[
+        {"field_name": "principal_name", "answer": "Mary C. McNutt", "status": "confirmed",
+         "source_class": "web_page", "confidence": "high"},
+        {"field_name": "principal_name", "answer": "Michelle J. Blass", "status": "confirmed",
+         "source_class": "web_page", "confidence": "high"},
+    ])
+    _, rows = _records_rows([cand])
+    assert rows[0]["principal_name"] == "Mary C. McNutt; Michelle J. Blass"
+
+
+def test_duplicate_principal_names_are_deduped():
+    from app.dataset import _records_rows
+
+    cand = _candidate_with_claims(claims=[
+        {"field_name": "principal_name", "answer": "Jane Doe", "status": "confirmed",
+         "source_class": "fec_employer", "confidence": "high"},
+        {"field_name": "principal_name", "answer": "Jane Doe", "status": "confirmed",
+         "source_class": "web_page", "confidence": "high"},
+    ])
+    _, rows = _records_rows([cand])
+    assert rows[0]["principal_name"] == "Jane Doe"
+
+
+def test_single_valued_field_is_unaffected_by_multi_value_handling():
+    from app.dataset import _records_rows
+
+    cand = _candidate_with_claims(claims=[
+        {"field_name": "aum_usd", "answer": 1, "status": "confirmed",
+         "source_class": "13f_filing", "confidence": "high"},
+        {"field_name": "aum_usd", "answer": 2, "status": "confirmed",
+         "source_class": "13f_filing", "confidence": "high"},
+    ])
+    _, rows = _records_rows([cand])
+    assert rows[0]["aum_usd"] == 2, "last write still wins for single-valued fields"

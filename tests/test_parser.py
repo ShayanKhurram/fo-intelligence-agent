@@ -18,7 +18,7 @@ def test_build_lead_brief_attaches_full_question_battery(db_path):
         brief, _ = build_lead_brief(conn, "E1")
     assert brief.canonical_name == "Acme Family Office"
     assert brief.aliases == ["Acme FO"]
-    assert len(brief.questions) == 12
+    assert len(brief.questions) == 11
     assert brief.budget.max_tool_calls == 8
 
 

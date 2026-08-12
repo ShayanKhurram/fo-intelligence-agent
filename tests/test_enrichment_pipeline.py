@@ -21,7 +21,7 @@ from app.enrichment import process_entity, run_pipeline
 
 
 def _patch_all_network(monkeypatch, *, edgar_hits=1, jsonld_html=None, page_content="",
-                        search_results=None, hunter_emails=None, gdelt_results=None):
+                        search_results=None, snov_emails=None, gdelt_results=None):
     async def _fake_edgar(query, forms=None):
         results = [{"url": "http://sec.gov/x"}] * edgar_hits
         return {"results": results, "query": query}
@@ -32,14 +32,17 @@ def _patch_all_network(monkeypatch, *, edgar_hits=1, jsonld_html=None, page_cont
     async def _fake_raw_html(url):
         return jsonld_html
 
-    async def _fake_free_fetch(url, paid_fallback):
+    async def _fake_free_fetch(url, fallback=None):
         return {"url": url, "content": page_content, "extraction_method": "httpx_trafilatura"}
 
     async def _fake_search(query, topic="general", max_results=5):
         return {"results": search_results or [], "query": query}
 
-    async def _fake_hunter(domain):
-        return {"domain": domain, "pattern": None, "emails": hunter_emails or []}
+    async def _fake_snov_by_name(first_name, last_name, domain):
+        return {"results": snov_emails or []}
+
+    async def _fake_snov_domain(domain):
+        return {"results": snov_emails or []}
 
     async def _fake_gdelt(query, lookback_days=365, max_records=75):
         return {"results": gdelt_results or [], "query": query}
@@ -49,7 +52,8 @@ def _patch_all_network(monkeypatch, *, edgar_hits=1, jsonld_html=None, page_cont
     monkeypatch.setattr(enrichment_module, "fetch_raw_html", _fake_raw_html)
     monkeypatch.setattr(enrichment_module, "fetch_page_free_first", _fake_free_fetch)
     monkeypatch.setattr(enrichment_module, "serper_search_raw", _fake_search)
-    monkeypatch.setattr(enrichment_module, "hunter_domain_search_raw", _fake_hunter)
+    monkeypatch.setattr(enrichment_module, "snov_emails_by_name_domain_raw", _fake_snov_by_name)
+    monkeypatch.setattr(enrichment_module, "snov_domain_search_raw", _fake_snov_domain)
     monkeypatch.setattr(enrichment_module, "news_search_raw", _fake_gdelt)
     monkeypatch.setattr(validation_module, "fetch_page_free_first", _fake_free_fetch)
 
@@ -170,3 +174,113 @@ async def test_run_pipeline_never_processes_structural_thin_reserve(db_path, fak
 
     assert summary["processed"] == []  # structural-thin, not promotable, never drawn
     assert summary["reserve_draws"] == 0
+
+
+# --- PLAN.md T16: contact tiers must actually fire for an entity with no domain_check ---
+
+
+async def test_process_entity_resolves_domain_and_lands_a_contact_channel(db_path, fake_model, monkeypatch):
+    """The regression this suite was missing, and the reason the enrichment layer produced
+    no `principal_email` in its entire live history (2026-08-12 pilot, PLAN.md T16).
+
+    Every entity in the real pool has NO `domain_check` source, so `injected_facts["domain"]`
+    was None, so wave 1's four domain-gated tiers never ran, so `have_channel` was
+    permanently False and wave 2 was permanently unreachable. Seeds exactly that shape —
+    no domain_check — and asserts a contact channel now lands.
+    """
+    with connection(db_path) as conn:
+        _seed_pursue_entity(conn, "e1", "Acme Capital Partners", with_domain=False)
+
+    _patch_all_network(
+        monkeypatch,
+        jsonld_html='<script type="application/ld+json">{"@type":"Person","name":"Jane Doe","jobTitle":"CIO"}</script>',
+        page_content="Contact us at jane@acmecap.com for inquiries.",
+        # The SERP the domain resolver reads: the firm's own site, behind an aggregator.
+        search_results=[
+            {"title": "Acme Capital Partners | LinkedIn", "url": "https://www.linkedin.com/company/acme"},
+            {"title": "Acme Capital Partners", "url": "https://acmecap.com/"},
+        ],
+    )
+    fake_model.route(
+        lambda msgs: any("extracting structured facts" in str(m.content) for m in msgs),
+        AIMessage(content="[]"),
+    )
+    fake_model.route(
+        lambda msgs: any("checking whether a web page" in str(m.content) for m in msgs),
+        *[AIMessage(content='{"supported": true, "reason": "confirmed on page"}') for _ in range(20)],
+    )
+
+    with connection(db_path) as conn:
+        result = await process_entity(conn, "e1", fake_model)
+        claims = get_claims(conn, "e1")
+
+    fields = {c["field_name"] for c in claims}
+    assert "principal_email" in fields, (
+        "no contact channel resolved — wave 1's domain-gated tiers did not run"
+    )
+    email = next(c for c in claims if c["field_name"] == "principal_email")
+    assert email["answer"] == "jane@acmecap.com"
+    # Channel + decision-maker settled means wave 1 did not gate, so wave 2 ran.
+    assert result["outcome"] in ("ship", "ship_with_caveats")
+
+
+async def test_process_entity_prefers_an_ingested_domain_over_resolving_one(db_path, fake_model, monkeypatch):
+    """An entity that DOES carry a domain_check source must use it and spend no Serper call
+    resolving one — the resolver is a fallback for missing ingestion, not a replacement."""
+    with connection(db_path) as conn:
+        _seed_pursue_entity(conn, "e1", "Acme Capital Partners", with_domain=True)
+
+    searched: list[tuple[str, str]] = []
+
+    _patch_all_network(monkeypatch, page_content="Reach us at ops@acmecap.com anytime.")
+
+    async def _tracking_search(query, topic="general", max_results=5):
+        searched.append((query, topic))
+        return {"results": [], "query": query}
+
+    monkeypatch.setattr(enrichment_module, "serper_search_raw", _tracking_search)
+    fake_model.route(
+        lambda msgs: any("extracting structured facts" in str(m.content) for m in msgs),
+        AIMessage(content="[]"),
+    )
+    fake_model.route(
+        lambda msgs: any("checking whether a web page" in str(m.content) for m in msgs),
+        *[AIMessage(content='{"supported": true, "reason": "confirmed on page"}') for _ in range(20)],
+    )
+
+    with connection(db_path) as conn:
+        await process_entity(conn, "e1", fake_model)
+
+    # The resolver's signature is the bare quoted name on the GENERAL endpoint. Wave 1's
+    # x-ray queries carry site:linkedin.com/in, and its dated-signal fallback issues the
+    # same bare name against topic="news" — so the topic is what discriminates.
+    assert ('"Acme Capital Partners"', "general") not in searched
+
+
+async def test_process_entity_wave0_reject_costs_no_domain_resolution(db_path, fake_model, monkeypatch):
+    """A wave-0 fatal must short-circuit before the resolver spends a Serper call."""
+    with connection(db_path) as conn:
+        upsert_entity(conn, "e1", "Definitely Not A Family Office Bank")
+        add_entity_source(conn, "e1", "13f_filing", {"quarter": "2026Q1", "value_usd": 1_000_000})
+        claims = [
+            {"question_id": "G1.Q3", "answer": "No affirmative family-office evidence found",
+             "status": "confirmed", "source_url": "http://x", "confidence": "high"},
+        ]
+        upsert_claims(conn, "e1", claims)
+        write_decision(conn, "e1", verdict="pursue", rationale="r", gate_results={},
+                       claim_ledger=claims, dead_ends=[])
+
+    searched: list[str] = []
+    _patch_all_network(monkeypatch)
+
+    async def _tracking_search(query, topic="general", max_results=5):
+        searched.append(query)
+        return {"results": [], "query": query}
+
+    monkeypatch.setattr(enrichment_module, "serper_search_raw", _tracking_search)
+
+    with connection(db_path) as conn:
+        result = await process_entity(conn, "e1", fake_model)
+
+    assert result["outcome"] == "reject"
+    assert searched == []

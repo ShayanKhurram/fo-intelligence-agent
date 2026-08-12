@@ -246,13 +246,27 @@ def test_v6_completeness_ignores_removed_failed_validation_claims():
 
 # --- release rule ---
 
-def test_release_rule_blanks_value_and_writes_audit_entry():
-    claims = [_claim(field_name="principal_email", answer="dead@nowhere.invalid")]
+def test_release_rule_no_longer_blanks_contacts_by_default():
+    """_RELEASABLE_FIELDS is deliberately empty as of 2026-08-12: a firm's public site
+    essentially never publishes a decision-maker's direct email, so verifying a contact
+    against it always failed and destroyed good Snov.io-sourced data. Contacts now ship
+    with their status and source_class attached, to be validated downstream."""
+    claims = [_claim(field_name="principal_email", answer="jane@acme.com")]
     out, audit = apply_release_rule(claims, failed_field_names={"principal_email"})
+    assert out[0].status == "confirmed", "the contact must survive to Layer D"
+    assert out[0].answer == "jane@acme.com"
+    assert audit == []
+
+
+def test_release_rule_mechanism_still_works_when_a_field_subscribes(monkeypatch):
+    """The rule is disarmed, not deleted — re-populating _RELEASABLE_FIELDS re-arms it."""
+    import app.validation as validation_module
+
+    monkeypatch.setattr(validation_module, "_RELEASABLE_FIELDS", frozenset({"principal_email"}))
+    claims = [_claim(field_name="principal_email", answer="dead@nowhere.invalid")]
+    out, audit = validation_module.apply_release_rule(claims, failed_field_names={"principal_email"})
     assert out[0].status == "removed_failed_validation"
     assert out[0].answer is None
-    assert len(audit) == 1
-    assert audit[0]["field_name"] == "principal_email"
     assert audit[0]["rejected_value"] == "dead@nowhere.invalid"
 
 
@@ -300,10 +314,15 @@ def test_phone_format_valid_rejects_garbage():
 
 # --- V1 source-supports-claim ---
 
-async def test_v1_empty_page_content_is_fatal_no_llm_call(fake_model):
+async def test_v1_empty_page_content_warns_rather_than_failing(fake_model):
+    """An unreadable source leaves a claim UNPROVEN, not disproven. Scoring it fatal flipped
+    the claim to "contradicted" and accounted for 42 of V1's 144 fatal findings — mostly
+    LinkedIn login walls and Cloudflare challenges, which say nothing either way
+    (2026-08-12). Still costs no LLM call."""
     claim = _claim(field_name="principal_name", answer="Jane Doe", source_url="http://x")
     finding, cost = await check_v1_source_supports_claim(claim, "", fake_model)
-    assert finding.severity == "fatal"
+    assert finding.severity == "warn"
+    assert "unproven" in finding.detail
     assert cost == 0.0
     assert fake_model.calls == []
 
@@ -353,12 +372,15 @@ async def test_run_validation_ships_clean_when_everything_supported(fake_model):
 
 
 async def test_run_validation_ships_with_caveats_when_release_rule_kills_only_contact_channel(fake_model):
-    """A missing/killed contact channel alone must NOT reject the whole record (2026-07-29
-    relaxation, see PROJECT_LOG.md) — it ships with that field honestly blank
-    (status=removed_failed_validation, never fabricated) since a real decision-maker +
-    dated signal are still present."""
-    # 2 queued V1 responses: only principal_name and why_now_trigger survive to V1 —
-    # both contradictory email claims get killed by the release rule before V1 runs.
+    """A contradicted contact channel alone must NOT reject the whole record (2026-07-29
+    relaxation, see PROJECT_LOG.md).
+
+    Updated 2026-08-12: the release rule no longer blanks contacts, so two genuinely
+    different emails are flagged `contradicted` by V4 and SHIP with their values intact for
+    downstream validation, instead of being destroyed. Nothing is written to
+    audit_rejected_values because nothing was rejected."""
+    # Only principal_name and why_now_trigger reach V1: both email claims are already
+    # `contradicted` by V4 (V1 skips non-settled claims), and contacts are V1-exempt anyway.
     for _ in range(2):
         fake_model.queue(AIMessage(content='{"supported": true, "reason": "ok"}'))
     claims = [
@@ -374,9 +396,10 @@ async def test_run_validation_ships_with_caveats_when_release_rule_kills_only_co
 
     assert dataset_input.outcome == "ship_with_caveats"
     email_statuses = {c.status for c in dataset_input.claim_ledger if c.field_name == "principal_email"}
-    assert email_statuses == {"removed_failed_validation"}
-    assert len(audit) == 2
-    assert all(a["reason_code"] == "verification_failed" for a in audit)
+    assert email_statuses == {"contradicted"}, "V4 still flags the conflict"
+    email_values = {c.answer for c in dataset_input.claim_ledger if c.field_name == "principal_email"}
+    assert email_values == {"jane@acme.com", "totally-different@other.com"}, "values must survive"
+    assert audit == [], "nothing was blanked, so nothing to audit"
 
 
 async def test_run_validation_skip_if_unchanged_carries_wave0_findings_forward(fake_model, monkeypatch):
@@ -479,3 +502,117 @@ async def test_v1_still_checks_aum_usd_and_aum_as_of(fake_model):
     vi = ValidationInput(entity_id="e1", claim_ledger=claims, waves_completed=["-1", "0"], wave0_findings=[])
     dataset_input, _, _ = await run_validation(vi, fake_model, fetch_fn=_supportive_fetch)
     assert len(fake_model.calls) == 1
+
+
+# --- V1 scope reductions (2026-08-12) ---
+
+
+async def test_v1_skips_serper_organic_sources(fake_model):
+    """A search-index hit can't confirm anything (NON_CONFIRMING_CLASSES) and its URL is
+    typically a login-walled LinkedIn profile, so V1 reliably "failed" it for reasons that
+    say nothing about the claim — burning a fetch and an LLM call each time."""
+    fetched = []
+
+    async def _tracking_fetch(url):
+        fetched.append(url)
+        return {"content": "some page text", "credits_spent": 0}
+
+    claims = [
+        Claim(field_name="principal_name", answer="Jane Doe", status="confirmed", confidence="low",
+              source_class="serper_organic", source_url="https://linkedin.com/in/janedoe"),
+    ]
+    vi = ValidationInput(entity_id="e1", claim_ledger=claims, waves_completed=["-1", "0", "1"], wave0_findings=[])
+    dataset_input, _, _ = await run_validation(vi, fake_model, fetch_fn=_tracking_fetch)
+
+    assert fetched == [], "V1 must not fetch a serper_organic source"
+    assert fake_model.calls == [], "V1 must not spend an LLM call on it"
+    name = next(c for c in dataset_input.claim_ledger if c.field_name == "principal_name")
+    assert name.status != "contradicted"
+
+
+async def test_v1_skips_contact_fields(fake_model):
+    """Contacts come from Snov.io but carry the firm's homepage as source_url — a page that
+    essentially never publishes a decision-maker's direct email. Asking V1 to verify one
+    against it is a category error, like the aum_basis exemption."""
+    fetched = []
+
+    async def _tracking_fetch(url):
+        fetched.append(url)
+        return {"content": "a page with no email on it", "credits_spent": 0}
+
+    claims = [
+        Claim(field_name="principal_email", answer="jane@acme.com", status="confirmed",
+              confidence="medium", source_class="snov", source_url="https://acme.com"),
+        Claim(field_name="principal_phone", answer="+15551234567", status="format_only",
+              confidence="low", source_class="site_scrape", source_url="https://acme.com"),
+    ]
+    vi = ValidationInput(entity_id="e1", claim_ledger=claims, waves_completed=["-1", "0", "1"], wave0_findings=[])
+    dataset_input, audit, _ = await run_validation(vi, fake_model, fetch_fn=_tracking_fetch)
+
+    assert fetched == []
+    assert audit == []
+    surviving = {c.field_name: c for c in dataset_input.claim_ledger}
+    assert surviving["principal_email"].answer == "jane@acme.com"
+    assert surviving["principal_phone"].answer == "+15551234567"
+
+
+async def test_v1_still_runs_on_a_real_sourced_field(fake_model):
+    """The scope reductions must not disarm V1 generally — a genuine page-backed claim is
+    still checked, and an unsupportive verdict still flips it to contradicted."""
+    fake_model.queue(AIMessage(content='{"supported": false, "reason": "page says otherwise"}'))
+
+    async def _fetch(url):
+        return {"content": "page text that disagrees", "credits_spent": 1}
+
+    claims = [
+        Claim(field_name="aum_usd", answer=123, status="confirmed", confidence="high",
+              source_class="13f_filing", source_url="https://sec.gov/x"),
+    ]
+    vi = ValidationInput(entity_id="e1", claim_ledger=claims, waves_completed=["-1", "0", "1"], wave0_findings=[])
+    dataset_input, _, _ = await run_validation(vi, fake_model, fetch_fn=_fetch)
+    aum = next(c for c in dataset_input.claim_ledger if c.field_name == "aum_usd")
+    assert aum.status == "contradicted"
+
+
+# --- multi-valued fields: co-principals are two facts, not a conflict (2026-08-12) ---
+
+
+def test_v4_does_not_contradict_two_different_principal_names():
+    """A family office routinely has two co-managing members, or a founder plus a president.
+    V4's substring heuristic read two people's names as a contradiction and flipped BOTH to
+    `contradicted`, which blocks G2.Q1's HARD gate and drops the record."""
+    claims = [
+        Claim(field_name="principal_name", answer="Mary C. McNutt", status="confirmed",
+              confidence="high", source_class="web_page", source_url="http://a"),
+        Claim(field_name="principal_name", answer="Michelle J. Blass", status="confirmed",
+              confidence="high", source_class="web_page", source_url="http://b"),
+    ]
+    out, findings = check_v4_contradictions(claims)
+    assert all(c.status == "confirmed" for c in out)
+    assert findings == []
+
+
+def test_v4_does_not_contradict_two_different_principal_titles():
+    claims = [
+        Claim(field_name="principal_title", answer="Co-Managing Member", status="confirmed",
+              confidence="high", source_url="http://a"),
+        Claim(field_name="principal_title", answer="President", status="confirmed",
+              confidence="high", source_url="http://b"),
+    ]
+    out, findings = check_v4_contradictions(claims)
+    assert all(c.status == "confirmed" for c in out)
+    assert findings == []
+
+
+def test_v4_still_contradicts_a_genuinely_single_valued_field():
+    """The exemption must be narrow — a firm has exactly one AUM figure for a given date, so
+    two wildly different values remain a real contradiction."""
+    claims = [
+        Claim(field_name="aum_usd", answer=150_000_000, status="confirmed",
+              confidence="high", source_class="13f_filing", source_url="http://a"),
+        Claim(field_name="aum_usd", answer=5_000_000, status="confirmed",
+              confidence="high", source_class="site_scrape", source_url="http://b"),
+    ]
+    out, findings = check_v4_contradictions(claims)
+    assert all(c.status == "contradicted" for c in out)
+    assert any(f.check_id == "V4_contradiction" for f in findings)

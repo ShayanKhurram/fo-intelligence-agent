@@ -31,7 +31,6 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.state import Claim, DatasetInput, FieldStatus, Finding, ValidationInput, utcnow
 from app.tools.freefetch import fetch_page_free_first
-from app.tools.serper import serper_scrape_raw
 
 # Search-index results are never themselves an authority — a hit must be fetched (which
 # turns it into site_scrape/web_page) before it can confirm anything else. "note
@@ -48,7 +47,14 @@ CONFIRMING_CLASSES: dict[str, bool] = {
     "domain_check": True, "edgar_filing": True, "fec_employer": True, "ppp_loans": True,
     "web_page": True, "news_article": True, "linkedin_profile": True,
     # Enrichment classes (plan §5's explicit list)
-    "site_scrape": True, "hunter": True, "derived_13f": True, "derived_5500": True,
+    "site_scrape": True, "derived_13f": True, "derived_5500": True,
+    # Snov.io replaced Hunter.io as the email/profile provider. Kept CONFIRMING for the
+    # same reason "hunter" was: it is a data vendor asserting a fact about a specific
+    # person at a specific domain, not a search index that merely points at a page. The
+    # "hunter" key stays mapped so historical claims already in the ledger (produced before
+    # the swap) keep their corroboration weight rather than silently becoming
+    # non-confirming on the next validation re-run.
+    "snov": True, "hunter": True,
     "serper_organic": False,  # search index only — see NON_CONFIRMING_CLASSES
     "gdelt": False,  # article index — the article itself (news_article) confirms, not the index hit
 }
@@ -142,6 +148,22 @@ def apply_cross_class_rule(claims: list[Claim], now: datetime | None = None) -> 
     return out
 
 
+# Fields that legitimately hold MORE THAN ONE value, so two different answers are two facts
+# rather than a conflict. V4's pairwise incompatibility check is skipped for these.
+#
+# `principal_name` is the motivating case: a family office routinely has two co-managing
+# members, or a founder plus a president, and V4's `_answers_compatible` (a substring
+# heuristic built for scalars) reads two different people's names as a contradiction and
+# flips BOTH to `contradicted` — which then blocks G2.Q1's HARD gate and drops the record.
+# Real example from the ledger: "Co-Managing Members Mary C. McNutt and Michelle J. Blass".
+#
+# `principal_title` rides along because it is meaningless to keep multiple names while
+# collapsing their titles to one. CAVEAT, stated rather than hidden: name<->title PAIRING is
+# not modelled — the ledger holds a set of names and a set of titles, not (name, title)
+# couples. Consumers must not assume the Nth title belongs to the Nth name.
+_MULTI_VALUED_FIELDS: frozenset[str] = frozenset({"principal_name", "principal_title"})
+
+
 def check_v4_contradictions(claims: list[Claim]) -> tuple[list[Claim], list[Finding]]:
     """V4 — same field, incompatible answers from >=2 settled claims -> both flip to
     "contradicted". Re-run post-enrichment because enrichment can introduce a claim
@@ -167,6 +189,7 @@ def check_v4_contradictions(claims: list[Claim]) -> tuple[list[Claim], list[Find
         field_name: group
         for field_name, group in _group_by_field(out).items()
         if any(c.field_name == field_name for c in group)  # exclude question_id-only groups
+        and field_name not in _MULTI_VALUED_FIELDS
     }
 
     for key, group in groups.items():
@@ -342,7 +365,25 @@ def check_v6_completeness(claims: list[Claim]) -> list[Finding]:
 # "Release rule enforcement" + §6.3's "never silently empty" cell rule). Contact fields
 # only — the release rule is about not shipping an undeliverable contact, not about
 # suppressing every unverifiable soft field.
-_RELEASABLE_FIELDS = frozenset({"principal_email", "principal_phone", "secondary_contact_email", "secondary_contact_phone"})
+# DELIBERATELY EMPTY as of 2026-08-12 — the release rule no longer blanks anything.
+#
+# It used to blank the four contact fields when Layer V couldn't verify them. In practice
+# that meant blanking almost every contact the pipeline found, for a structural reason:
+# a firm's public website essentially never publishes a decision-maker's direct email or
+# phone. So V1 would fetch `https://<domain>`, ask "does this page contain
+# alan@accredited.com?", correctly answer no, and the release rule would destroy a perfectly
+# good Snov.io-sourced contact.
+#
+# The deeper flaw is provenance, not strictness: `app.enrichment._find_email_via_snov` sets
+# `source_url` to the firm's homepage even though the email came from Snov.io's API, so V1
+# was checking a page that was never the claim's source. Same category error as the
+# `aum_basis` V1 exemption.
+#
+# Contacts now SHIP with their status and source_class attached (Layer D carries
+# `principal_email_source_class`), to be validated downstream by a real deliverability
+# check rather than by asking whether a marketing page happens to mention them.
+# The mechanism below is kept intact — re-populate this set to re-arm it for any field.
+_RELEASABLE_FIELDS: frozenset[str] = frozenset()
 
 
 def apply_release_rule(
@@ -386,7 +427,25 @@ def apply_release_rule(
 # completely useless — the claim `aum_basis="13f_floor"` describes HOW aum_usd was
 # computed, not a fact extractable from prose. `aum_usd`/`aum_as_of` stay in scope —
 # a dollar figure and a filing quarter genuinely are facts a filing page states.
-_V1_EXEMPT_FIELDS: frozenset[str] = frozenset({"aum_basis"})
+_V1_EXEMPT_FIELDS: frozenset[str] = frozenset({
+    "aum_basis",
+    # Contact fields: same category error, different shape. These come from Snov.io's
+    # database (or a site-wide scrape), but the claim's source_url is the firm's homepage —
+    # a page that essentially never publishes a decision-maker's direct email or phone.
+    # Asking V1 "does this page support alan@accredited.com?" is therefore guaranteed to
+    # answer no regardless of whether the address is real, so the check carries no
+    # information and only produced false contradictions. Deliverability is the right test
+    # for these and it isn't a page-content question (2026-08-12).
+    "principal_email", "principal_phone",
+    "secondary_contact_email", "secondary_contact_phone",
+})
+
+# Source classes V1 must not spend a call on. A search-index hit is already incapable of
+# confirming anything (NON_CONFIRMING_CLASSES), and its URL is typically a LinkedIn profile
+# that returns a login wall to any fetcher — so V1 reliably "fails" it for reasons that say
+# nothing about the claim. 42 of V1's 144 fatal findings were exactly this: an unreadable
+# page scored as a contradiction (2026-08-12).
+_V1_SKIP_SOURCE_CLASSES: frozenset[str] = frozenset({"serper_organic"})
 
 _V1_SYSTEM_PROMPT = (
     "You are checking whether a web page's content supports a specific factual claim "
@@ -420,9 +479,16 @@ async def check_v1_source_supports_claim(claim: Claim, page_content: str, model:
     fail-safe posture as app.verdict._llm_soft_gate_pass's parse-failure default."""
     field = claim.field_name or claim.question_id
     if not page_content.strip():
+        # WARN, not FATAL: an unreadable source leaves the claim UNPROVEN, not disproven.
+        # "I couldn't read the page" is not evidence the claim is false — most of these are
+        # LinkedIn login walls and Cloudflare challenges, which say nothing either way.
+        # Scoring them fatal flipped the claim to "contradicted" and accounted for 42 of
+        # V1's 144 fatal findings (2026-08-12). Same fail-safe posture as the judge-parse
+        # failure below, and the same distinction app/researcher.py draws between
+        # `tool_unavailable` and `no_evidence_found`.
         return Finding(
-            check_id="V1_source_supports", severity="fatal", field=field,
-            detail="source page fetch returned no extractable content",
+            check_id="V1_source_supports", severity="warn", field=field,
+            detail="source page fetch returned no extractable content — claim unproven, not disproven",
             claim_id=claim.claim_id, evidence_url=claim.source_url,
         ), 0.0
 
@@ -455,9 +521,15 @@ async def check_v1_source_supports_claim(claim: Claim, page_content: str, model:
 
 async def _default_v1_fetch(url: str) -> dict[str, Any]:
     """Free-fetch-first (plan §5's ring-fence: "Free-path fetches... don't draw from the
-    ring-fence — prefer them here too"). `credits_spent` is 0 on the free path, 1 when
-    it fell back to a paid Serper scrape."""
-    result = await fetch_page_free_first(url, serper_scrape_raw)
+    ring-fence — prefer them here too"). `credits_spent` is 0 on the cheap
+    httpx+trafilatura path, 1 on the escalation tier.
+
+    The escalation tier is now a Crawl4AI browser render rather than a paid Serper scrape,
+    so that 1 is no longer literally a purchased API credit — it is a unit of *wall time*
+    (a Chromium render, seconds not milliseconds). `v1_credit_budget` is still the right
+    bound to charge it against: V1 runs ~150x per validation pass, and letting every one of
+    those escalate to a browser render unbounded would dominate the run's duration."""
+    result = await fetch_page_free_first(url)
     credits_spent = 0 if result.get("extraction_method") == "httpx_trafilatura" else 1
     return {"content": result.get("content", ""), "credits_spent": credits_spent}
 
@@ -559,7 +631,12 @@ async def run_validation(
             continue
         if not claim.source_url:
             continue
-        if claim.field_name in _V1_EXEMPT_FIELDS:
+        if (claim.field_name or claim.question_id) in _V1_EXEMPT_FIELDS:
+            continue
+        if claim.source_class in _V1_SKIP_SOURCE_CLASSES:
+            # A search-index hit can't confirm anything anyway, and its URL is usually a
+            # login-walled LinkedIn profile — V1 would burn a fetch and an LLM call to
+            # produce a meaningless "unsupported". See _V1_SKIP_SOURCE_CLASSES.
             continue
         fetched = await fetch_fn(claim.source_url)
         credits_spent += fetched.get("credits_spent", 1)

@@ -67,7 +67,7 @@ async def test_full_graph_pursue_path(db_path, fake_model):
     fake_model.route(_sys_contains("You are the activity_signals researcher"), AIMessage(content="no leads", tool_calls=[]))
     fake_model.route(
         _sys_contains_all("compress a researcher", "G3.Q1"),
-        AIMessage(content='[{"question_id":"G3.Q3","answer":"clean","status":"confirmed","source_url":"http://x","source_class":"news","confidence":"medium"}]'),
+        AIMessage(content='[{"question_id":"G3.Q2","answer":"recent hire","status":"confirmed","source_url":"http://x","source_class":"news","confidence":"medium"}]'),
     )
     fake_model.route(
         _sys_contains("final judgment pass"),
@@ -81,7 +81,7 @@ async def test_full_graph_pursue_path(db_path, fake_model):
     assert result["gate_results"]["reject"] is False
     assert result["dead_ends"] == []
     claim_ids = {c["question_id"] for c in result["claims"]}
-    assert {"G1.Q1", "G1.Q2", "G1.Q3", "G1.Q5", "G1.Q6", "G2.Q1", "G3.Q3", "G1.Q4"}.issubset(claim_ids)
+    assert {"G1.Q1", "G1.Q2", "G1.Q3", "G1.Q5", "G1.Q6", "G2.Q1", "G1.Q4"}.issubset(claim_ids)
 
     with connection(db_path) as conn:
         rows = conn.execute("SELECT * FROM decisions WHERE entity_id = 'E1'").fetchall()

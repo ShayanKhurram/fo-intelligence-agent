@@ -51,9 +51,10 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def _env_key_list(name: str) -> tuple[str, ...]:
     """Comma-separated multi-key support for tools with a per-key rate/credit limit
-    (Serper, Hunter) — `app.tools.keyrotation.KeyRotator` rotates through these when one
-    hits a 429, so a long batch run doesn't stall on one exhausted key. A single key is
-    just a list of one; nothing changes for anyone who only ever set one."""
+    (Serper) — `app.tools.keyrotation.KeyRotator` rotates through these when one is spent,
+    so a long batch run doesn't stall on one exhausted key. A single key is just a list of
+    one; nothing changes for anyone who only ever set one. Note the rotation trigger is NOT
+    simply a 429 — see `app.tools.keyrotation.is_exhaustion_response`."""
     raw = os.environ.get(name, "")
     return tuple(k.strip() for k in raw.split(",") if k.strip())
 
@@ -90,6 +91,9 @@ class RunnerConfig:
     warn_at_fraction: float = _env_float("FOIA_BUDGET_WARN_FRACTION", 0.75)
     sec_rate_per_sec: float = _env_float("FOIA_SEC_RATE_PER_SEC", 10.0)
     linkedin_rate_per_sec: float = _env_float("FOIA_LINKEDIN_RATE_PER_SEC", 0.5)
+    # Snov.io documents a 60 requests/minute cap. 1/s keeps the whole batch under it, and
+    # the async start/result pattern means each logical lookup is >=2 requests.
+    snov_rate_per_sec: float = _env_float("FOIA_SNOV_RATE_PER_SEC", 1.0)
     # GDELT has no published rate limit, but the first live pilot run got 429s on every
     # single call under 8-way batch concurrency — 1/s is a conservative global default.
     gdelt_rate_per_sec: float = _env_float("FOIA_GDELT_RATE_PER_SEC", 1.0)
@@ -115,19 +119,17 @@ class ToolEndpoints:
     propublica_base_url: str = os.environ.get(
         "PROPUBLICA_BASE_URL", "https://projects.propublica.org/nonprofits/api/v2"
     )
-    # Deprecated free-form override, kept for anyone who wired a custom command before
-    # the vendored scraper (below) existed. Leave unset to use the vendored one.
-    linkedin_scraper_cmd: str = os.environ.get("LINKEDIN_SCRAPER_CMD", "")
     # vendor/linkedin_scraper — python-scrapy-playbook/linkedin-python-scrapy-scraper,
     # patched to accept runtime args (see app/tools/linkedin.py). Requires SCRAPEOPS_API_KEY.
     linkedin_scraper_dir: str = os.environ.get("LINKEDIN_SCRAPER_DIR", "vendor/linkedin_scraper")
     scrapeops_api_key: str = os.environ.get("SCRAPEOPS_API_KEY", "")
-    # Serper.dev — Google SERP search backend for `web_search` (google.serper.dev) and
-    # page-scrape backend for `fetch_page` (scrape.serper.dev). Replaces the self-hosted
-    # OrioSearch/SearXNG backend entirely (SearXNG returned irrelevant results on long-tail
-    # entity queries; OrioSearch's local Docker container was a single point of failure).
-    # When the key is unset, both web_search and fetch_page degrade to an empty/error
-    # result rather than raising. Key from https://serper.dev.
+    # Serper.dev — Google SERP search backend for `web_search` (google.serper.dev).
+    # Replaces the self-hosted OrioSearch/SearXNG backend entirely (SearXNG returned
+    # irrelevant results on long-tail entity queries; OrioSearch's local Docker container
+    # was a single point of failure). When the key is unset, web_search degrades to an
+    # empty/error result rather than raising. Key from https://serper.dev.
+    # Serper's paid scrape endpoint is no longer used — page fetching moved to Crawl4AI
+    # (app/tools/crawl.py), so there is no serper_scrape_url here any more.
     # SERPER_API_KEY may be a single key or a comma-separated list (multi-key rotation,
     # app/tools/keyrotation.py) — serper_api_key stays the first one for any call site
     # that only ever wanted one (e.g. runner.py's preflight check); serper_api_keys is
@@ -135,14 +137,14 @@ class ToolEndpoints:
     serper_api_key: str = os.environ.get("SERPER_API_KEY", "").split(",")[0].strip()
     serper_api_keys: tuple[str, ...] = field(default_factory=lambda: _env_key_list("SERPER_API_KEY"))
     serper_base_url: str = os.environ.get("SERPER_BASE_URL", "https://google.serper.dev")
-    serper_scrape_url: str = os.environ.get("SERPER_SCRAPE_URL", "https://scrape.serper.dev")
-    # Hunter.io — email discovery for enrichment wave 1 (app/tools/hunter.py). Free tier:
-    # 50 credits/month. Unset -> hunter_domain_search_raw degrades to an empty result
-    # with no HTTP call, same pattern as every other optional-key tool here.
-    # Also supports a comma-separated multi-key list, same rotation pattern as Serper.
-    hunter_api_key: str = os.environ.get("HUNTER_API_KEY", "").split(",")[0].strip()
-    hunter_api_keys: tuple[str, ...] = field(default_factory=lambda: _env_key_list("HUNTER_API_KEY"))
-    hunter_base_url: str = os.environ.get("HUNTER_BASE_URL", "https://api.hunter.io")
+    # Snov.io — replaced Hunter.io for email discovery (enrichment wave 1) AND the vendored
+    # LinkedIn scraper for people/company lookups (app/tools/snov.py). Auth is an OAuth2
+    # client_credentials pair from the account's API settings, not a bare API key:
+    # SNOV_CLIENT_ID + SNOV_CLIENT_SECRET. Unset -> every snov_* function degrades to an
+    # error result with no HTTP call, same pattern as every other optional-credential tool.
+    snov_client_id: str = os.environ.get("SNOV_CLIENT_ID", "").strip()
+    snov_client_secret: str = os.environ.get("SNOV_CLIENT_SECRET", "").strip()
+    snov_base_url: str = os.environ.get("SNOV_BASE_URL", "https://api.snov.io")
 
 
 @dataclass(frozen=True)

@@ -29,6 +29,7 @@ from app.db import (
     get_rejections,
     write_production_record,
 )
+from app.validation import _MULTI_VALUED_FIELDS
 
 MAX_PER_CLASS = 15  # 30% of 50 — plan §6.1
 
@@ -195,15 +196,36 @@ def gather_survivors(conn, entity_outcomes: list[tuple[str, str, str]]) -> list[
 
 
 def _records_rows(selected: list[ProductionCandidate]) -> tuple[list[str], list[dict[str, Any]]]:
-    """One row per entity, one column per field_name (plus a `<field>_status`
-    companion column for every high-value field — plan §6.3: "populated, or blank with
-    could_not_verify status column. Never silently empty.")."""
+    """One row per entity, one column per field_name, plus `<field>_status` and
+    `<field>_source_class` companion columns for every high-value field — plan §6.3:
+    "populated, or blank with could_not_verify status column. Never silently empty."
+
+    Two things this function gets deliberately right, both learned the hard way:
+
+    1. **Every high-value field ALWAYS gets its columns**, even when no selected record has
+       a claim for it. Columns used to be derived purely from fields present in the ledger,
+       so when none of the shipped records had an email the `principal_email` and
+       `principal_email_status` columns vanished from the sheet entirely. That is exactly
+       the "silently empty" outcome the plan forbids — and it is worse than a blank cell,
+       because a consumer cannot distinguish "we looked and could not verify it" from "this
+       field is not part of the dataset". Observed on the current 5-record output, where
+       0/5 records carried any contact field.
+
+    2. **`<field>_source_class` sits next to the value**, so a reader can judge a cell
+       without cross-referencing the `provenance` sheet. A `principal_email` sourced from
+       `snov` is a different proposition from one scraped off `site_scrape`, and the whole
+       point of the claim ledger is that the distinction stays attached to the value.
+       (`provenance` remains the full audit trail — every field, plus confirming_url,
+       confirming_class and verification_method.)
+    """
     present_fields: set[str] = set()
     for c in selected:
         present_fields.update(cl["field_name"] for cl in c.claims if cl.get("field_name"))
 
-    ordered = [f for f in _COLUMN_ORDER if f in present_fields]
-    ordered += sorted(present_fields - set(ordered))
+    # High-value fields are guaranteed columns whether or not anyone has one.
+    all_fields = present_fields | set(_HIGH_VALUE_FIELDS)
+    ordered = [f for f in _COLUMN_ORDER if f in all_fields]
+    ordered += sorted(all_fields - set(ordered))
 
     columns: list[str] = ["entity_id", "canonical_name", "type_final", "outcome"]
     for f in ordered:
@@ -212,23 +234,47 @@ def _records_rows(selected: list[ProductionCandidate]) -> tuple[list[str], list[
         columns.append(f)
         if f in _HIGH_VALUE_FIELDS:
             columns.append(f"{f}_status")
+            columns.append(f"{f}_source_class")
 
     rows = []
     for c in selected:
         latest: dict[str, dict[str, Any]] = {}
+        multi: dict[str, list[str]] = {}
         for cl in c.claims:
             fname = cl.get("field_name")
-            if fname:
-                latest[fname] = cl  # last write wins, same convention as elsewhere
+            if not fname:
+                continue
+            latest[fname] = cl  # last write wins, same convention as elsewhere
+            # Multi-valued fields must not lose their other values to last-write-wins: a
+            # firm with two co-managing members has two real principal_name claims, and
+            # keeping only the last one silently discards a decision-maker. See
+            # app.validation._MULTI_VALUED_FIELDS for why V4 no longer calls these a
+            # contradiction.
+            if fname in _MULTI_VALUED_FIELDS and cl.get("status") != "removed_failed_validation":
+                answer = cl.get("answer")
+                if answer not in (None, ""):
+                    bucket = multi.setdefault(fname, [])
+                    if str(answer) not in bucket:
+                        bucket.append(str(answer))
         row: dict[str, Any] = {"entity_id": c.entity_id, "canonical_name": c.canonical_name,
                                 "type_final": c.type_final, "outcome": c.outcome}
         for f in ordered:
             if f in ("entity_id", "canonical_name", "type_final"):
                 continue
             claim = latest.get(f)
-            row[f] = claim["answer"] if claim and claim["status"] != "removed_failed_validation" else None
+            if f in _MULTI_VALUED_FIELDS and multi.get(f):
+                # "; " rather than a list, so the XLSX cell and the Postgres TEXT column
+                # both stay a plain string. Order is first-seen (wave -1 discovery data
+                # before wave-1 research), not ranked.
+                row[f] = "; ".join(multi[f])
+            else:
+                row[f] = claim["answer"] if claim and claim["status"] != "removed_failed_validation" else None
             if f in _HIGH_VALUE_FIELDS:
                 row[f"{f}_status"] = claim["status"] if claim else "could_not_verify"
+                # A blanked value keeps its source_class: the release rule killed the value,
+                # not the record of where it came from (the value itself is preserved in
+                # audit_rejected_values).
+                row[f"{f}_source_class"] = claim.get("source_class") if claim else None
         rows.append(row)
     return columns, rows
 

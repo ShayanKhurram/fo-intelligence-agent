@@ -88,13 +88,19 @@ QUESTION_BATTERY: list[QuestionSpec] = [
         gate="SOFT",
         on_unknown="ship_with_label",
     ),
-    QuestionSpec(
-        question_id="G3.Q3",
-        text="Does a scandal/enforcement-action check come back clean?",
-        lane="activity_signals",
-        gate="HARD",
-        on_unknown="ship_with_label",
-    ),
+    # G3.Q3 ("does a scandal/enforcement-action check come back clean?") was REMOVED
+    # 2026-08-12. It was nominally a HARD gate but had no gating power in practice:
+    #   * on_unknown="ship_with_label" meant an unanswered check never rejected, and
+    #   * evaluate_hard_gates tests claim *status* only, so a settled NEGATIVE answer
+    #     ("No — a class-action was filed over a data breach") came back status="confirmed"
+    #     and passed the gate too. Observed live on PATHSTONE FAMILY OFFICE.
+    # So it could not reject anything, while costing the activity lane several web_search
+    # calls per lead chasing scandal coverage. Dropped rather than repaired.
+    #
+    # If scandal screening is wanted back, the cheap route is mechanical, not another
+    # question: app/tools/adv.py's `adv_lookup` already returns `has_disclosure_events`
+    # (IAPD's regulatory-disclosure flag) for free, inside a call the identity lane makes
+    # anyway. That is a structured fact, not an LLM judgement over news coverage.
 ]
 
 QUESTIONS_BY_LANE: dict[str, list[QuestionSpec]] = {}

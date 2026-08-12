@@ -8,7 +8,7 @@ from app.state import new_supervisor_state
 
 ALL_HARD_CONFIRMED = [
     {"question_id": qid, "answer": "ok", "status": "confirmed", "source_url": "http://x", "confidence": "high"}
-    for qid in ("G1.Q1", "G1.Q2", "G1.Q3", "G1.Q5", "G1.Q6", "G2.Q1", "G3.Q3")
+    for qid in ("G1.Q1", "G1.Q2", "G1.Q3", "G1.Q5", "G1.Q6", "G2.Q1")
 ]
 
 
@@ -36,11 +36,14 @@ def test_deprioritize_policy_survives_but_forces_low():
 
 
 def test_ship_with_label_policy_survives_without_forcing_low():
-    claims = [c for c in ALL_HARD_CONFIRMED if c["question_id"] not in ("G3.Q3",)]
+    """G1.Q2 (current legal name) is the HARD gate carrying on_unknown="ship_with_label":
+    unanswered, it neither rejects nor caps the lead — it only attaches a label. G3.Q3 used
+    to be the example here, but it was removed from the battery on 2026-08-12."""
+    claims = [c for c in ALL_HARD_CONFIRMED if c["question_id"] not in ("G1.Q2",)]
     gates = evaluate_hard_gates(claims)
     assert gates["reject"] is False
     assert gates["force_low"] is False
-    assert any("G3.Q3" in label for label in gates["labels"])
+    assert any("G1.Q2" in label for label in gates["labels"])
 
 
 def test_all_confirmed_no_labels():

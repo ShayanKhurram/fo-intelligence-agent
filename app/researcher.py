@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -39,16 +40,69 @@ async def _summarize_text(text: str) -> tuple[str, float]:
     return str(resp.content).strip() or text[:240], cost
 
 
+# Keys `_format_tool_result_as_note` renders explicitly; everything else in a result row is
+# rendered as compact key=value so structured facts are not silently dropped.
+_NOTE_HANDLED_KEYS = frozenset(
+    {"title", "url", "content", "snippet", "seendate", "filed_at", "date", "cache_hit"}
+)
+_NOTE_MAX_FIELDS = 12
+_NOTE_MAX_VALUE_CHARS = 120
+
+
+def _render_extra_fields(row: dict[str, Any]) -> str:
+    """Render a result row's remaining structured fields as `key=value` pairs.
+
+    This exists because the original formatter emitted only title/url/date/snippet, which
+    silently threw away every other field a structured tool returned. The consequences were
+    not subtle (found live 2026-08-12):
+      * `adv_lookup` results reached the model as a bare URL twice — `sec_number=801-70776`,
+        `branches_count=162`, `is_registered_investment_adviser=True` and `name_match=exact`
+        were all dropped, so the tool that exists specifically to settle G1.Q4/G1.Q5
+        delivered nothing and G1.Q4 stayed could_not_verify.
+      * `edgar_search` hits lost `company_name` and `form_type`, so the model cited EDGAR
+        archive URLs without ever seeing which company or filing type they belonged to.
+    Values are truncated and capped in count so a wide record cannot flood a lane's context.
+    """
+    parts: list[str] = []
+    for key, value in row.items():
+        if key in _NOTE_HANDLED_KEYS or value is None or value == "" or value == []:
+            continue
+        if isinstance(value, (list, tuple)):
+            rendered = ", ".join(str(v) for v in list(value)[:5])
+        elif isinstance(value, dict):
+            rendered = ", ".join(f"{k}={v}" for k, v in list(value.items())[:5] if v)
+        else:
+            rendered = str(value)
+        rendered = rendered[:_NOTE_MAX_VALUE_CHARS]
+        if rendered:
+            parts.append(f"{key}={rendered}")
+        if len(parts) >= _NOTE_MAX_FIELDS:
+            break
+    return "; ".join(parts)
+
+
 async def _format_tool_result_as_note(tool_name: str, result: dict[str, Any]) -> tuple[str, float]:
-    """Turns a raw tool result into a compact note. URL/date fields are copied verbatim
-    from the structured result — never passed through the summarizer — so provenance can
-    never be corrupted by a lossy summary (plan §4.4). Returns (note, summarizer_cost_usd)."""
+    """Turns a raw tool result into a compact note. URL/date fields and all other structured
+    fields are copied verbatim from the result — never passed through the summarizer — so
+    provenance and figures can never be corrupted by a lossy summary (plan §4.4). Only
+    free-text snippets are summarized. Returns (note, summarizer_cost_usd)."""
     total_cost = 0.0
     if "results" in result:
-        lines = [f"[{tool_name}] query={result.get('query')!r}"]
+        header = f"[{tool_name}] query={result.get('query')!r}"
+        # Result-set level counters (e.g. adv_lookup's exact_matches) matter for judging
+        # whether any row can be trusted at all, so keep them on the header line.
+        meta = _render_extra_fields(
+            {k: v for k, v in result.items() if k not in ("results", "query", "error")}
+        )
+        if meta:
+            header += f" ({meta})"
+        lines = [header]
         if result.get("error"):
             lines.append(f"  (tool error: {result['error']})")
         for r in result.get("results", [])[:5]:
+            if not isinstance(r, dict):
+                lines.append(f"  - {str(r)[:200]}")
+                continue
             url = r.get("url")
             date = r.get("seendate") or r.get("filed_at") or r.get("date")
             snippet = r.get("content") or r.get("snippet") or ""
@@ -58,7 +112,12 @@ async def _format_tool_result_as_note(tool_name: str, result: dict[str, Any]) ->
             else:
                 summary = ""
             date_part = f" (date: {date})" if date else ""
-            lines.append(f"  - {r.get('title') or url} — {url}{date_part}\n    {summary}")
+            lines.append(f"  - {r.get('title') or url} — {url}{date_part}")
+            extras = _render_extra_fields(r)
+            if extras:
+                lines.append(f"    {extras}")
+            if summary:
+                lines.append(f"    {summary}")
         if not result.get("results"):
             lines.append("  (no results)")
         return "\n".join(lines), total_cost
@@ -97,6 +156,20 @@ def _lane_system_prompt(state: ResearcherState) -> str:
         "own official website), and nonprofit_lookup (affiliated-foundation overlap). "
         "These are direct APIs (not scraping), so they keep working when web_search is "
         "throttled or rate-limited.\n"
+        "\nG1.Q4 (SFO vs MFO) and G1.Q5 (plain RIA in costume) MUST be settled from "
+        "`adv_lookup` (SEC IAPD registration data), not from the firm's own website. A "
+        "website saying 'family office' is self-branding and settles neither question. "
+        "Read adv_lookup like this — but only for a result whose `name_match` is \"exact\":\n"
+        "  - active 801- registration -> a registered investment adviser. A genuine "
+        "single-family office normally does NOT register (it uses the family-office "
+        "exclusion), so this is strong evidence for MFO and against SFO.\n"
+        "  - branches_count well above 1 -> many offices serving many client families, "
+        "i.e. multi-family office, not SFO.\n"
+        "  - several distinct other_names -> an acquisition rollup of multiple firms.\n"
+        "  - NO exact-match registration found -> that absence is itself evidence FOR a "
+        "single-family office. Answer G1.Q4 'SFO' on that basis and cite the adv_lookup "
+        "result; do NOT report could_not_verify just because the lookup was empty.\n"
+        "Either way G1.Q4 must come back answered (SFO or MFO), not could_not_verify.\n"
         if lane == "identity_and_type"
         else ""
     )
@@ -121,8 +194,27 @@ async def researcher_node(state: ResearcherState) -> dict[str, Any]:
     tools = LANE_TOOLS[state["lane"]]
     model = get_model(SETTINGS.models.researcher_tier)
     messages = state["researcher_messages"]
+    seed: list[Any] = []
     if not messages:
-        messages = [SystemMessage(content=_lane_system_prompt(state))]
+        # Two fixes in one, both verified live 2026-08-12:
+        #
+        # 1. The kick-off HumanMessage is REQUIRED, not stylistic. Ollama Cloud's
+        #    OpenAI-compatible endpoint treats a system-only message list as a model-LOAD
+        #    request: HTTP 200, finish_reason="load", empty content, no tool calls, 0
+        #    prompt/0 completion tokens. Nothing raises, so the lane skipped straight to
+        #    compress_to_claims with zero notes and marked every question could_not_verify
+        #    — for every lead, at ~$0. System-only -> 0/0 tokens; +1 user turn -> 823
+        #    prompt tokens and a real edgar_search call.
+        #
+        # 2. The seed must be PERSISTED, not just used locally. `researcher_messages` uses
+        #    the add_messages reducer, so returning only the response meant turn 2 onwards
+        #    ran with a list starting at an AIMessage and no system prompt at all — the
+        #    lane forgot its questions, its HARD gates and its instructions after one turn.
+        seed = [
+            SystemMessage(content=_lane_system_prompt(state)),
+            HumanMessage(content="Begin gathering evidence now."),
+        ]
+        messages = seed
     response = await model.ainvoke(messages, tools=tools)
     cost = response.response_metadata.get("cost_usd", 0.0)
     event = trace_event(
@@ -134,7 +226,7 @@ async def researcher_node(state: ResearcherState) -> dict[str, Any]:
         cost_usd=cost,
     )
     return {
-        "researcher_messages": [response],
+        "researcher_messages": [*seed, response],
         "cost_usd": state["cost_usd"] + cost,
         "trace": [event],
     }
@@ -215,23 +307,86 @@ _COMPRESS_SYSTEM_TEMPLATE = (
     "below that the notes touch on, emit exactly one claim. Rules:\n"
     "- Every claim needs a source_url, UNLESS status is 'could_not_verify'.\n"
     "- Never invent a question_id not in the list below.\n"
-    "- If two sources disagree, set status='contradicted' and put both URLs in the answer "
-    "text — do not silently pick one.\n"
+    "- Use status='contradicted' ONLY when two sources assert MUTUALLY EXCLUSIVE facts "
+    "about the same thing — facts that cannot both be true (e.g. one says the firm is "
+    "dissolved and another says it is actively filing; one gives AUM as $50M and another "
+    "as $2B for the same date). When you do, name BOTH conflicting values and cite BOTH "
+    "URLs in the answer text — do not silently pick one.\n"
+    "- The following are NOT contradictions. Use status='confirmed':\n"
+    "  * Several people each holding a senior role. A firm can have two co-managing "
+    "members, a CEO and a CIO, or a founder and a president — listing more than one "
+    "decision-maker is normal and is not a conflict. Name all of them in the answer.\n"
+    "  * Two sources stating the same fact in different words, units, or detail levels.\n"
+    "  * One source being silent on something another source states. Silence is not "
+    "disagreement — that is just one source being less complete.\n"
+    "  * Figures for different dates or reporting periods (a Q1 number and a Q2 number "
+    "are two facts, not a conflict).\n"
     "- Respond with ONLY a JSON array of objects with keys: question_id, answer, status "
     "(confirmed|could_not_verify|contradicted), source_url, source_class, confidence "
     "(high|medium|low). No prose, no markdown fences.\n\n"
     "Questions for this lane:\n{questions}\n"
 )
 
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s,;'\"<>)\]]+")
+
+
+def _downgrade_unsupported_contradictions(claims: list[Claim]) -> list[tuple[str, str]]:
+    """Enforce the "cite BOTH URLs" half of the contradiction contract in CODE.
+
+    A claim asserting `contradicted` has to actually demonstrate a conflict: two sources
+    saying incompatible things. If the answer text doesn't cite at least two distinct URLs,
+    the model has not shown one, so the status is downgraded in place.
+
+    This exists because the compress step was by far the largest producer of false
+    contradictions — 142 of the 203 contradicted claims in the ledger came from here, versus
+    ZERO from V4, the check actually named for contradictions (2026-08-12). The samples were
+    not close calls; they were plain confirmations, e.g. G2.Q1 "Yes – the firm's Form ADV
+    lists Co-Managing Members Mary C. McNutt and Michelle J. Blass as owners" stored as
+    `contradicted` purely because two people were named. A `contradicted` claim is excluded
+    from V6 completeness, blocks its HARD gate in Verdict, and is dropped from the dataset —
+    so a false one silently destroys a good record.
+
+    Returns the list of (question_id, old_answer_preview) downgrades so the caller can trace
+    them; downgrades are never silent.
+    """
+    downgraded: list[tuple[str, str]] = []
+    for c in claims:
+        if c.status != "contradicted":
+            continue
+        urls = set(_URL_IN_TEXT_RE.findall(str(c.answer or "")))
+        if len(urls) >= 2:
+            continue  # a genuine, cited conflict — leave it alone
+        # Not demonstrated. Keep the finding honest rather than flipping to a stronger
+        # status than the evidence supports: with a source it is a single-source assertion
+        # (Layer V's cross-class rule will grade it), without one it is unverified.
+        c.status = "confirmed" if c.source_url else "could_not_verify"
+        downgraded.append((c.question_id or c.field_name or "?", str(c.answer or "")[:120]))
+    return downgraded
+
+
+# Values the compress model emits as a stand-in for "I have no source class" — they are
+# truthy strings, so a plain falsy check treats them as a real classification and skips the
+# gap tagging entirely. Observed live: a lane whose only tool returned nothing produced five
+# could_not_verify claims all carrying source_class="unknown", which silently destroyed the
+# tool_unavailable vs no_evidence_found distinction (2026-08-12).
+_PLACEHOLDER_SOURCE_CLASSES = frozenset({"unknown", "none", "null", "n/a", "na", "-", ""})
+
 
 def _tag_evidence_gaps(claims: list[Claim], had_real_evidence: bool) -> None:
     """Distinguish "the tool was broken/empty" from "genuinely no evidence exists" on
-    could_not_verify claims the LLM left unclassified. Only sets source_class on claims
-    whose source_class is currently falsy — never overwrites a value the LLM already
-    assigned (e.g. "uncompressed_notes" on the parse-failure fallback path)."""
+    could_not_verify claims the LLM left unclassified.
+
+    Overwrites a falsy source_class OR one of the placeholder strings above, but never a
+    real value the LLM assigned (e.g. "uncompressed_notes" on the parse-failure fallback
+    path). This distinction is the only signal that separates "our tooling is down" from
+    "this firm has no public footprint", so letting a placeholder win makes an outage look
+    like a finding."""
     gap_class = "no_evidence_found" if had_real_evidence else "tool_unavailable"
     for c in claims:
-        if c.status == "could_not_verify" and not c.source_class:
+        if c.status != "could_not_verify":
+            continue
+        current = (c.source_class or "").strip().lower()
+        if current in _PLACEHOLDER_SOURCE_CLASSES:
             c.source_class = gap_class
 
 
@@ -274,6 +429,7 @@ async def compress_to_claims_node(state: ResearcherState) -> dict[str, Any]:
         call_cost += response.response_metadata.get("cost_usd", 0.0)
         try:
             claims = _parse_claims_json(str(response.content), lane_question_ids)
+            downgraded = _downgrade_unsupported_contradictions(claims)
             _tag_evidence_gaps(claims, state["had_real_evidence"])
             event = trace_event(
                 "compress",
@@ -282,6 +438,10 @@ async def compress_to_claims_node(state: ResearcherState) -> dict[str, Any]:
                 attempt=attempt,
                 raw_response=response.content,
                 claims=[c.model_dump(mode="json") for c in claims],
+                # Never silent: every downgraded contradiction is recorded so a real
+                # conflict the model failed to cite properly is still recoverable from
+                # the trace rather than lost.
+                downgraded_contradictions=downgraded,
             )
             return {
                 "claims": [c.model_dump(mode="json") for c in claims],

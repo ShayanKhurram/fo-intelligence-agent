@@ -65,8 +65,9 @@ Concretely:
 | Storage | SQLite (WAL mode) via `aiosqlite` | stdlib + `aiosqlite 0.20` |
 | HTTP | httpx (async, pooled) | 0.27+ |
 | LLM | Ollama Cloud (default) · Anthropic (optional) | OpenAI-compatible API |
-| Tools | SEC EDGAR · Serper (Google SERP) · Hunter · GDELT · `dnspython` · vendored Scrapy LinkedIn scraper | — |
-| Docs/extraction | `trafilatura` (free-path fetch) · `openpyxl` (XLSX export) | — |
+| Tools | SEC EDGAR · Serper (Google SERP) · Snov.io (email + LinkedIn profiles) · GDELT · ProPublica · `dnspython` · vendored Scrapy scraper (job postings only) | — |
+| Page fetch | `crawl4ai` (headless Chromium, JS-rendering) · `trafilatura` (free fast path) | — |
+| Docs/extraction | `openpyxl` (XLSX export) | — |
 | Local UI/API | FastAPI + Uvicorn | 0.115+ |
 | Tests | pytest + pytest-asyncio (fully offline) | 8+ |
 
@@ -103,7 +104,7 @@ Discovery queue
       ▼
 ┌─────────────────────── Layer 1: Research ───────────────────────┐
 │ Parser → LangGraph supervisor/researcher → Verdict              │
-│ 12-question battery across 3 lanes (identity · people · signals)│
+│ 11-question battery across 3 lanes (identity · people · signals)│
 │ HARD gates evaluated mechanically → pursue / pursue_low / reject│
 └─────────────────────────────────────────────────────────────────┘
       │  (pursue / pursue_low)
@@ -184,7 +185,7 @@ Two data sources coexist in `records` via a `source` column (`pipeline` vs `csv_
 │   ├── validation.py        #   V1/V4/V5/V6, cross-class rule, release rule
 │   ├── dataset.py           #   Layer D assembly
 │   ├── db.py / schema.sql   #   SQLite storage
-│   ├── tools/               #   EDGAR, Serper, Hunter, GDELT, DNS, key rotation
+│   ├── tools/               #   EDGAR, Serper, Snov.io, Crawl4AI, GDELT, DNS, key rotation
 │   └── llm.py               #   Ollama Cloud / Anthropic chat models
 ├── micro_rag/
 │   ├── ingest/              # Python: SQLite/CSV → Postgres+pgvector
@@ -200,7 +201,7 @@ Two data sources coexist in `records` via a `source` column (`pipeline` vs `csv_
 │       ├── components/      #   SearchApp, EvidenceDrawer, RecordCard, ...
 │       └── scripts/         #   fetch-model.sh, contrast-check.mjs
 ├── tests/                   # 242 offline tests (pytest)
-├── vendor/                  # vendored LinkedIn scraper (Scrapy)
+├── vendor/                  # vendored LinkedIn scraper (Scrapy) — job postings only
 ├── docs/                    # design specs (the "why" behind each layer)
 ├── run_enrichment.py        # driver: Layer E/V/D over pursue/pursue_low leads
 ├── run_layer1_next.py       # driver: Layer-1 triage over the next N leads
@@ -220,7 +221,8 @@ Two data sources coexist in `records` via a `source` column (`pipeline` vs `csv_
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env            # fill in keys (Serper, Hunter, Ollama, ...)
+cp .env.example .env            # fill in keys (Serper, Snov.io, Ollama, ...)
+crawl4ai-setup                  # one-time: installs the headless browser fetch_page needs
 
 python run_layer1_next.py 200   # triage the next 200 discovery leads (Layer 1)
 python run_enrichment.py        # enrich/validate/assemble the qualified leads

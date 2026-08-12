@@ -19,6 +19,7 @@ import sqlite3
 import uuid as _uuid
 from datetime import date, datetime, timezone
 from typing import Any
+from urllib.parse import urlsplit as _urlsplit
 
 import phonenumbers
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -41,11 +42,12 @@ from app.config import SETTINGS
 from app.parser import compute_injected_facts
 from app.state import Claim, Finding, ValidationInput, utcnow
 from app.validation import run_validation
+from app.tools.adv import distinctive_name_tokens
 from app.tools.edgar import edgar_full_text_search_raw
 from app.tools.freefetch import fetch_page_free_first, fetch_raw_html
 from app.tools.gdelt import news_search_raw
-from app.tools.hunter import hunter_domain_search_raw
-from app.tools.serper import serper_scrape_raw, serper_search_raw
+from app.tools.serper import serper_search_raw
+from app.tools.snov import snov_domain_search_raw, snov_emails_by_name_domain_raw
 from app.validation import (
     check_domain_mx_exists,
     check_v4_contradictions,
@@ -371,6 +373,112 @@ async def wave_0(
 
 
 # ============================================================================
+# Domain resolution — the one input every wave-1 contact tier is gated on.
+#
+# `injected_facts["domain"]` is derived from a `domain_check` entity_source
+# (app/parser.py:66-68) and NOTHING in this codebase writes one: app/ingest.py's
+# _map_source only ever emits 13f_filing / fec_employer / 5500_filing / ppp_loans, so the
+# domain was None for all 2,644 ingested entities. Consequence, measured on the 2026-08-12
+# 10-lead pilot: wave 1's four domain-gated tiers had never executed once, `principal_email`
+# and `principal_phone` had never been produced in the project's history, and because
+# `have_channel` was therefore permanently False, wave_1 always gated and **wave 2 had never
+# run for any entity** — taking its 13 depth fields down with it. See PLAN.md T16.
+#
+# So: resolve a domain from a Serper organic search when ingestion didn't supply one. The
+# firm's own site is result #1 for these long-tail RIA/family-office names (verified live
+# for ICG Advisors / IMPACTfolio / IMZ Advisory), but a SERP is untrusted input — an
+# unrelated firm's domain attributed to this entity would poison every contact claim
+# derived from it, the same false-positive class app/tools/adv.py::_name_match exists for.
+# Hence both guards below: skip known aggregators, and require a real name match.
+# ============================================================================
+
+# Hosts that rank for a firm name without being the firm. Directory/profile aggregators
+# (fintrx, aum13f, radientanalytics, bizapedia…) are the dangerous ones: they rank highly
+# for exactly these long-tail adviser names and their domains would never trip the
+# name-match guard on their own.
+_AGGREGATOR_HOSTS = frozenset({
+    "linkedin.com", "facebook.com", "instagram.com", "twitter.com", "x.com",
+    "youtube.com", "tiktok.com", "yelp.com", "wikipedia.org", "crunchbase.com",
+    "bloomberg.com", "reuters.com", "forbes.com", "zoominfo.com", "dnb.com",
+    "glassdoor.com", "indeed.com", "bbb.org", "sec.gov", "google.com",
+    "fintrx.com", "radientanalytics.com", "aum13f.com", "usnews.com",
+    "opencorporates.com", "manta.com", "corporationwiki.com", "buzzfile.com",
+    "mapquest.com", "bizapedia.com", "apollo.io", "rocketreach.co", "signalhire.com",
+    "brokercheck.finra.org", "finra.org", "wealthminder.com", "investor.gov",
+})
+
+_NON_ALNUM_RE = _re.compile(r"[^a-z0-9]")
+
+
+def _host_from_url(url: str) -> str | None:
+    """Lowercased registrable host with scheme, port, credentials and a leading `www.`
+    stripped. None for anything that isn't an http(s) URL with a host."""
+    try:
+        parts = _urlsplit(url)
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https"):
+        return None
+    host = (parts.hostname or "").lower()
+    if not host:
+        return None
+    return host[4:] if host.startswith("www.") else host
+
+
+def _is_aggregator(host: str) -> bool:
+    return any(host == a or host.endswith(f".{a}") for a in _AGGREGATOR_HOSTS)
+
+
+def _domain_matches_entity(host: str, canonical_name: str) -> bool:
+    """Does this host plausibly BELONG to this entity?
+
+    Compares the domain's leading label against the entity's distinctive name tokens
+    (`adv.py::distinctive_name_tokens` — "Family"/"Office"/"LLC" and friends excluded,
+    since they match hundreds of unrelated advisers). A bare substring test is too loose
+    for the short acronym tokens these names are full of ("IFS" would match
+    "clifshire.com"), so a token has to either anchor the label or be long enough that an
+    incidental hit is implausible:
+
+        ICG Advisors, LLC   -> {"icg"}          icgadvisors.com          startswith ✓
+        IMPACTfolio, LLC    -> {"impactfolio"}  impactfolio.co           equals     ✓
+        IMZ Advisory Inc    -> {"imz"}          imzfinancialservices.com startswith ✓
+    """
+    tokens = distinctive_name_tokens(canonical_name)
+    if not tokens:
+        return False
+    label = _NON_ALNUM_RE.sub("", host.split(".")[0])
+    if not label:
+        return False
+    for token in tokens:
+        token = _NON_ALNUM_RE.sub("", token)
+        if not token:
+            continue
+        if label == token or label.startswith(token):
+            return True
+        if len(token) >= 5 and token in label:
+            return True
+    return False
+
+
+async def resolve_domain(canonical_name: str) -> str | None:
+    """The entity's own web domain from one Serper organic search, or None.
+
+    None is a normal outcome, not an error: a Serper failure, an all-aggregator SERP, and
+    "this firm genuinely has no website" all land here, and every caller must treat it the
+    same way it already treats a missing `domain_check` source — by skipping the tiers that
+    need one rather than guessing at a domain.
+    """
+    search = await serper_search_raw(f'"{canonical_name}"', max_results=5)
+    for result in search.get("results", []):
+        host = _host_from_url(result.get("url") or "")
+        if not host or _is_aggregator(host):
+            continue
+        if _domain_matches_entity(host, canonical_name):
+            return host
+    return None
+
+
+# ============================================================================
 # Wave 1 — actionability core (~6 calls): named decision-maker + one working contact
 # channel + one dated signal (plan §4). Every helper below is one tier of the table in
 # the plan's wave-1 section; wave_1() tries tier 1 (already covered by wave -1, or a
@@ -488,7 +596,7 @@ async def _find_email_on_site(domain: str) -> Claim | None:
     """Tier 1 — free fetch of common contact/team pages, first @domain email found."""
     for path in _COMMON_SITE_PATHS:
         url = f"https://{domain}{path}"
-        fetched = await fetch_page_free_first(url, serper_scrape_raw)
+        fetched = await fetch_page_free_first(url)
         content = fetched.get("content") or ""
         match = _EMAIL_RE.search(content)
         if match and domain.lower() in match.group(0).lower():
@@ -501,32 +609,74 @@ async def _find_email_on_site(domain: str) -> Claim | None:
     return None
 
 
-async def _find_email_via_hunter(domain: str, principal_name: str | None) -> Claim | None:
-    """Tier 3 — Hunter domain search (one credit -> every known address + pattern for
-    the domain). Prefers an address matching the known principal's surname; falls back
-    to the highest-confidence address on the domain otherwise."""
-    result = await hunter_domain_search_raw(domain)
-    emails = result.get("emails") or []
-    if not emails:
-        return None
-    last_name = principal_name.split()[-1].lower() if principal_name and principal_name.split() else None
-    if last_name:
-        for e in emails:
-            if e.get("last_name") and e["last_name"].lower() == last_name and e.get("value"):
+def _split_name(principal_name: str | None) -> tuple[str, str]:
+    """First/last split for a name-targeted email lookup. Snov.io's
+    emails-by-domain-by-name wants both parts; a single-token name goes in as the last
+    name, which is the half that actually drives the match."""
+    parts = (principal_name or "").split()
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return "", parts[0]
+    return parts[0], parts[-1]
+
+
+async def _find_email_via_snov(domain: str, principal_name: str | None) -> Claim | None:
+    """Tier 3 — Snov.io email discovery (replaced Hunter.io).
+
+    Two shapes, tried in order:
+      1. name-targeted (`emails-by-domain-by-name`) when a principal is already known —
+         the surname match happens server-side, so a hit is directly attributable to the
+         decision-maker rather than to "someone at this domain".
+      2. domain-wide (`domain-search/domain-emails`) otherwise, or when (1) misses. This is
+         the closest analogue to Hunter's old domain search, and like it the result is only
+         "low" confidence: an address on the right domain is not evidence about the right
+         person.
+
+    `confidence` is carried from Snov.io's own 0-100 score where present; anything under 70
+    stays "low" so a weak pattern-guess can't be presented as a solid contact.
+    """
+    first, last = _split_name(principal_name)
+
+    if last:
+        targeted = await snov_emails_by_name_domain_raw(first, last, domain)
+        for row in targeted.get("results") or []:
+            email = row.get("email")
+            if not email:
+                continue
+            score = row.get("confidence")
+            strong = isinstance(score, (int, float)) and score >= 70
+            return Claim(
+                field_name="principal_email", answer=email, status="confirmed",
+                source_url=f"https://{domain}", source_class="snov",
+                extraction_method="snov_emails_by_name_domain",
+                confidence="medium" if strong else "low",
+                produced_by="enrichment", wave="1",
+            )
+
+    domain_wide = await snov_domain_search_raw(domain)
+    rows = domain_wide.get("results") or []
+    # A domain-wide hit is preferred only if it matches the known surname; otherwise take
+    # the first address but score it "low" — same policy the Hunter version used.
+    if last:
+        for row in rows:
+            email = row.get("email") or row.get("value")
+            if email and last.lower() in str(email).lower():
                 return Claim(
-                    field_name="principal_email", answer=e["value"], status="confirmed",
-                    source_url=f"https://{domain}", source_class="hunter",
-                    extraction_method="hunter_domain_search", confidence="medium",
+                    field_name="principal_email", answer=email, status="confirmed",
+                    source_url=f"https://{domain}", source_class="snov",
+                    extraction_method="snov_domain_search", confidence="medium",
                     produced_by="enrichment", wave="1",
                 )
-    best = emails[0]
-    if best.get("value"):
-        return Claim(
-            field_name="principal_email", answer=best["value"], status="confirmed",
-            source_url=f"https://{domain}", source_class="hunter",
-            extraction_method="hunter_domain_search", confidence="low",
-            produced_by="enrichment", wave="1",
-        )
+    for row in rows:
+        email = row.get("email") or row.get("value")
+        if email:
+            return Claim(
+                field_name="principal_email", answer=email, status="confirmed",
+                source_url=f"https://{domain}", source_class="snov",
+                extraction_method="snov_domain_search", confidence="low",
+                produced_by="enrichment", wave="1",
+            )
     return None
 
 
@@ -536,7 +686,7 @@ async def _find_phone_via_site(domain: str) -> Claim | None:
     this is explicitly status="format_only", not "confirmed"."""
     for path in ("/contact", "/about", "/team"):
         url = f"https://{domain}{path}"
-        fetched = await fetch_page_free_first(url, serper_scrape_raw)
+        fetched = await fetch_page_free_first(url)
         content = fetched.get("content") or ""
         for match in phonenumbers.PhoneNumberMatcher(content, "US"):
             number = phonenumbers.format_number(match.number, phonenumbers.PhoneNumberFormat.E164)
@@ -611,7 +761,7 @@ async def wave_1(
     if "principal_email" not in settled and domain:
         claim = await _find_email_on_site(domain)
         if claim is None:
-            claim = await _find_email_via_hunter(domain, principal_name)
+            claim = await _find_email_via_snov(domain, principal_name)
         if claim:
             new_claims.append(claim)
             settled.add("principal_email")
@@ -675,7 +825,7 @@ async def _gather_wave2_documents(canonical_name: str, domain: str | None) -> li
     """Numbered source documents for the LLM extraction pass — each {"url","content"}."""
     docs: list[dict[str, str]] = []
     if domain:
-        fetched = await fetch_page_free_first(f"https://{domain}", serper_scrape_raw)
+        fetched = await fetch_page_free_first(f"https://{domain}")
         if fetched.get("content"):
             docs.append({"url": f"https://{domain}", "content": fetched["content"][:3000]})
     search = await serper_search_raw(
@@ -915,6 +1065,13 @@ async def process_entity(
             gate_results={}, claim_ledger=[c.model_dump(mode="json") for c in claims], stage="wave0",
         )
     else:
+        # Resolve a domain if ingestion didn't supply one (no `domain_check` source — which
+        # is every entity in the current pool). Deliberately AFTER the wave-0 gate: an
+        # entity wave 0 rejects must not cost a Serper call. See PLAN.md T16.
+        if not domain:
+            domain = await resolve_domain(canonical_name)
+            calls_spent += 1
+
         new1, gated = await wave_1(claims, canonical_name, domain=domain)
         claims = claims + new1
         calls_spent += len(new1)

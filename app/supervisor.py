@@ -9,7 +9,7 @@ import asyncio
 import json
 from typing import Any, Literal
 
-from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 
 from app.config import SETTINGS
@@ -118,8 +118,12 @@ def _supervisor_system_prompt(state: SupervisorState) -> str:
         "- activity_signals: capital deployment, recent exits/hires/commitments, scandal check.\n\n"
         "Gate semantics: HARD-gate questions can sink the lead if left unanswered "
         "(policy varies by question); SOFT-gate questions inform confidence, not rejection.\n\n"
-        "RULE: dispatch only lanes whose HARD-gate questions are still unanswered. Do not "
-        "re-dispatch a lane just to chase SOFT-gate questions once its HARD gates are settled.\n\n"
+        "RULE: dispatch every lane at least once. After that, only RE-dispatch a lane whose "
+        "HARD-gate questions are still unanswered — do not re-dispatch a lane just to chase "
+        "SOFT-gate questions once its HARD gates are settled.\n"
+        "(The activity_signals lane has no HARD-gate questions at all since G3.Q3 was "
+        "removed, so an 'only chase HARD gates' reading would skip it entirely and leave "
+        "capital-deployment and recency evidence ungathered.)\n\n"
         f"Progress so far:\n{_lane_status_summary(state)}\n\n"
         f"Budget: {state['calls_spent']}/{brief.budget.max_tool_calls} tool calls used, "
         f"turn {state['iterations']}/{brief.budget.max_iterations}.\n\n"
@@ -137,7 +141,21 @@ async def supervisor_node(state: SupervisorState) -> dict[str, Any]:
     # place each turn (refreshed progress/budget) instead of appending a duplicate —
     # everything else in supervisor_messages accumulates normally.
     fresh_system = SystemMessage(content=_supervisor_system_prompt(state), id=_SUPERVISOR_SYSTEM_ID)
-    invoke_messages = [fresh_system, *state["supervisor_messages"][1:]] if state["supervisor_messages"] else [fresh_system]
+    kickoff: list[Any] = []
+    if state["supervisor_messages"]:
+        invoke_messages = [fresh_system, *state["supervisor_messages"][1:]]
+    else:
+        # First turn needs a user message alongside the system prompt: Ollama Cloud reads a
+        # system-only list as a model-load request and returns finish_reason="load" with
+        # empty content, no tool calls and 0/0 tokens (HTTP 200, nothing raises). The
+        # supervisor would then never emit conduct_research, so no lane was ever dispatched
+        # and every lead ran out its 2 iterations and rejected on unanswered HARD gates at
+        # ~$0. Same root cause and fix as app/researcher.py's researcher_node. It is
+        # persisted below so later turns keep a user turn in the list too.
+        kickoff = [
+            HumanMessage(content="Begin. Reflect with think_tool, then dispatch the lanes you need.")
+        ]
+        invoke_messages = [fresh_system, *kickoff]
     response = await model.ainvoke(invoke_messages, tools=SUPERVISOR_TOOLS)
     cost = response.response_metadata.get("cost_usd", 0.0)
     event = trace_event(
@@ -149,7 +167,7 @@ async def supervisor_node(state: SupervisorState) -> dict[str, Any]:
         cost_usd=cost,
     )
     return {
-        "supervisor_messages": [fresh_system, response],
+        "supervisor_messages": [fresh_system, *kickoff, response],
         "iterations": state["iterations"] + 1,
         "cost_usd": state["cost_usd"] + cost,
         "trace": [event],
@@ -241,18 +259,40 @@ async def supervisor_tools_node(state: SupervisorState) -> dict[str, Any]:
         elif tc["name"] == "research_complete":
             all_claims = state["claims"] + new_claims
             unanswered = _unanswered_hard_questions(all_claims)
+            # Every lane must run at least once, enforced here rather than trusted to the
+            # prompt. Since G3.Q3 was removed, activity_signals has NO HARD-gate questions,
+            # so a purely HARD-gate-driven completion check would let a lead finish without
+            # that lane ever being dispatched — losing G3.Q1/G3.Q2 (capital deployment and
+            # recency), which compute_thin_reason and V6 completeness both read.
+            undispatched = [
+                lane
+                for lane in LANES
+                if state["lanes_dispatched"].get(lane, 0) + lanes_dispatched_delta.get(lane, 0) == 0
+            ]
             exhausted = _budget_exhausted(state)
-            if unanswered and not exhausted:
+            if (unanswered or undispatched) and not exhausted:
+                reasons = []
+                if unanswered:
+                    reasons.append(f"HARD-gate questions still unanswered: {unanswered}")
+                if undispatched:
+                    reasons.append(f"lane(s) never dispatched: {undispatched}")
                 tool_messages.append(
                     ToolMessage(
                         content=(
-                            f"Not yet — HARD-gate questions still unanswered: {unanswered}. "
+                            "Not yet — " + "; ".join(reasons) + ". "
                             "Dispatch the relevant lane(s) or exhaust the budget first."
                         ),
                         tool_call_id=tc["id"],
                     )
                 )
-                new_trace.append(trace_event("supervisor", "research_complete_blocked", unanswered=unanswered))
+                new_trace.append(
+                    trace_event(
+                        "supervisor",
+                        "research_complete_blocked",
+                        unanswered=unanswered,
+                        undispatched=undispatched,
+                    )
+                )
             else:
                 research_complete = True
                 tool_messages.append(ToolMessage(content="Research marked complete.", tool_call_id=tc["id"]))

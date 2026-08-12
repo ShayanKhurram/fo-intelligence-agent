@@ -23,7 +23,7 @@ from app.enrichment import process_entity, run_pipeline
 
 
 def _patch_network(monkeypatch, *, edgar_hits=1, jsonld_html=None, page_content="",
-                    search_results=None, hunter_emails=None, gdelt_results=None, counters=None):
+                    search_results=None, snov_emails=None, gdelt_results=None, counters=None):
     counters = counters if counters is not None else {}
 
     def _count(name):
@@ -41,7 +41,7 @@ def _patch_network(monkeypatch, *, edgar_hits=1, jsonld_html=None, page_content=
         _count("raw_html")
         return jsonld_html
 
-    async def _fake_free_fetch(url, paid_fallback):
+    async def _fake_free_fetch(url, fallback=None):
         _count("free_fetch")
         return {"url": url, "content": page_content, "extraction_method": "httpx_trafilatura"}
 
@@ -49,9 +49,13 @@ def _patch_network(monkeypatch, *, edgar_hits=1, jsonld_html=None, page_content=
         _count("search")
         return {"results": search_results or [], "query": query}
 
-    async def _fake_hunter(domain):
-        _count("hunter")
-        return {"domain": domain, "pattern": None, "emails": hunter_emails or []}
+    async def _fake_snov_by_name(first_name, last_name, domain):
+        _count("snov")
+        return {"results": snov_emails or []}
+
+    async def _fake_snov_domain(domain):
+        _count("snov")
+        return {"results": snov_emails or []}
 
     async def _fake_gdelt(query, lookback_days=365, max_records=75):
         _count("gdelt")
@@ -62,7 +66,8 @@ def _patch_network(monkeypatch, *, edgar_hits=1, jsonld_html=None, page_content=
     monkeypatch.setattr(enrichment_module, "fetch_raw_html", _fake_raw_html)
     monkeypatch.setattr(enrichment_module, "fetch_page_free_first", _fake_free_fetch)
     monkeypatch.setattr(enrichment_module, "serper_search_raw", _fake_search)
-    monkeypatch.setattr(enrichment_module, "hunter_domain_search_raw", _fake_hunter)
+    monkeypatch.setattr(enrichment_module, "snov_emails_by_name_domain_raw", _fake_snov_by_name)
+    monkeypatch.setattr(enrichment_module, "snov_domain_search_raw", _fake_snov_domain)
     monkeypatch.setattr(enrichment_module, "news_search_raw", _fake_gdelt)
     monkeypatch.setattr(validation_module, "fetch_page_free_first", _fake_free_fetch)
     return counters
@@ -128,13 +133,16 @@ async def test_provenance_survives_wave_minus_1_through_validation_and_assembly(
 
 # --- 2. Release rule ---
 
-async def test_release_rule_blanks_undeliverable_email_and_logs_audit(db_path, fake_model, monkeypatch):
-    """The reachable path for the release rule in this pipeline: wave 0's own V4 check
-    catches any contradiction that already exists BEFORE enrichment runs (rejecting the
-    whole record cheaply, per plan §4) — so the release rule's real job is catching a
-    claim V1 determines its cited source doesn't actually support, on a high-value
-    field, without necessarily rejecting the whole record. Simulated here by routing
-    the V1 judge to say "not supported" specifically for the principal_email claim."""
+async def test_unverifiable_email_now_ships_instead_of_being_blanked(db_path, fake_model, monkeypatch):
+    """Contacts survive an unsupportive source page (2026-08-12).
+
+    Previously this asserted the opposite: V1 said "the page never mentions this email", the
+    release rule blanked it, and Layer D shipped a blank cell. That was wrong in practice —
+    a firm's public site essentially never publishes a decision-maker's direct email, so the
+    check failed for structural reasons and destroyed good data every time. Contacts are now
+    V1-exempt and _RELEASABLE_FIELDS is empty, so the value ships with its status and
+    source_class for downstream validation. The V1 route below is left in place precisely to
+    prove an unsupportive verdict no longer destroys the value."""
     with connection(db_path) as conn:
         _seed_shippable_entity(conn, "e1", "Acme Capital Partners")
         add_entity_source(conn, "e1", "fec_employer", {"signals": {}, "people": [{"name": "Jane Doe", "title": "CIO"}]})
@@ -159,20 +167,20 @@ async def test_release_rule_blanks_undeliverable_email_and_logs_audit(db_path, f
         audit = get_audit_rejected_values(conn, "e1")
         claims_after = get_claims(conn, "e1")
 
-    assert len(audit) == 1
-    assert audit[0]["reason_code"] == "verification_failed"
-    assert audit[0]["rejected_value"] == "jane@acme.com"
+    assert audit == [], "nothing was blanked, so nothing to audit"
     email_claim = next(c for c in claims_after if c["field_name"] == "principal_email")
-    assert email_claim["status"] == "removed_failed_validation"
-    assert email_claim["answer"] is None
+    assert email_claim["status"] != "removed_failed_validation"
+    assert email_claim["answer"] == "jane@acme.com", "the contact must survive to Layer D"
 
     entity = {"entity_id": "e1", "canonical_name": "Acme Capital Partners"}
     candidate = build_candidate(entity, claims_after, result["outcome"], "type_unconfirmed")
     from app.dataset import _records_rows
     columns, rows = _records_rows([candidate])
     row = rows[0]
-    assert row["principal_email"] is None  # never silently empty...
-    assert row["principal_email_status"] == "removed_failed_validation"  # ...the status column says why
+    assert row["principal_email"] == "jane@acme.com"
+    # The value ships WITH its provenance so it can be validated downstream.
+    assert row["principal_email_source_class"] == "site_scrape"
+    assert row["principal_email_status"] != "removed_failed_validation"
 
 
 # --- 3. Cross-class ---

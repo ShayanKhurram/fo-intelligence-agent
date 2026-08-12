@@ -64,7 +64,7 @@ async def test_verdict_trace_persisted_to_db(db_path, fake_model):
     state = new_supervisor_state("E1")
     state["claims"] = [
         {"question_id": qid, "answer": "ok", "status": "confirmed", "confidence": "high"}
-        for qid in ("G1.Q1", "G1.Q2", "G1.Q3", "G1.Q5", "G1.Q6", "G2.Q1", "G3.Q3")
+        for qid in ("G1.Q1", "G1.Q2", "G1.Q3", "G1.Q5", "G1.Q6", "G2.Q1")
     ]
 
     with connection(db_path) as conn:

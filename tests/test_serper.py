@@ -1,5 +1,7 @@
-"""Tests for the Serper-backed `web_search` — respx-mocked, all offline (no real
-SERPER_API_KEY exists in this environment yet). Pins the Serper request/response contract
+"""Tests for the Serper-backed `web_search` — respx-mocked, all offline.
+
+Page fetching is no longer Serper-backed (it moved to Crawl4AI, see tests/test_crawl.py),
+so this module covers search only. Pins the Serper request/response contract
 documented in the build brief: POST /search returns {"organic": [...]}, POST /news
 returns {"news": [...]}, results map to our {title,url,content,score} shape, and any
 failure (missing key, HTTP error) degrades to {"results": [], "query":..., "error":...}
@@ -14,10 +16,9 @@ import respx
 import app.tools.serper as serper_mod
 from app.config import SETTINGS
 from app.tools.keyrotation import KeyRotator
-from app.tools.serper import serper_scrape_raw, serper_search_raw, web_search, fetch_page
+from app.tools.serper import serper_search_raw, web_search
 
 SERPER_BASE = SETTINGS.tools.serper_base_url
-SERPER_SCRAPE = SETTINGS.tools.serper_scrape_url
 
 
 def _set_key(value: str):
@@ -245,69 +246,6 @@ async def test_max_results_caps_organic_and_payload_num():
     finally:
         _restore_key()
 
-# --- fetch_page / serper_scrape_raw (scrape.serper.dev) ---
-
-
-@respx.mock
-async def test_fetch_page_success_maps_text_to_content():
-    _set_key("testkey")
-    try:
-        respx.post(SERPER_SCRAPE).mock(
-            return_value=httpx.Response(
-                200, json={"text": "hello world", "metadata": {}}
-            )
-        )
-        result = await fetch_page.ainvoke({"url": "https://x"})
-        assert result == {"url": "https://x", "content": "hello world"}
-    finally:
-        _restore_key()
-
-
-@respx.mock
-async def test_fetch_page_http_error_degrades_with_error():
-    _set_key("testkey")
-    try:
-        respx.post(SERPER_SCRAPE).mock(return_value=httpx.Response(500))
-        result = await fetch_page.ainvoke({"url": "https://x"})
-        assert result["url"] == "https://x"
-        assert result["content"] == ""
-        assert result["error"] is not None
-    finally:
-        _restore_key()
-
-
-@respx.mock
-async def test_serper_scrape_raw_missing_key_returns_error_without_http_call():
-    _set_key("")
-    try:
-        route = respx.post(SERPER_SCRAPE).mock(
-            return_value=httpx.Response(200, json={"text": "hello"})
-        )
-        result = await serper_scrape_raw("https://x")
-        assert result == {"url": "https://x", "content": "", "error": "SERPER_API_KEY not set"}
-        assert not route.called
-    finally:
-        _restore_key()
-
-
-@respx.mock
-async def test_scrape_api_key_header_present_on_request():
-    _set_key("testkey")
-    try:
-        route = respx.post(SERPER_SCRAPE).mock(
-            return_value=httpx.Response(200, json={"text": "hello", "metadata": {}})
-        )
-        await serper_scrape_raw("https://x")
-        assert route.called
-        sent = respx.calls[0].request
-        assert sent.headers.get("X-API-KEY") == "testkey"
-        assert sent.headers.get("Content-Type") == "application/json"
-        payload = json.loads(sent.content)
-        assert payload == {"url": "https://x"}
-    finally:
-        _restore_key()
-
-
 # --- multi-key rotation (app/tools/keyrotation.py) ---
 
 def _set_keys(*values: str):
@@ -363,21 +301,5 @@ async def test_rotation_state_persists_across_calls():
         await serper_search_raw("first")
         await serper_search_raw("second")
         assert respx.calls[2].request.headers.get("X-API-KEY") == "key2"
-    finally:
-        _restore_key()
-
-
-@respx.mock
-async def test_scrape_rotates_to_next_key_on_429():
-    _set_keys("key1", "key2")
-    try:
-        route = respx.post(SERPER_SCRAPE).mock(
-            side_effect=[httpx.Response(429), httpx.Response(200, json={"text": "hello"})]
-        )
-        result = await serper_scrape_raw("https://x")
-        assert route.call_count == 2
-        assert respx.calls[0].request.headers.get("X-API-KEY") == "key1"
-        assert respx.calls[1].request.headers.get("X-API-KEY") == "key2"
-        assert result == {"url": "https://x", "content": "hello"}
     finally:
         _restore_key()
