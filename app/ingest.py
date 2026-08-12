@@ -116,6 +116,7 @@ def _map_source(record: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         "state": record.get("state"),
         "address_raw": record.get("address_raw"),
         "discovery_source_id": record.get("discovery_source_id"),
+        "raw_payload": raw,
     }
     return discovery_class, payload
 
@@ -139,6 +140,14 @@ def ingest_discovery_file(conn: sqlite3.Connection, path: str | Path) -> list[st
             order.append(entity_id)
             aliases_by_id[entity_id] = set()
         aliases_by_id[entity_id].add(name_raw)
+        # Some discovery classes (notably fec_employer) carry alternate spellings of the
+        # firm name in signals.name_variants. Fold them in as aliases so the researcher
+        # sees the variants even when the canonical name came from a different record.
+        # Read defensively: most classes have no such key, and non-str entries are skipped.
+        name_variants = (record.get("signals", {}) or {}).get("name_variants") or []
+        for variant in name_variants:
+            if isinstance(variant, str) and variant.strip():
+                aliases_by_id[entity_id].add(variant.strip())
 
         existing = get_entity(conn, entity_id)
         canonical_name = existing["canonical_name"] if existing else name_raw

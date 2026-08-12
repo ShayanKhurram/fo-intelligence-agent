@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS claims (
     question_id         TEXT,
     field_name          TEXT,
     answer              TEXT,                       -- JSON-encoded (Claim.answer is Any)
+    subject_value       TEXT,
     status              TEXT NOT NULL,
     source_url          TEXT,
     source_class        TEXT,

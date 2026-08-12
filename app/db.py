@@ -52,6 +52,15 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE rejections ADD COLUMN stage TEXT NOT NULL DEFAULT 'verdict'")
     except sqlite3.OperationalError:
         pass
+    try:
+        # PLAN.md T19.1: the claims spine gains subject_value in place. The live
+        # data/foia.db is 145MB and must not be rebuilt — a guarded ALTER adds the
+        # column to an existing table; CREATE TABLE IF NOT EXISTS already covers a
+        # fresh DB (schema.sql). Idempotent: re-running on a migrated DB raises and is
+        # caught here, so init_db() twice is a no-op.
+        conn.execute("ALTER TABLE claims ADD COLUMN subject_value TEXT")
+    except sqlite3.OperationalError:
+        pass
 
 
 @contextmanager
@@ -349,14 +358,15 @@ def upsert_claim(conn: sqlite3.Connection, entity_id: str, claim: dict[str, Any]
     conn.execute(
         """
         INSERT INTO claims (
-            claim_id, entity_id, question_id, field_name, answer, status,
+            claim_id, entity_id, question_id, field_name, answer, subject_value, status,
             source_url, source_class, extraction_method, retrieved_at, confidence,
             produced_by, wave, verification_method, confirming_url, confirming_class,
             verified_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(claim_id) DO UPDATE SET
             status = excluded.status,
             answer = excluded.answer,
+            subject_value = excluded.subject_value,
             verification_method = excluded.verification_method,
             confirming_url = excluded.confirming_url,
             confirming_class = excluded.confirming_class,
@@ -364,7 +374,8 @@ def upsert_claim(conn: sqlite3.Connection, entity_id: str, claim: dict[str, Any]
         """,
         (
             claim_id, entity_id, claim.get("question_id"), claim.get("field_name"),
-            json.dumps(claim.get("answer"), default=str), claim["status"],
+            json.dumps(claim.get("answer"), default=str), claim.get("subject_value"),
+            claim["status"],
             claim.get("source_url"), claim.get("source_class"), claim.get("extraction_method"),
             str(retrieved_at) if retrieved_at else None, claim["confidence"],
             claim.get("produced_by", "research"), claim.get("wave"),

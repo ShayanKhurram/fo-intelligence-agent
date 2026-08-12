@@ -57,6 +57,12 @@ class Claim(BaseModel):
     question_id: str | None = None  # e.g. "G1.Q3" (gate.question) — layer-1 battery claims
     field_name: str | None = None  # join key to the dataset schema — enrichment/derived claims
     answer: Any = None
+    # The bare value the answer asserts, when the answer is about a named subject a
+    # later wave needs to read without the question text (PLAN.md T19). E.g. G2.Q1's
+    # answer restates "Matt Blackburn is Managing Director..."; subject_value carries
+    # just "Matt Blackburn". None on every historical claim and on any question_id the
+    # compress step does not explicitly fill — see app/researcher.py._COMPRESS_SYSTEM_TEMPLATE.
+    subject_value: str | None = None
     status: ClaimStatus
     source_url: str | None = None
     source_class: str | None = None
@@ -93,6 +99,7 @@ class LeadBrief(BaseModel):
     canonical_name: str
     aliases: list[str] = Field(default_factory=list)
     injected_facts: dict[str, Any] = Field(default_factory=dict)
+    unverified_leads: list[dict[str, Any]] = Field(default_factory=list)
     questions: list[QuestionSpec] = Field(default_factory=list)
     budget: LeadBudget = Field(default_factory=LeadBudget)
 

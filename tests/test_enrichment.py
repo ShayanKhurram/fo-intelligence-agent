@@ -256,14 +256,15 @@ async def test_wave_1_resolves_via_jsonld_and_site_email_ungated(monkeypatch):
         monkeypatch,
         raw_html='<script type="application/ld+json">{"@type":"Person","name":"Jane Doe","jobTitle":"CIO"}</script>',
         free_fetch_content="Contact us at jane@acmecap.com for more information.",
-        gdelt_results=[{"url": "http://news.example/x", "title": "Acme raises new fund", "seendate": "20260101000000"}],
+        gdelt_results=[{"url": "http://news.example/x", "title": "Acme Capital Partners raises new fund", "seendate": "20260101000000"}],
     )
     new_claims, gated = await wave_1([], "Acme Capital Partners", domain="acmecap.com")
     fields = {c.field_name: c for c in new_claims}
     assert fields["principal_name"].answer == "Jane Doe"
     assert fields["principal_name"].extraction_method == "jsonld"
     assert fields["principal_email"].answer == "jane@acmecap.com"
-    assert "recent_investments" in fields
+    assert "recent_news" in fields
+    assert "recent_investments" not in fields
     assert gated is False
 
 

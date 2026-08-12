@@ -123,6 +123,115 @@ def _aum_claims(f13: dict[str, Any]) -> list[Claim]:
     return claims
 
 
+def _adv_aum_claims(adv_row: dict[str, Any]) -> list[Claim]:
+    """AUM from an adv_name row's self-reported RAUM (PLAN.md T19.5). Mirrors
+    `_aum_claims` but reads `signals.raum_usd` instead of a 13F holdings value. A 13F
+    is a holdings floor for a stated quarter; RAUM is self-reported, so the 13F-derived
+    aum_usd wins when both exist — wave_minus_1 emits this one ONLY when no 13F row is
+    present (see wave_minus_1). Verified live: Class VI $1,498,011,942, MB $204,073,110,
+    Arden $107,056,681 all shipped `aum_usd` blank before this.
+
+    `aum_basis` is "adv_raum" (distinct from the 13F's "13f_floor") so the row records
+    HOW the figure was derived. `aum_as_of` is the row's `retrieved_at` date when present
+    (RAUM has no reporting quarter in the current ingest payload — the retrieval date is
+    the best available 'as of')."""
+    signals = adv_row["payload"].get("signals") or {}
+    raum = signals.get("raum_usd")
+    if raum is None:
+        return []
+    claims: list[Claim] = [
+        _derived_claim(
+            field_name="aum_usd", answer=raum, source=adv_row,
+            extraction_method="adv_raum", confidence="high", source_class="adv_name",
+        ),
+        _derived_claim(
+            field_name="aum_basis", answer="adv_raum", source=adv_row,
+            extraction_method="adv_raum", confidence="high", source_class="adv_name",
+        ),
+    ]
+    retrieved_at = _parse_dt(adv_row.get("retrieved_at"))
+    if retrieved_at:
+        claims.append(_derived_claim(
+            field_name="aum_as_of", answer=retrieved_at.date().isoformat(), source=adv_row,
+            extraction_method="adv_raum", confidence="high", source_class="adv_name",
+        ))
+    return claims
+
+
+# PLAN.md T19.3: Layer 1 writes claims keyed on `question_id` (G2.Q1); the dataset row
+# pivots on `field_name` (principal_name). This map bridges the two vocabularies so a
+# researched, confirmed fact reaches the row instead of being invisible to Layer D and
+# to enrichment's _settled_fields (which is what gated wave 2 off on Class VI).
+QUESTION_FIELD_PROJECTIONS: dict[str, str] = {
+    "G2.Q1": "principal_name",
+    "G2.Q3": "principal_title",
+    "G3.Q1": "recent_investments",
+    "G3.Q2": "why_now_trigger",
+}
+
+
+def _project_question_claims(claims: list[Claim]) -> list[Claim]:
+    """Project Layer-1 question claims into field-name claims the row pivots on
+    (PLAN.md T19.3). `claims` is the combined list the caller already holds — both the
+    Layer-1 research claims (which carry `question_id` + `subject_value`) and any
+    structured derivations produced so far (13F/5500/conference, which carry
+    `field_name`). Only the question_id-bearing claims match the projection map; the
+    structured ones are consulted only to decide what is already settled.
+
+    For each Layer-1 claim whose question_id is in QUESTION_FIELD_PROJECTIONS (or G2.Q2
+    -> principal_linkedin when subject_value is a linkedin.com/in/ URL), whose status is
+    `confirmed`, and whose subject_value is a non-empty string: emit a _derived_claim
+    with that field_name, answer=subject_value, extraction_method=f"projected_{qid}",
+    confidence=`medium`, PRESERVING the original claim's source_url and source_class — the
+    researcher's citation must survive the projection so the row stays auditable back to
+    the page the fact came from. Skip a field already settled by a higher-confidence
+    13F/5500/conference structured derivation. Never project a claim whose status is
+    could_not_verify / contradicted / superseded (the status != "confirmed" guard covers
+    all three)."""
+    settled_by_structured = {
+        c.field_name for c in claims
+        if c.produced_by == "derived"
+        and c.field_name
+        and c.status not in ("could_not_verify", "removed_failed_validation", "superseded")
+        and (c.extraction_method or "").startswith(("derived_13f", "derived_5500", "derived_conference"))
+    }
+    out: list[Claim] = []
+    for c in claims:
+        qid = c.question_id
+        if not qid or c.status != "confirmed":
+            continue
+        sv = c.subject_value
+        if not isinstance(sv, str) or not sv.strip():
+            continue
+        field_name = QUESTION_FIELD_PROJECTIONS.get(qid)
+        if field_name is None:
+            # G2.Q2 -> principal_linkedin ONLY when subject_value is a linkedin.com/in/
+            # URL — a generic profile URL or a company LinkedIn page is not a person's
+            # LinkedIn field (PLAN.md T19.3).
+            if qid == "G2.Q2" and "linkedin.com/in/" in sv.lower():
+                field_name = "principal_linkedin"
+            else:
+                continue
+        if field_name in settled_by_structured:
+            continue
+        # Preserve the original claim's timestamp alongside its url/source_class — the
+        # date is part of the provenance the projection must carry (PLAN.md T19.3), and
+        # `check_v5_staleness` skips any claim whose retrieved_at is None, so dropping it
+        # would silently make a two-year-old researched principal look freshly found.
+        # `_parse_dt` accepts an ISO string and returns None for None, so a Layer-1 claim
+        # with no timestamp keeps behaving exactly as it did before this fix.
+        out.append(_derived_claim(
+            field_name=field_name, answer=sv,
+            source={
+                "url": c.source_url,
+                "retrieved_at": c.retrieved_at.isoformat() if c.retrieved_at else None,
+            },
+            extraction_method=f"projected_{qid}", confidence="medium",
+            source_class=c.source_class,
+        ))
+    return out
+
+
 def _why_now_from_13f_delta(f13: dict[str, Any]) -> Claim | None:
     """concentration_pain (value dropped hard QoQ) / fresh_liquidity (value jumped hard
     QoQ). Depends on prior_value_usd, which app/ingest.py's edgar_13f mapping does not
@@ -254,6 +363,7 @@ def wave_minus_1(
     *,
     today: date | None = None,
     entity_id: str | None = None,
+    layer1_claims: list[Claim] | None = None,
 ) -> list[Claim]:
     """Pure function, zero API calls (plan §4 wave -1 table). Run on every
     pursue/pursue_low lead before any spend decision — some pursue_low records promote
@@ -270,6 +380,12 @@ def wave_minus_1(
     Claim model's random default — so calling this twice for the same entity upserts the
     SAME rows in the `claims` table rather than duplicating them (plan §9's idempotency
     test). Omitted by unit tests that don't care about storage identity.
+
+    `layer1_claims` (PLAN.md T19.3): the Layer-1 research claims for this entity, when the
+    caller already holds them (process_entity / run_pipeline read them from the DB).
+    Question claims confirmed with a `subject_value` are projected into field-name
+    claims the row pivots on (G2.Q1 -> principal_name, etc.), preserving the original
+    source_url/source_class. Omitted by callers/tests that don't need the projection.
     """
     today = today or datetime.now(timezone.utc).date()
     claims: list[Claim] = []
@@ -279,6 +395,13 @@ def wave_minus_1(
         claims.extend(_aum_claims(f13))
         if trigger := _why_now_from_13f_delta(f13):
             claims.append(trigger)
+    else:
+        # PLAN.md T19.5: trust the source's own AUM. A 13F is a holdings floor for a
+        # stated quarter; RAUM is self-reported — so the 13F wins when both exist, and
+        # the ADV RAUM is emitted only when no 13F row is present.
+        adv_rows = _by_class(entity_sources, "adv_name")
+        if adv := _latest(adv_rows):
+            claims.extend(_adv_aum_claims(adv))
 
     f5500_rows = _by_class(entity_sources, "5500_filing")
     if f5500 := _latest(f5500_rows):
@@ -293,6 +416,12 @@ def wave_minus_1(
 
     if overlap := _public_list_overlap_claim(canonical_name, aliases, public_list):
         claims.append(overlap)
+
+    # PLAN.md T19.3: project confirmed Layer-1 question claims into field-name claims
+    # AFTER the structured derivations, so a field already settled by a 13F/5500/
+    # conference derivation is not overwritten by a lower-confidence projection.
+    if layer1_claims:
+        claims.extend(_project_question_claims([*claims, *layer1_claims]))
 
     if entity_id:
         claims = [
@@ -427,6 +556,30 @@ def _host_from_url(url: str) -> str | None:
 
 def _is_aggregator(host: str) -> bool:
     return any(host == a or host.endswith(f".{a}") for a in _AGGREGATOR_HOSTS)
+
+
+def _domain_from_sources(entity_sources: list[dict[str, Any]]) -> str | None:
+    """The entity's own web domain straight from the discovery record, no Serper call
+    (PLAN.md T19.4). An adv_name row's `signals.website` is the firm's self-reported
+    domain — it arrives upper-cased in real data
+    (e.g. `HTTPS://WWW.CLASSVIPARTNERS.COM`), so this normalises to a bare lowercase host
+    (strip scheme, `www.`, path). Rejected and falls through to resolve_domain when the
+    field holds an aggregator (verified live: ARDEN GLOBAL FAMILY OFFICES carries
+    `HTTPS://WWW.LINKEDIN.COM/COMPANY/ARDENWOOD-ADVISORS` in that field) or is None
+    (MB FAMILY ADVISORS). This is not re-verification of the fact; it is a check that the
+    field contains a firm domain at all — the source class IS the provenance."""
+    adv_rows = _by_class(entity_sources, "adv_name")
+    adv = _latest(adv_rows)
+    if adv is None:
+        return None
+    signals = adv["payload"].get("signals") or {}
+    website = signals.get("website")
+    if not isinstance(website, str) or not website.strip():
+        return None
+    host = _host_from_url(website) if "://" in website else _host_from_url(f"https://{website}")
+    if not host or _is_aggregator(host):
+        return None
+    return host
 
 
 def _domain_matches_entity(host: str, canonical_name: str) -> bool:
@@ -699,23 +852,88 @@ async def _find_phone_via_site(domain: str) -> Claim | None:
     return None
 
 
-async def _find_dated_signal(canonical_name: str) -> Claim | None:
+_LEGAL_SUFFIX_RE = _re.compile(
+    r"\s*,?\s*\b(?:L\.L\.C\.|LLC|INC\.?|LP|LLP|LTD|CORP|CO)\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _normalise_entity_text(s: str) -> str:
+    """Casefold, replace punctuation with space, collapse whitespace, strip — for the
+    contiguous-substring entity-mention gate (T20.1)."""
+    s = (s or "").casefold()
+    s = _re.sub(r"[^\w\s]", " ", s)
+    s = _re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _core_name_phrase(name: str) -> str:
+    """The canonical name (or alias) with a trailing legal suffix removed, then
+    normalised — the contiguous phrase `_mentions_entity` requires to appear in the
+    article text. Suffix list per PLAN.md T20: LLC, L.L.C., INC, INC., LP, LLP, LTD,
+    CORP, CO (and an optional trailing comma before it). The leading `\b` keeps a
+    suffix like CO from biting the end of a word such as 'DISCO'."""
+    return _normalise_entity_text(_LEGAL_SUFFIX_RE.sub("", name or ""))
+
+
+def _result_mention_text(r: dict[str, Any]) -> str:
+    """Title plus any snippet/description/content the result carries — the full text the
+    entity-mention gate runs against (T20.1)."""
+    parts = [r.get("title") or ""]
+    for key in ("snippet", "description", "content"):
+        v = r.get(key)
+        if isinstance(v, str):
+            parts.append(v)
+    return " ".join(parts)
+
+
+def _mentions_entity(text: str, canonical_name: str, aliases: list[str] | None) -> bool:
+    """T20.1 entity-mention gate. Normalise both sides (casefold, strip punctuation,
+    collapse whitespace) and require the article text to contain the entity's **core
+    name phrase** — the canonical name with a trailing legal suffix removed — as a
+    contiguous substring. Any alias, normalised the same way, also satisfies the gate.
+
+    Deliberate recall trade-off (PLAN.md T20.1): requiring the contiguous core phrase
+    drops a real article that calls the firm only 'Class VI Partners'. Single
+    distinctive tokens are NOT a safe fallback — the distinctive tokens of 'CLASS VI
+    FAMILY OFFICE' are 'class'/'vi', which match almost anything. A missed article
+    costs a blank cell; a wrong one ships a falsehood with a citation, which is worse.
+    """
+    norm_text = _normalise_entity_text(text)
+    if not norm_text:
+        return False
+    phrases = [_core_name_phrase(canonical_name)]
+    for alias in aliases or []:
+        phrases.append(_core_name_phrase(alias))
+    return any(p and p in norm_text for p in phrases)
+
+
+async def _find_dated_signal(
+    canonical_name: str, aliases: list[str] | None = None
+) -> Claim | None:
     """Tier 2 GDELT, tier 3 Serper /news — both carry a real dated field (seendate /
-    date), which is the whole point of a "dated signal" claim."""
+    date), which is the whole point of a 'dated signal' claim. A news article is
+    evidence a story exists, not a statement the firm made an investment, so T20.2
+    emits it on `recent_news` (never `recent_investments`). T20.1 skips any result that
+    doesn't actually mention the entity in its title/snippet/description."""
     gdelt = await news_search_raw(f'"{canonical_name}"', lookback_days=180, max_records=5)
     for r in gdelt.get("results", []):
+        if not _mentions_entity(_result_mention_text(r), canonical_name, aliases):
+            continue
         if r.get("url") and r.get("seendate"):
             return Claim(
-                field_name="recent_investments", answer=r.get("title") or r["url"], status="confirmed",
+                field_name="recent_news", answer=r.get("title") or r["url"], status="confirmed",
                 source_url=r["url"], source_class="gdelt", extraction_method="gdelt_docapi",
                 confidence="low", produced_by="enrichment", wave="1",
                 retrieved_at=_parse_dt(r.get("seendate")),
             )
     news = await serper_search_raw(f'"{canonical_name}"', topic="news", max_results=5)
     for r in news.get("results", []):
+        if not _mentions_entity(_result_mention_text(r), canonical_name, aliases):
+            continue
         if r.get("url"):
             return Claim(
-                field_name="recent_investments", answer=r.get("title") or r["url"], status="confirmed",
+                field_name="recent_news", answer=r.get("title") or r["url"], status="confirmed",
                 source_url=r["url"], source_class="news_article", extraction_method="serper_news",
                 confidence="low", produced_by="enrichment", wave="1",
             )
@@ -731,7 +949,8 @@ def _settled_fields(claims: list[Claim]) -> set[str]:
 
 
 async def wave_1(
-    claims: list[Claim], canonical_name: str, domain: str | None = None
+    claims: list[Claim], canonical_name: str, domain: str | None = None,
+    aliases: list[str] | None = None,
 ) -> tuple[list[Claim], bool]:
     """Returns (new_claims, gated). `gated=True` means no decision-maker OR no contact
     channel was resolved even after every tier — the caller (run_pipeline) should stop;
@@ -772,10 +991,10 @@ async def wave_1(
             new_claims.append(claim)
             settled.add("principal_phone")
 
-    if "recent_investments" not in settled and "why_now_trigger" not in settled:
-        if claim := await _find_dated_signal(canonical_name):
+    if "recent_news" not in settled and "why_now_trigger" not in settled:
+        if claim := await _find_dated_signal(canonical_name, aliases):
             new_claims.append(claim)
-            settled.add("recent_investments")
+            settled.add("recent_news")
 
     have_decision_maker = "principal_name" in settled
     have_channel = "principal_email" in settled or "principal_phone" in settled
@@ -900,16 +1119,21 @@ async def _find_principal_linkedin(principal_name: str, canonical_name: str) -> 
 
 
 _WAVE2_NEWS_QUERIES = {
-    "recent_fund_commitments": lambda name: f'"{name}" (commitment OR "LP" OR allocation)',
-    "recent_key_hires": lambda name: f'"{name}" (hire OR appoints OR joins)',
     "recent_news": lambda name: f'"{name}"',
 }
 
 
-async def _find_news_signals(canonical_name: str) -> list[Claim]:
-    """recent_fund_commitments / recent_key_hires / recent_news — tier 2 GDELT, tier 3
-    Serper /news, same dated-evidence pattern as wave 1's dated-signal helper, one
-    result (the single highest-kill-power hit) per field."""
+async def _find_news_signals(
+    canonical_name: str, aliases: list[str] | None = None
+) -> list[Claim]:
+    """recent_news — tier 2 GDELT, tier 3 Serper /news, same dated-evidence pattern as
+    wave 1's dated-signal helper, one result (the single highest-kill-power hit). A
+    news article is evidence a story exists, not a statement the firm made an
+    investment/hire/commitment, so T20.2 collapsed this helper to `recent_news` only —
+    the `recent_fund_commitments` and `recent_key_hires` paths that used to write a
+    field chosen by the query string (never by the article content) are deleted. T20.1
+    skips any result that doesn't actually mention the entity in its
+    title/snippet/description."""
     claims: list[Claim] = []
     for field, query_fn in _WAVE2_NEWS_QUERIES.items():
         query = query_fn(canonical_name)
@@ -922,6 +1146,8 @@ async def _find_news_signals(canonical_name: str) -> list[Claim]:
             source_class, extraction_method = "news_article", "serper_news"
         for r in results[:1]:
             if not r.get("url"):
+                continue
+            if not _mentions_entity(_result_mention_text(r), canonical_name, aliases):
                 continue
             claims.append(Claim(
                 field_name=field, answer=r.get("title") or r["url"], status="confirmed",
@@ -960,7 +1186,8 @@ async def _author_outreach_hook(trigger_claim: Claim, model: Any) -> tuple[Claim
 
 
 async def wave_2(
-    claims: list[Claim], canonical_name: str, model: Any, domain: str | None = None
+    claims: list[Claim], canonical_name: str, model: Any, domain: str | None = None,
+    aliases: list[str] | None = None,
 ) -> tuple[list[Claim], float]:
     """Survivors only (called after wave 1 clears its gate). Returns (new_claims,
     cost_usd)."""
@@ -984,7 +1211,9 @@ async def wave_2(
         if claim := await _find_principal_linkedin(principal_name, canonical_name):
             new_claims.append(claim)
 
-    new_claims.extend(c for c in await _find_news_signals(canonical_name) if c.field_name not in settled)
+    new_claims.extend(
+        c for c in await _find_news_signals(canonical_name, aliases) if c.field_name not in settled
+    )
 
     trigger = next((c for c in [*claims, *new_claims] if c.field_name == "why_now_trigger"), None)
     if trigger and "outreach_hook" not in settled:
@@ -1062,7 +1291,8 @@ async def process_entity(
 
     started_at = utcnow()
 
-    minus1 = wave_minus_1(sources, canonical_name, entity["aliases"], entity_id=entity_id)
+    minus1 = wave_minus_1(sources, canonical_name, entity["aliases"], entity_id=entity_id,
+                          layer1_claims=existing)
     claims = existing + minus1
     waves_completed = ["-1"]
 
@@ -1087,17 +1317,23 @@ async def process_entity(
         # Resolve a domain if ingestion didn't supply one (no `domain_check` source — which
         # is every entity in the current pool). Deliberately AFTER the wave-0 gate: an
         # entity wave 0 rejects must not cost a Serper call. See PLAN.md T16.
+        # PLAN.md T19.4: first take the domain straight from the discovery record when the
+        # adv_name row carries a firm website — costs no Serper call (do NOT increment
+        # calls_spent). Falls through to resolve_domain when the field is None or an
+        # aggregator (e.g. a LinkedIn company page).
+        if not domain:
+            domain = _domain_from_sources(sources)
         if not domain:
             domain = await resolve_domain(canonical_name)
             calls_spent += 1
 
-        new1, gated = await wave_1(claims, canonical_name, domain=domain)
+        new1, gated = await wave_1(claims, canonical_name, domain=domain, aliases=entity["aliases"])
         claims = claims + new1
         calls_spent += len(new1)
         waves_completed.append("1")
 
         if not gated:
-            new2, cost2 = await wave_2(claims, canonical_name, model, domain=domain)
+            new2, cost2 = await wave_2(claims, canonical_name, model, domain=domain, aliases=entity["aliases"])
             claims = claims + new2
             calls_spent += len(new2)
             usd_spent += cost2
@@ -1232,7 +1468,8 @@ async def run_pipeline(
         entity_id = d["entity_id"]
         entity = get_entity(conn, entity_id)
         sources = get_entity_sources(conn, entity_id)
-        claims = wave_minus_1(sources, entity["canonical_name"], entity["aliases"], entity_id=entity_id)
+        claims = wave_minus_1(sources, entity["canonical_name"], entity["aliases"], entity_id=entity_id,
+                              layer1_claims=[_claim_from_row(r) for r in get_claims(conn, entity_id)])
         minus1_by_entity[entity_id] = claims
         upsert_claims(conn, entity_id, [c.model_dump(mode="json") for c in claims])
 

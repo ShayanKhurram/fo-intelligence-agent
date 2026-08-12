@@ -150,6 +150,19 @@ def _lane_system_prompt(state: ResearcherState) -> str:
         if hard_gates
         else ""
     )
+    leads = brief.get("unverified_leads") or []
+    if leads:
+        lead_lines = [
+            "UNVERIFIED LEADS from the discovery feed — these are starting points for your searches, NOT answers. You MUST confirm each one with a tool and cite the confirming source_url before reporting it. If you cannot confirm one, do not report it at all."
+        ]
+        for lead in leads:
+            title_part = f" ({lead['title']})" if lead.get("title") else ""
+            lead_lines.append(
+                f"- {lead['kind']}: {lead['value']}{title_part} [via {lead['source_class']}]"
+            )
+        leads_block = "\n".join(lead_lines) + "\n\n"
+    else:
+        leads_block = ""
     identity_hint = (
         "\nFor FO-status questions specifically, before concluding could_not_verify try "
         "edgar_submissions (SIC code / business description), fetch_page (the entity's "
@@ -177,6 +190,7 @@ def _lane_system_prompt(state: ResearcherState) -> str:
         f"You are the {lane} researcher for a family-office lead-qualification pipeline.\n"
         f"Entity: {brief.get('canonical_name')} (aliases: {brief.get('aliases')})\n"
         f"Known facts: {json.dumps(brief.get('injected_facts', {}))}\n\n"
+        f"{leads_block}"
         f"Supervisor instructions for this lane:\n{state['instructions']}\n\n"
         f"Questions this lane must try to answer:\n{q_lines}\n"
         f"{hard_gate_line}"
@@ -307,6 +321,17 @@ _COMPRESS_SYSTEM_TEMPLATE = (
     "below that the notes touch on, emit exactly one claim. Rules:\n"
     "- Every claim needs a source_url, UNLESS status is 'could_not_verify'.\n"
     "- Never invent a question_id not in the list below.\n"
+    "- Never answer with a bare \"Yes\"/\"No\". Every answer must restate its subject so it "
+    "stands alone out of context — the claim is later read without the question text. "
+    "So instead of \"Yes\" write \"Matt Blackburn is Managing Director of Class VI Family "
+    "Office\", not a bare affirmative; instead of \"No\" state what was actually found or "
+    "that nothing was found.\n"
+    "- For these question_ids ALSO emit a `subject_value` key holding ONLY the value, no "
+    "prose: G2.Q1 -> the person's full name; G2.Q2 -> the URL of that person's public "
+    "profile; G2.Q3 -> their current title; G3.Q1 -> a short description of the "
+    "investment/deployment; G3.Q2 -> a short description of the recent signal. Omit the "
+    "`subject_value` key for every other question_id, and whenever the lane could not "
+    "determine the value.\n"
     "- Use status='contradicted' ONLY when two sources assert MUTUALLY EXCLUSIVE facts "
     "about the same thing — facts that cannot both be true (e.g. one says the firm is "
     "dissolved and another says it is actively filing; one gives AUM as $50M and another "
@@ -323,7 +348,8 @@ _COMPRESS_SYSTEM_TEMPLATE = (
     "are two facts, not a conflict).\n"
     "- Respond with ONLY a JSON array of objects with keys: question_id, answer, status "
     "(confirmed|could_not_verify|contradicted), source_url, source_class, confidence "
-    "(high|medium|low). No prose, no markdown fences.\n\n"
+    "(high|medium|low), and (for the listed question_ids only) subject_value. No prose, "
+    "no markdown fences.\n\n"
     "Questions for this lane:\n{questions}\n"
 )
 

@@ -216,6 +216,7 @@ async def supervisor_tools_node(state: SupervisorState) -> dict[str, Any]:
         "canonical_name": brief.canonical_name,
         "aliases": brief.aliases,
         "injected_facts": brief.injected_facts,
+        "unverified_leads": brief.unverified_leads,
     }
     cap = SETTINGS.supervisor.max_concurrent_research_units
     for i in range(0, len(accepted), cap):
