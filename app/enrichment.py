@@ -1354,10 +1354,29 @@ async def _find_email_via_snov(domain: str, principal_name: str | None) -> Claim
     (`"medium"`) in addition to the existing numeric rule.
     """
     first, last = _split_name(principal_name)
+    # T32.1: track whether ANY Snov call returned an `error` key, and whether either
+    # tier returned ANY row at all. An outage (HTTP 402 credits exhausted) and a firm
+    # with genuinely no published address are otherwise byte-identical: both fall
+    # through the `for row in ...get("results") or []` loops to `return None`. Surfacing
+    # the failure as a `could_not_verify` claim (below) lets the row say "we could not
+    # look" instead of silently reporting an absence — the same distinction
+    # app/researcher.py's `_tag_evidence_gaps` already draws with the `tool_unavailable`
+    # vs `no_evidence_found` vocabulary. `saw_any_row` keeps the pre-T32 `None` return
+    # for the distinct case where Snov DID answer (rows present) but every row was
+    # off-domain and filtered out by `_email_matches_domain` — that is "Snov returned
+    # the wrong company", not "no evidence", and is the behaviour tests/test_email_domain_guard.py
+    # guards (an off-domain row yields no claim).
+    errors: list[str] = []
+    saw_any_row = False
 
     if last:
         targeted = await snov_emails_by_name_domain_raw(first, last, domain)
-        for row in targeted.get("results") or []:
+        if targeted.get("error"):
+            errors.append(str(targeted["error"]))
+        targeted_rows = targeted.get("results") or []
+        if targeted_rows:
+            saw_any_row = True
+        for row in targeted_rows:
             email = row.get("email")
             if not email:
                 continue
@@ -1383,7 +1402,11 @@ async def _find_email_via_snov(domain: str, principal_name: str | None) -> Claim
             )
 
     domain_wide = await snov_domain_search_raw(domain)
+    if domain_wide.get("error"):
+        errors.append(str(domain_wide["error"]))
     rows = domain_wide.get("results") or []
+    if rows:
+        saw_any_row = True
     # A domain-wide hit is preferred only if it matches the known surname; otherwise take
     # the first address but score it "low" — same policy the Hunter version used. A generic
     # firm inbox (`info@`, `contact@`, ...) is `firm_email` regardless of surname match, and
@@ -1411,7 +1434,31 @@ async def _find_email_via_snov(domain: str, principal_name: str | None) -> Claim
                 extraction_method="snov_domain_search", confidence="low",
                 produced_by="enrichment", wave="1",
             )
-    return None
+    # T32.1: no usable address found. Distinguish "the tool failed" from "the tool
+    # answered and there was nothing". `answer=None` (NOT the error text) because
+    # `_records_rows` renders a `could_not_verify` claim's `answer` into the cell — the
+    # error message would otherwise print in the `principal_email` column. The error
+    # string survives in `verification_method` (free-text, unset by any producer on this
+    # path) so the ledger records why the look failed without reaching the sheet.
+    # `saw_any_row` keeps the pre-T32 `None` return when Snov DID answer but every row was
+    # off-domain (filtered out by `_email_matches_domain`) — that is not "no evidence",
+    # and tests/test_email_domain_guard.py guards it (an off-domain row yields no claim).
+    if errors:
+        return Claim(
+            field_name="principal_email", answer=None, status="could_not_verify",
+            source_url=f"https://{domain}", source_class="tool_unavailable",
+            extraction_method="snov_error", confidence="low",
+            produced_by="enrichment", wave="1",
+            verification_method="; ".join(errors),
+        )
+    if saw_any_row:
+        return None
+    return Claim(
+        field_name="principal_email", answer=None, status="could_not_verify",
+        source_url=f"https://{domain}", source_class="no_evidence_found",
+        extraction_method="snov_no_match", confidence="low",
+        produced_by="enrichment", wave="1",
+    )
 
 
 async def _find_phone_via_site(domain: str) -> Claim | None:
@@ -1589,15 +1636,33 @@ async def wave_1(
         # found (site or Snov domain-wide) is `firm_email`, never `principal_email`.
         if principal_name:
             claim = await _find_email_via_snov(domain, principal_name)
-            if claim is None:
-                claim = await _find_email_on_site(domain, principal_name)
+            # T32: Snov may now return a `could_not_verify` claim (`tool_unavailable` /
+            # `no_evidence_found`) instead of None. Fall back to the site tier whenever
+            # Snov did not produce a usable (confirmed) address — a real address or
+            # `firm_email` the site finds is a genuine channel, not an absence, and
+            # surfacing a `tool_unavailable` claim while the site could have found the
+            # address would itself be "an outage looking like an absence". Only when the
+            # site tier ALSO finds nothing does the Snov `could_not_verify` claim
+            # survive, so a true outage is surfaced rather than silently looking like
+            # the firm published nothing (PLAN.md T32).
+            if claim is None or claim.status == "could_not_verify":
+                site_claim = await _find_email_on_site(domain, principal_name)
+                if site_claim is not None:
+                    claim = site_claim
         else:
             claim = await _find_email_on_site(domain, principal_name)
             if claim is None:
                 claim = await _find_email_via_snov(domain, principal_name)
         if claim:
             new_claims.append(claim)
-            settled.add(claim.field_name)
+            # T32.2: an unresolved claim (`could_not_verify` / `removed_failed_validation` /
+            # `superseded`) must NOT settle its field — the same statuses `_settled_fields`
+            # already excludes. Without this guard a `tool_unavailable` `principal_email`
+            # claim would enter `settled` and flip `have_channel` (T21.5) to True on a lead
+            # with no contact channel at all, wrongly ungating wave 2 and spending money
+            # on a dead lead.
+            if claim.status not in ("could_not_verify", "removed_failed_validation", "superseded"):
+                settled.add(claim.field_name)
 
     if "principal_phone" not in settled and domain:
         if claim := await _find_phone_via_site(domain):
