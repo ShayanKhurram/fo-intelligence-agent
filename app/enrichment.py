@@ -39,6 +39,7 @@ from app.db import (
     write_rejection,
 )
 from app.config import SETTINGS
+from app.llm import get_model
 from app.parser import compute_injected_facts
 from app.state import Claim, Finding, ValidationInput, select_claim_for_question, utcnow, _CLAIM_STATUS_RANK
 from app.validation import run_validation
@@ -54,6 +55,7 @@ from app.tools.gdelt import news_search_raw
 from app.tools.serper import serper_search_raw
 from app.tools.snov import snov_domain_search_raw, snov_emails_by_name_domain_raw
 from app.validation import (
+    _judge_claim_polarity,
     check_domain_mx_exists,
     check_v4_contradictions,
     check_v5_firm_is_fo_hardening,
@@ -957,18 +959,26 @@ async def _recheck_registration(canonical_name: str) -> Finding:
 
 
 async def wave_0(
-    claims: list[Claim], canonical_name: str, injected_facts: dict[str, Any] | None = None
+    claims: list[Claim], canonical_name: str, injected_facts: dict[str, Any] | None = None,
+    model: Any = None,
 ) -> tuple[list[Claim], list[Finding], bool]:
     """Returns (annotated_claims, findings, fatal). `fatal=True` means the caller
     (run_pipeline) should reject immediately rather than spend wave 1/2 budget — Layer V
-    would reject it on the same grounds regardless."""
+    would reject it on the same grounds regardless.
+
+    `model` (optional, T33) is the cheapest-tier model used to judge G1.Q3/G1.Q5 answer
+    polarity before the firm-is-FO gate. `None` (the test default) skips the judge and the
+    gate falls back to its deterministic string floor — so the existing 2-arg calls of
+    ``wave_0(claims, name)`` behave exactly as before. Production passes
+    ``get_model(SETTINGS.models.validation_tier)`` (PLAN.md T33.1)."""
     injected_facts = injected_facts or {}
     findings: list[Finding] = []
 
     claims, v4_findings = check_v4_contradictions(claims)
     findings.extend(v4_findings)
     findings.extend(check_v5_staleness(claims))
-    findings.extend(check_v5_firm_is_fo_hardening(claims))
+    polarity = await _judge_claim_polarity(claims, model)
+    findings.extend(check_v5_firm_is_fo_hardening(claims, polarity))
 
     domain = injected_facts.get("domain")
     if domain:
@@ -1979,7 +1989,9 @@ async def process_entity(
     claims = existing + minus1
     waves_completed = ["-1"]
 
-    claims, wave0_findings, fatal0 = await wave_0(claims, canonical_name, injected_facts)
+    claims, wave0_findings, fatal0 = await wave_0(
+        claims, canonical_name, injected_facts, model=get_model(SETTINGS.models.validation_tier)
+    )
     waves_completed.append("0")
 
     calls_spent = 0

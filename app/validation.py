@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -29,6 +30,9 @@ import dns.resolver
 import phonenumbers
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from app.config import SETTINGS
+from app.llm import get_model
+from app.questions import QUESTIONS_BY_ID
 from app.state import Claim, DatasetInput, FieldStatus, Finding, ValidationInput, utcnow
 from app.tools.freefetch import fetch_page_free_first
 
@@ -79,13 +83,48 @@ def _normalize_answer(answer: object) -> str:
 # "no FO evidence" even when the claim's status is settled (single_source). See
 # check_v5_firm_is_fo_hardening — this is what keeps settled-but-negative G1.Q3 entities
 # (Achmea, ASR — institutional asset managers) out of the dataset.
-_FO_NEGATIVE_PREFIXES = ("no", "there is no", "there's no", "insufficient", "not enough", "not a", "none")
+#
+# T33.3: this MUST match the leading TOKEN, never leading characters. The previous
+# `ans.startswith("no")` rejected NOBLE FAMILY WEALTH (a genuine $527M MFO) because the
+# firm's name begins with "No" — the third instance of this exact trap today (T20 guarded
+# "ceo" inside "Deceased", T30 guarded "No" inside "Norwegian"/"Nominated"). "Noble" /
+# "Northern" / "Nominally" are NOT negations; "No," / "None" / "Not a" / "There is no" /
+# "Insufficient" still are.
+#
+# Kept SEPARATE from app/enrichment.py's `_is_negative_answer` (T30) rather than shared,
+# because validation is not a dependency of the projection path and the two token sets
+# serve different purposes: this gate's negatives must catch "no affirmative evidence" /
+# "not a family office" as settled-negative G1.Q3 verdicts, while the projection path's set
+# is tuned for prose-field fallback ("no recent exits…"). If you fix the leading-token
+# discipline here, fix it there too — both encode the same rule, and leaving one unfixed
+# is exactly how this copy survived three rounds of the same bug.
+_FO_NEGATIVE_TOKENS = frozenset({"no", "none", "not", "insufficient"})
+_FO_NEGATIVE_LEADING_PHRASES = (
+    ("there", "is", "no"),
+    ("there's", "no"),
+    ("there", "are", "no"),
+    ("not", "a"),
+    ("not", "enough"),
+    ("no", "affirmative"),
+    ("no", "evidence"),
+)
+# Substring phrases kept from the original: a settled-negative verdict can appear
+# mid-sentence ("… no affirmative evidence that …") and that is still a negation.
 _FO_NEGATIVE_PHRASES = ("no affirmative evidence", "not a family office", "no evidence that")
 
 
 def _is_negative_fo_answer(answer: object) -> bool:
-    ans = _normalize_answer(answer).strip('"').lstrip()
-    return ans.startswith(_FO_NEGATIVE_PREFIXES) or any(p in ans for p in _FO_NEGATIVE_PHRASES)
+    cleaned = re.sub(r"[^\w\s]+", " ", str(answer), flags=re.UNICODE).strip().lower()
+    if not cleaned:
+        return False
+    tokens = cleaned.split()
+    if tokens[0] in _FO_NEGATIVE_TOKENS:
+        return True
+    for phrase in _FO_NEGATIVE_LEADING_PHRASES:
+        if tuple(tokens[: len(phrase)]) == phrase:
+            return True
+    joined = " ".join(tokens)
+    return any(p in joined for p in _FO_NEGATIVE_PHRASES)
 
 
 def _answers_compatible(a: object, b: object) -> bool:
@@ -266,15 +305,120 @@ def check_phone_format_valid(phone: str, region: str = "US") -> bool:
         return False
 
 
-def check_v5_firm_is_fo_hardening(claims: list[Claim]) -> list[Finding]:
+# --- T33.1: model-judged answer polarity (the G1.Q3 / G1.Q5 identity gate's primary
+# signal). The string check (`_is_negative_fo_answer` / `startswith("yes")`) is the
+# DETERMINISTIC FLOOR: it runs when the model is unavailable, returns "unclear", or is
+# stubbed off — a model outage must never silently open a HARD gate (PLAN.md T33).
+#
+# The motivating failure (2026-08-14): NOBLE FAMILY WEALTH, a $527M ADV-registered MFO with
+# a `confirmed` G1.Q3 reading "Noble Family Wealth LLC operates as a family office, …",
+# was rejected at wave 0 because `_is_negative_fo_answer` matched the firm name's leading
+# "No". The model judged correctly and the string check overruled it. T33.3 fixes the
+# floor; this judge makes the floor the fallback rather than the verdict.
+_POLARITY_SYSTEM_PROMPT = (
+    "You are judging ONE thing only: whether an answer ASSERTS, DENIES, or leaves "
+    "indeterminate the proposition of a yes/no question. Judge the SUBSTANCE of the "
+    "answer, never how it opens.\n\n"
+    "An answer that begins with the entity's own name (e.g. \"Noble Family Wealth LLC "
+    "operates as a family office\") is an AFFIRMATIVE statement, NEVER a negation — a name "
+    "whose first letters are \"No\" is not the word \"no\".\n\n"
+    "Respond with ONLY a JSON object: {\"verdict\": \"affirmative\"|\"negative\"|\"unclear\"}. "
+    "No markdown fences, no extra keys, no prose.\n\n"
+    "Verdict rules:\n"
+    "- \"affirmative\" — the answer asserts the question's proposition is TRUE.\n"
+    "- \"negative\" — the answer denies it, asserts the opposite, or reports an absence "
+    "of the thing the question asks about.\n"
+    "- \"unclear\" — the answer is indeterminate, hedged, off-topic, or takes no position "
+    "on the question's proposition.\n"
+)
+
+_POLARITY_VERDICTS = ("affirmative", "negative", "unclear")
+
+
+def _parse_polarity_json(text: str) -> str:
+    """Strict parse with the same fail-safe posture as `check_v1_source_supports_claim`'s
+    parse-failure path: anything unparseable or unexpected returns `"unclear"` rather than
+    raising, so the gate falls through to the deterministic string floor instead of
+    crashing or silently opening."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.startswith("json"):
+            text = text[4:]
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return "unclear"
+    if not isinstance(data, dict):
+        return "unclear"
+    verdict = data.get("verdict")
+    return verdict if verdict in _POLARITY_VERDICTS else "unclear"
+
+
+async def _judge_answer_polarity(question_text: str, answer: Any, model: Any) -> str:
+    """One cheapest-tier call (the caller supplies the model — `SETTINGS.models.
+    validation_tier`, already `cheapest`, per PLAN.md T33.1). Returns
+    `"affirmative"` / `"negative"` / `"unclear"`. Never raises: a model-invocation
+    failure (network, provider error) degrades to `"unclear"` so the gate falls back to
+    the string floor — a model outage must not silently open a HARD gate."""
+    human = HumanMessage(content=f"Question: {question_text}\n\nAnswer: {str(answer)}")
+    try:
+        response = await model.ainvoke([SystemMessage(content=_POLARITY_SYSTEM_PROMPT), human])
+    except Exception:
+        return "unclear"
+    return _parse_polarity_json(str(response.content))
+
+
+async def _judge_claim_polarity(claims: list[Claim], model: Any) -> dict[str, str]:
+    """One cheapest-tier polarity call per PRESENT G1 identity-gate question whose verdict
+    can still change the gate's outcome, returning `{question_id: verdict}`.
+    `model is None` -> `{}` (skip; the gate then falls back to the string floor). This is
+    the async helper the already-async call sites (`wave_0`, `run_validation`) await so the
+    gate itself stays a pure, synchronously-testable function of `(claims, polarity)`.
+
+    Only judges when the verdict matters, to avoid wasted calls:
+    - G1.Q3 is fatal on status alone when `could_not_verify`/`contradicted`, so the verdict
+      only matters for any other settled status.
+    - G1.Q5 is fatal ONLY when `status == "confirmed"` and the verdict is `"affirmative"`,
+      so any other status needs no call."""
+    if model is None:
+        return {}
+    by_q = {c.question_id: c for c in claims if c.question_id}
+    out: dict[str, str] = {}
+    g1q3 = by_q.get("G1.Q3")
+    if g1q3 is not None and g1q3.status not in ("could_not_verify", "contradicted"):
+        spec = QUESTIONS_BY_ID.get("G1.Q3")
+        if spec is not None:
+            out["G1.Q3"] = await _judge_answer_polarity(spec.text, g1q3.answer, model)
+    g1q5 = by_q.get("G1.Q5")
+    if g1q5 is not None and g1q5.status == "confirmed":
+        spec = QUESTIONS_BY_ID.get("G1.Q5")
+        if spec is not None:
+            out["G1.Q5"] = await _judge_answer_polarity(spec.text, g1q5.answer, model)
+    return out
+
+
+def check_v5_firm_is_fo_hardening(
+    claims: list[Claim], polarity: dict[str, str] | None = None
+) -> list[Finding]:
     """V5b — re-assert G1.Q3 (affirmative FO evidence) and G1.Q5 (RIA-in-costume) are
     still settled post-enrichment. If enrichment introduced evidence that contradicts
     either, V4 will already have flagged it as "contradicted" — this specifically
     catches the case where G1.Q3 was never resolved by layer 1 (could_not_verify) and
     still isn't after enrichment, which V6 completeness should also catch but this makes
-    the reason explicit and attributable to identity, not just "incomplete"."""
+    the reason explicit and attributable to identity, not just "incomplete".
+
+    T33.2: the answer's POLARITY is decided by the model (`_judge_claim_polarity`, run by
+    the async callers and passed in here as `polarity`, a `{question_id: verdict}` map).
+    The gate stays a pure, synchronously-testable function of `(claims, polarity)`. When a
+    verdict is present it is used; when it is missing, `None`, or `"unclear"` the gate
+    falls back to the deterministic string floor (`_is_negative_fo_answer` / leading
+    `"yes"`) — so a model outage or a `None` model can never silently open this HARD gate.
+    Question text is never hardcoded here; the caller reads it from `QUESTIONS_BY_ID`."""
     by_q = {c.question_id: c for c in claims if c.question_id}
     findings: list[Finding] = []
+    polarity = polarity or {}
+
     g1q3 = by_q.get("G1.Q3")
     # G1.Q3 must be BOTH settled (not could_not_verify/contradicted) AND affirmative — a
     # "single_source" claim whose answer is "No, there is no affirmative evidence that the
@@ -286,8 +430,16 @@ def check_v5_firm_is_fo_hardening(claims: list[Claim]) -> list[Finding]:
     # themselves several ways ("Yes, there is affirmative evidence…", "Affirmative evidence
     # shows the firm offers family-office services…") and must all pass — only clear
     # negatives / hedges ("No…", "There is no affirmative evidence…", "Insufficient
-    # evidence…") get killed.
-    g1q3_negative = g1q3 is not None and _is_negative_fo_answer(g1q3.answer)
+    # evidence…") get killed. The model polarity is the primary signal; the string floor is
+    # the fallback so NOBLE FAMILY WEALTH (whose name begins with "No") is no longer
+    # rejected by a two-character prefix check overruling a correct model verdict.
+    q3 = polarity.get("G1.Q3")
+    if q3 == "affirmative":
+        g1q3_negative = False
+    elif q3 == "negative":
+        g1q3_negative = True
+    else:  # "unclear" / missing / None -> deterministic floor
+        g1q3_negative = g1q3 is not None and _is_negative_fo_answer(g1q3.answer)
     if g1q3 is None or g1q3.status in ("could_not_verify", "contradicted") or g1q3_negative:
         findings.append(Finding(
             check_id="V5_firm_is_fo", severity="fatal", field="G1.Q3",
@@ -295,24 +447,34 @@ def check_v5_firm_is_fo_hardening(claims: list[Claim]) -> list[Finding]:
             claim_id=g1q3.claim_id if g1q3 else None,
         ))
     g1q5 = by_q.get("G1.Q5")
-    if g1q5 is not None and g1q5.status == "confirmed" and _normalize_answer(g1q5.answer).startswith("yes"):
-        # G1.Q5's real answers are full sentences, not literal "yes"/"no" tokens — e.g.
-        # "No, the entity is not merely a plain RIA in costume; it presents itself as a
-        # family office." An exact-match check against the literal string "no" (the
-        # original implementation) NEVER matches a real sentence, so every negative
-        # answer was wrongly treated as an affirmative RIA-in-costume confirmation —
-        # a critical false-positive found live 2026-07-29 (see PROJECT_LOG.md): it
-        # silently killed "ACIMA PRIVATE WEALTH, LLC" at wave 0, a lead with G1.Q3
-        # confirmed (genuine FO evidence), G1.Q4 confirmed MFO, and G1.Q5 explicitly
-        # negative — exactly the kind of real survivor this pipeline exists to find.
-        # Every G1 answer observed in practice opens with "Yes," or "No," (matching
-        # every other G1 question's phrasing), so checking the leading token is a much
-        # more reliable signal than exact equality.
-        findings.append(Finding(
-            check_id="V5_firm_is_fo", severity="fatal", field="G1.Q5",
-            detail="entity confirmed as RIA-in-costume, not a genuine family office",
-            claim_id=g1q5.claim_id,
-        ))
+    # G1.Q5 is INVERTED: "yes" (affirmative) means RIA-in-costume, which is disqualifying.
+    # Fatal when status is `confirmed` AND the answer asserts the RIA-in-costume
+    # proposition. The model polarity replaces the old `startswith("yes")` check, which
+    # had the same leading-character brittleness as the G1.Q3 bug; on `"unclear"`/missing we
+    # fall back to that exact `startswith("yes")` check so the floor is unchanged.
+    # G1.Q5's real answers are full sentences, not literal "yes"/"no" tokens — e.g.
+    # "No, the entity is not merely a plain RIA in costume; it presents itself as a
+    # family office." An exact-match check against the literal string "no" (the
+    # original implementation) NEVER matches a real sentence, so every negative
+    # answer was wrongly treated as an affirmative RIA-in-costume confirmation —
+    # a critical false-positive found live 2026-07-29 (see PROJECT_LOG.md): it
+    # silently killed "ACIMA PRIVATE WEALTH, LLC" at wave 0, a lead with G1.Q3
+    # confirmed (genuine FO evidence), G1.Q4 confirmed MFO, and G1.Q5 explicitly
+    # negative — exactly the kind of real survivor this pipeline exists to find.
+    if g1q5 is not None and g1q5.status == "confirmed":
+        q5 = polarity.get("G1.Q5")
+        if q5 == "negative":
+            ria_in_costume = False
+        elif q5 == "affirmative":
+            ria_in_costume = True
+        else:  # "unclear" / missing / None -> deterministic floor (the leading "yes")
+            ria_in_costume = _normalize_answer(g1q5.answer).startswith("yes")
+        if ria_in_costume:
+            findings.append(Finding(
+                check_id="V5_firm_is_fo", severity="fatal", field="G1.Q5",
+                detail="entity confirmed as RIA-in-costume, not a genuine family office",
+                claim_id=g1q5.claim_id,
+            ))
     return findings
 
 
@@ -685,7 +847,13 @@ async def run_validation(
             if f.check_id == "V4_contradiction" and f.claim_id not in seen
         )
         findings.extend(check_v5_staleness(claims, now=now))
-        findings.extend(check_v5_firm_is_fo_hardening(claims))
+        # T33: the model judges G1.Q3 / G1.Q5 answer polarity on the cheapest validation
+        # tier (PLAN.md T33.1); the gate uses the verdict and falls back to the string
+        # floor on "unclear"/missing. Run on the validation tier specifically — not the
+        # enrichment `model` used for V1 below — so the polarity call costs the cheapest
+        # rate regardless of which tier the caller wired for V1.
+        polarity = await _judge_claim_polarity(claims, get_model(SETTINGS.models.validation_tier))
+        findings.extend(check_v5_firm_is_fo_hardening(claims, polarity))
     else:
         findings.extend(validation_input.wave0_findings)
 
