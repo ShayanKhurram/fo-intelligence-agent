@@ -61,7 +61,7 @@ def test_acme_derives_aum_and_principal_from_people_list():
     assert by_field["principal_name"].source_class == "fec_employer"
     assert by_field["principal_title"].answer == "Managing Principal"
 
-    assert "why_now_trigger" not in by_field  # no prior_value_usd on this fixture
+    assert "important_insight" not in by_field  # no prior_value_usd on this fixture
 
     assert "discovery_class_13f_filing" in by_field
     assert "discovery_class_fec_employer" in by_field
@@ -72,7 +72,7 @@ def test_beta_derives_fresh_liquidity_headcount_and_access_window():
     claims = wave_minus_1(BETA_SOURCES)
     by_field = {c.field_name: [c2 for c2 in claims if c2.field_name == c.field_name] for c in claims}
 
-    triggers = {c.answer for c in by_field["why_now_trigger"]}
+    triggers = {c.answer for c in by_field["important_insight"]}
     assert "fresh_liquidity" in triggers  # +100% QoQ
     assert "access_window" in triggers  # future conference sighting
 
@@ -93,14 +93,14 @@ def test_gamma_thin_entity_emits_only_discovery_class_no_fabrication():
 def test_concentration_pain_on_large_qoq_drop():
     sources = [_source("13f_filing", {"quarter": "2026Q2", "value_usd": 50_000_000, "prior_value_usd": 100_000_000})]
     claims = wave_minus_1(sources)
-    trigger = [c for c in claims if c.field_name == "why_now_trigger"][0]
+    trigger = [c for c in claims if c.field_name == "important_insight"][0]
     assert trigger.answer == "concentration_pain"
 
 
 def test_qoq_delta_below_threshold_emits_no_trigger():
     sources = [_source("13f_filing", {"quarter": "2026Q2", "value_usd": 105_000_000, "prior_value_usd": 100_000_000})]
     claims = wave_minus_1(sources)
-    assert "why_now_trigger" not in {c.field_name for c in claims}
+    assert "important_insight" not in {c.field_name for c in claims}
 
 
 def test_public_list_overlap_requires_caller_supplied_list():
@@ -117,7 +117,7 @@ def test_public_list_overlap_requires_caller_supplied_list():
 def test_past_dated_conference_sighting_does_not_trigger_access_window():
     sources = [_source("conference_sighting", {"conference": "Old Forum", "date": "2020-01-01", "role": "speaker"})]
     claims = wave_minus_1(sources)
-    assert "why_now_trigger" not in {c.field_name for c in claims}
+    assert "important_insight" not in {c.field_name for c in claims}
 
 
 # --- wave 0 gates ---
@@ -373,15 +373,20 @@ async def test_wave_2_skips_narrative_call_when_no_documents_gathered(monkeypatc
     assert cost == 0.0
 
 
-async def test_wave_2_authors_outreach_hook_only_when_trigger_exists(monkeypatch, fake_model):
+async def test_wave_2_no_longer_authors_an_outreach_hook(monkeypatch, fake_model):
+    # T34.3 removed the wave-2 outreach_hook authoring pass (a field that never ships
+    # is pure spend). This test pins the removal: even with a settled important_insight
+    # trigger claim in hand, wave_2 must (a) emit no outreach_hook claim and (b) make
+    # no LLM call to author one. The queued AIMessage is deliberately left in place so
+    # that a silent reintroduction of _author_outreach_hook would consume it, produce
+    # the claim, and flip both assertions red — without it the test would pass vacuously.
     _patch_wave2(monkeypatch)
     fake_model.queue(AIMessage(content="Saw your recent $50M capital raise — congrats."))
-    trigger = Claim(field_name="why_now_trigger", answer="fresh_liquidity", status="confirmed",
+    trigger = Claim(field_name="important_insight", answer="fresh_liquidity", status="confirmed",
                      confidence="medium", source_url="http://sec.gov/x", source_class="13f_filing")
     new_claims, cost = await wave_2([trigger], "Acme Capital Partners", fake_model, domain=None)
-    hook = next((c for c in new_claims if c.field_name == "outreach_hook"), None)
-    assert hook is not None
-    assert "capital raise" in hook.answer
+    assert "outreach_hook" not in {c.field_name for c in new_claims}
+    assert fake_model.calls == []  # no LLM call made to author an outreach hook
 
 
 async def test_wave_2_no_outreach_hook_when_no_trigger(monkeypatch, fake_model):

@@ -61,6 +61,15 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE claims ADD COLUMN subject_value TEXT")
     except sqlite3.OperationalError:
         pass
+    # PLAN.md T34.2: rename the why_now_trigger claim field to important_insight
+    # in the live ledger. A display-only rename would leave the ledger saying
+    # why_now_trigger while the row pivots on important_insight, blanking the
+    # column for every lead already enriched (the T19 vocabulary split). This
+    # UPDATE is idempotent — a second init_db() run updates 0 rows. Not a
+    # Postgres column migration (no deployed DB column).
+    conn.execute(
+        "UPDATE claims SET field_name='important_insight' WHERE field_name='why_now_trigger'"
+    )
 
 
 @contextmanager

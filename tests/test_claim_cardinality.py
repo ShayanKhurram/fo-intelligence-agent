@@ -47,7 +47,7 @@ def test_compress_template_forbids_joining_facts_from_different_pages():
 def test_two_single_fact_claims_survive_parsing_and_project_to_one_field():
     """T23.4(b): two G3.Q2 claims with distinct `source_url`s — the shape T23.1 tells the
     model to emit instead of one composite claim — both survive `_parse_claims_json`, and
-    the projection emits EXACTLY ONE `why_now_trigger` field claim, carrying the selected
+    the projection emits EXACTLY ONE `important_insight` field claim, carrying the selected
     claim's `source_url` (not both, not neither)."""
     payload = json.dumps([
         {
@@ -80,7 +80,7 @@ def test_two_single_fact_claims_survive_parsing_and_project_to_one_field():
     projected = _project_question_claims(claims)
     # Exactly ONE projected field claim for the one question, despite two input claims.
     assert len(projected) == 1
-    assert projected[0].field_name == "why_now_trigger"
+    assert projected[0].field_name == "important_insight"
     # It carries ONE of the two source URLs — the selected claim's — not both, not none.
     assert projected[0].source_url in {c.source_url for c in claims}
 

@@ -6,7 +6,7 @@ Two live defects, one gate:
    ``subject_value="Chris Younger"`` and ``G2.Q3`` ``subject_value=None``
    ``answer="CEO"`` on the SAME team page. ``"CEO"`` is short, correct, and on the
    same page as the name — and it did not project, because T30's fallback covered
-   only the prose fields (``why_now_trigger`` / ``recent_investments``) and
+   only the prose fields (``important_insight`` / ``recent_investments``) and
    ``principal_title`` was excluded under "entity fields must never fall back",
    a rule written to stop a SENTENCE landing in ``principal_name``. That blanket
    rule also blocks a clean three-character answer landing in ``principal_title``.

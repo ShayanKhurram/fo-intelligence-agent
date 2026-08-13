@@ -86,7 +86,7 @@ def _route_ship_responses(fake_model, n_v1=10):
 
 def _seed_shippable_entity(conn, entity_id, name, *, verdict="pursue", thin_reason=None):
     upsert_entity(conn, entity_id, name)
-    # value_usd/prior_value_usd -> wave -1 derives a why_now_trigger (fresh_liquidity),
+    # value_usd/prior_value_usd -> wave -1 derives a important_insight (fresh_liquidity),
     # which is the "dated signal" leg of V6 completeness — without it every entity here
     # would reject on completeness regardless of decision-maker/contact, since this repo
     # has no other dated-signal source wired into these tests.

@@ -230,7 +230,7 @@ def test_v6_completeness_clean_when_all_three_present():
     claims = [
         _claim(field_name="principal_name", answer="Jane Doe"),
         _claim(field_name="principal_email", answer="jane@acme.com"),
-        _claim(field_name="why_now_trigger", answer="fresh_liquidity"),
+        _claim(field_name="important_insight", answer="fresh_liquidity"),
     ]
     assert check_v6_completeness(claims) == []
 
@@ -239,7 +239,7 @@ def test_v6_completeness_ignores_removed_failed_validation_claims():
     claims = [
         _claim(field_name="principal_name", answer="Jane Doe"),
         _claim(field_name="principal_email", answer=None, status="removed_failed_validation"),
-        _claim(field_name="why_now_trigger", answer="fresh_liquidity"),
+        _claim(field_name="important_insight", answer="fresh_liquidity"),
     ]
     findings = check_v6_completeness(claims)
     assert any(f.field == "principal_email" for f in findings)
@@ -362,7 +362,7 @@ async def test_run_validation_ships_clean_when_everything_supported(fake_model):
     claims = [
         _claim(field_name="principal_name", answer="Jane Doe", source_url="http://a"),
         _claim(field_name="principal_email", answer="jane@acme.com", source_url="http://b"),
-        _claim(field_name="why_now_trigger", answer="fresh_liquidity", source_url="http://c"),
+        _claim(field_name="important_insight", answer="fresh_liquidity", source_url="http://c"),
         _claim(question_id="G1.Q3", answer="yes, operates as a family office", source_url="http://d"),
     ]
     vi = ValidationInput(entity_id="e1", claim_ledger=claims, waves_completed=["-1", "0", "1"], wave0_findings=[])
@@ -380,7 +380,7 @@ async def test_run_validation_ships_with_caveats_when_release_rule_kills_only_co
     different emails are flagged `contradicted` by V4 and SHIP with their values intact for
     downstream validation, instead of being destroyed. Nothing is written to
     audit_rejected_values because nothing was rejected."""
-    # Only principal_name and why_now_trigger reach V1: both email claims are already
+    # Only principal_name and important_insight reach V1: both email claims are already
     # `contradicted` by V4 (V1 skips non-settled claims), and contacts are V1-exempt anyway.
     for _ in range(2):
         fake_model.queue(AIMessage(content='{"supported": true, "reason": "ok"}'))
@@ -390,7 +390,7 @@ async def test_run_validation_ships_with_caveats_when_release_rule_kills_only_co
               source_class="site_scrape", source_url="http://b"),
         Claim(field_name="principal_email", answer="totally-different@other.com", status="confirmed", confidence="low",
               source_class="hunter", source_url="http://c"),
-        Claim(field_name="why_now_trigger", answer="fresh_liquidity", status="confirmed", confidence="medium", source_url="http://d"),
+        Claim(field_name="important_insight", answer="fresh_liquidity", status="confirmed", confidence="medium", source_url="http://d"),
     ]
     vi = ValidationInput(entity_id="e1", claim_ledger=claims, waves_completed=["-1", "0", "1"], wave0_findings=[])
     dataset_input, audit, cost = await run_validation(vi, fake_model, fetch_fn=_supportive_fetch)
@@ -430,7 +430,7 @@ async def test_run_validation_v1_ring_fence_stops_spending_paid_credits(fake_mod
     claims = [
         _claim(field_name="principal_name", answer="Jane Doe", source_url="http://a"),
         _claim(field_name="principal_email", answer="jane@acme.com", source_url="http://b"),
-        _claim(field_name="why_now_trigger", answer="fresh_liquidity", source_url="http://c"),
+        _claim(field_name="important_insight", answer="fresh_liquidity", source_url="http://c"),
     ]
     vi = ValidationInput(entity_id="e1", claim_ledger=claims, waves_completed=["-1", "0", "1"], wave0_findings=[])
 

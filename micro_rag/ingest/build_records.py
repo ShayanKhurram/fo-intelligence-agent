@@ -70,7 +70,7 @@ def _type_final(claims_by_field: dict[str, dict[str, Any]], claims: list[dict[st
 def _most_recent_signal_date(claims: list[dict[str, Any]]) -> date | None:
     """Latest retrieved_at across every dated-signal claim still standing — the plan's
     `most_recent_signal_date` column. Never fabricated: None if nothing dated survives."""
-    signal_fields = {"why_now_trigger", "recent_investments", "recent_fund_commitments", "recent_key_hires", "recent_news"}
+    signal_fields = {"important_insight", "recent_investments", "recent_fund_commitments", "recent_key_hires", "recent_news"}
     dates: list[date] = []
     for c in claims:
         if c.get("field_name") not in signal_fields:
@@ -88,7 +88,7 @@ def _most_recent_signal_date(claims: list[dict[str, Any]]) -> date | None:
 
 
 def _urgency_tier(claims_by_field: dict[str, dict[str, Any]]) -> str | None:
-    trigger = _settled_value(claims_by_field, "why_now_trigger")
+    trigger = _settled_value(claims_by_field, "important_insight")
     if trigger is None:
         return None
     return {"fresh_liquidity": "high", "concentration_pain": "high", "access_window": "medium"}.get(str(trigger), "low")

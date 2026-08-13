@@ -68,9 +68,9 @@ from app.validation import (
 # (name/full_name, title/occupation/role) — see _principal_from_people below.
 _STRUCTURED_CLASSES = {"13f_filing", "5500_filing", "conference_sighting", "domain_check", "adv_index"}
 
-# |QoQ 13F value change| at or above this triggers a why_now_trigger claim. Chosen as a
-# deliberately conservative threshold — a why_now_trigger is a claim wave 2's
-# outreach_hook may be authored from, so a borderline delta shouldn't fire it.
+# |QoQ 13F value change| at or above this triggers an important_insight claim. Chosen as a
+# deliberately conservative threshold — an important_insight is a claim the row ships, so
+# a borderline delta shouldn't fire it.
 _QOQ_TRIGGER_THRESHOLD_PCT = 25.0
 
 
@@ -173,7 +173,7 @@ QUESTION_FIELD_PROJECTIONS: dict[str, str] = {
     "G2.Q1": "principal_name",
     "G2.Q3": "principal_title",
     "G3.Q1": "recent_investments",
-    "G3.Q2": "why_now_trigger",
+    "G3.Q2": "important_insight",
 }
 
 # PLAN.md T28.1: the statuses a Layer-1 question claim may carry and STILL project
@@ -200,7 +200,7 @@ _PROJECTABLE_STATUSES: frozenset[str] = frozenset({"confirmed", "single_source",
 # (`principal_name`, `principal_title`, `principal_linkedin`) are deliberately NOT
 # in this set: a whole sentence in `principal_name` is exactly the T26/T27/T29
 # defect. A present, non-blank `subject_value` always wins over this fallback.
-_PROSE_PROJECTION_FIELDS: frozenset[str] = frozenset({"why_now_trigger", "recent_investments"})
+_PROSE_PROJECTION_FIELDS: frozenset[str] = frozenset({"important_insight", "recent_investments"})
 
 
 def _is_negative_answer(text: str) -> bool:
@@ -569,7 +569,7 @@ def _project_question_claims(
             answer = sv
         else:
             # PLAN.md T30.1: prose fallback. When subject_value is missing/blank and
-            # the target field is a prose-valued field (why_now_trigger /
+            # the target field is a prose-valued field (important_insight /
             # recent_investments), fall back to the claim's `answer` — the compress
             # model routinely omits subject_value for prose answers because the bare
             # value and the answer are the same kind of thing (G3.Q2 is 0-for-6 on
@@ -610,7 +610,7 @@ def _why_now_from_13f_delta(f13: dict[str, Any]) -> Claim | None:
     else:
         return None
     return _derived_claim(
-        field_name="why_now_trigger", answer=trigger, source=f13,
+        field_name="important_insight", answer=trigger, source=f13,
         extraction_method="derived_13f_qoq", confidence="medium",
     )
 
@@ -626,7 +626,7 @@ def _headcount_claim(f5500: dict[str, Any]) -> Claim | None:
 
 
 def _access_window_claims(conf_rows: list[dict[str, Any]], today: date) -> list[Claim]:
-    """why_now_trigger=access_window — a future-dated conference sighting is a live
+    """important_insight=access_window — a future-dated conference sighting is a live
     door-opener (the entity will physically be somewhere, soon)."""
     claims: list[Claim] = []
     for conf in conf_rows:
@@ -640,7 +640,7 @@ def _access_window_claims(conf_rows: list[dict[str, Any]], today: date) -> list[
         if sighting_date <= today:
             continue
         claims.append(_derived_claim(
-            field_name="why_now_trigger", answer="access_window", source=conf,
+            field_name="important_insight", answer="access_window", source=conf,
             extraction_method="derived_conference", confidence="medium",
         ))
     return claims
@@ -1679,7 +1679,7 @@ async def wave_1(
             new_claims.append(claim)
             settled.add("principal_phone")
 
-    if "recent_news" not in settled and "why_now_trigger" not in settled:
+    if "recent_news" not in settled and "important_insight" not in settled:
         if claim := await _find_dated_signal(canonical_name, aliases):
             new_claims.append(claim)
             settled.add("recent_news")
@@ -1851,33 +1851,6 @@ async def _find_news_signals(
     return claims
 
 
-_OUTREACH_HOOK_SYSTEM = (
-    "Write ONE short outreach-hook sentence for a first-contact email, using ONLY the "
-    "fact given below — do not add any detail not present in it. Respond with ONLY the "
-    "sentence: no quotes, no markdown, no preamble."
-)
-
-
-async def _author_outreach_hook(trigger_claim: Claim, model: Any) -> tuple[Claim | None, float]:
-    """"authored by the model from the highest-confidence trigger; if no trigger exists,
-    leave blank rather than inventing one" (plan §4) — the "leave blank" half is enforced
-    by the caller (wave_2) never calling this without a trigger claim in hand; this
-    function itself never fabricates a trigger, only phrases the one it's given."""
-    response = await model.ainvoke(
-        [SystemMessage(content=_OUTREACH_HOOK_SYSTEM), HumanMessage(content=f"Fact: {trigger_claim.answer}")]
-    )
-    cost = response.response_metadata.get("cost_usd", 0.0)
-    text = str(response.content).strip()
-    if not text:
-        return None, cost
-    return Claim(
-        field_name="outreach_hook", answer=text, status="confirmed",
-        source_url=trigger_claim.source_url, source_class=trigger_claim.source_class,
-        extraction_method="llm_authored", confidence="low",
-        produced_by="enrichment", wave="2",
-    ), cost
-
-
 async def wave_2(
     claims: list[Claim], canonical_name: str, model: Any, domain: str | None = None,
     aliases: list[str] | None = None,
@@ -1907,13 +1880,6 @@ async def wave_2(
     new_claims.extend(
         c for c in await _find_news_signals(canonical_name, aliases) if c.field_name not in settled
     )
-
-    trigger = next((c for c in [*claims, *new_claims] if c.field_name == "why_now_trigger"), None)
-    if trigger and "outreach_hook" not in settled:
-        hook_claim, cost = await _author_outreach_hook(trigger, model)
-        total_cost += cost
-        if hook_claim:
-            new_claims.append(hook_claim)
 
     return new_claims, total_cost
 

@@ -50,7 +50,7 @@ _COLUMN_ORDER: list[str] = [
     "principal_linkedin", "corporate_linkedin",
     "secondary_contact_name", "secondary_contact_email", "secondary_contact_phone",
     # why-now
-    "why_now_trigger", "outreach_hook", "recent_investments", "recent_fund_commitments",
+    "important_insight", "recent_investments", "recent_fund_commitments",
     "recent_key_hires", "recent_news",
     # mandates
     "investing_mandates", "investing_thesis", "sector_focus", "stage_focus",
@@ -61,7 +61,7 @@ _COLUMN_ORDER: list[str] = [
 ]
 
 _HIGH_VALUE_FIELDS: frozenset[str] = frozenset({
-    "principal_name", "principal_email", "principal_phone", "aum_usd", "why_now_trigger",
+    "principal_name", "principal_email", "principal_phone", "aum_usd", "important_insight",
 })
 
 # T26 — provenance tiers for multi-valued fields. An extraction_method PREFIX maps to a
@@ -126,7 +126,7 @@ def _score_claims(claims: list[dict[str, Any]]) -> tuple[float, int]:
 def _urgency_tier_rank(claims: list[dict[str, Any]]) -> int:
     """0 = no dated signal at all, 1 = a low-confidence dated signal only, 2 = a
     medium/high-confidence dated signal. Used purely as a selection tiebreaker."""
-    signal_fields = {"why_now_trigger", "recent_investments", "recent_fund_commitments"}
+    signal_fields = {"important_insight", "recent_investments", "recent_fund_commitments"}
     signals = [
         c for c in claims
         if c.get("field_name") in signal_fields and c["status"] not in ("could_not_verify", "removed_failed_validation")
@@ -382,8 +382,7 @@ _DATA_DICTIONARY: list[dict[str, str]] = [
     {"field": "principal_name", "description": "Named decision-maker (principal, CIO, or similar).", "inclusion_standard": "wave 1 actionability-core field; a record without one is gated before wave 2 spend."},
     {"field": "principal_email", "description": "Contact email for the principal or the firm.", "inclusion_standard": "release rule: an email that fails verification is blanked, status='removed_failed_validation', logged to audit_rejected_values."},
     {"field": "principal_phone", "description": "Contact phone.", "inclusion_standard": "format-valid only unless independently corroborated — see status='format_only' vs 'verified'."},
-    {"field": "why_now_trigger", "description": "The reason this is a live opportunity now (concentration_pain | fresh_liquidity | access_window).", "inclusion_standard": "derived from 13F QoQ deltas or a future-dated conference sighting; never guessed."},
-    {"field": "outreach_hook", "description": "One-sentence first-contact hook, authored only from an existing why_now_trigger claim.", "inclusion_standard": "left blank if no trigger exists — never invented."},
+    {"field": "important_insight", "description": "The reason this is a live opportunity now (concentration_pain | fresh_liquidity | access_window).", "inclusion_standard": "derived from 13F QoQ deltas or a future-dated conference sighting; never guessed."},
     {"field": "type_final", "description": "SFO | MFO | type_unconfirmed, from the G1.Q4 claim's final validated status.", "inclusion_standard": "type_unconfirmed if G1.Q4 was never settled or was contradicted."},
     {"field": "lead_origin_source_class", "description": "Discovery feed class this lead originally came from (13f_filing | fec_employer | 5500_filing | ppp_loans); 'unknown' if the lead carries no discovery_class_* claim.", "inclusion_standard": "derived from the discovery_class_* claims written by wave -1; the same value that drives the select_50 per-class quota."},
 ]

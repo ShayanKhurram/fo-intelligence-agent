@@ -483,7 +483,7 @@ def check_v5_firm_is_fo_hardening(
 # non removed_failed_validation) claim.
 _DECISION_MAKER_FIELDS = ("principal_name", "G2.Q1")
 _CONTACT_CHANNEL_FIELDS = ("principal_email", "principal_phone", "G2.Q2")
-_DATED_SIGNAL_FIELDS = ("recent_investments", "why_now_trigger", "G3.Q1", "G3.Q2")
+_DATED_SIGNAL_FIELDS = ("recent_investments", "important_insight", "G3.Q1", "G3.Q2")
 
 
 def _any_settled(claims: list[Claim], field_names: tuple[str, ...]) -> bool:

@@ -1,6 +1,6 @@
 """PLAN.md T30 — regression corpus for the prose-fallback projection.
 
-The live ledger has produced a blank `why_now_trigger` on every row of every run
+The live ledger has produced a blank `important_insight` on every row of every run
 this session even though four of six leads carry a SETTLED G3.Q2 — the researcher
 found a dated signal and cited it. The cause is that the compress model fills
 `subject_value` reliably for entity answers (a name, a URL, a title) and unreliably
@@ -9,7 +9,7 @@ pre-T30 projection (`_projectable` requires a non-blank `subject_value`) skipped
 every one of them.
 
 T30.1 adds a prose fallback: when `subject_value` is missing/blank AND the target
-field is a prose-valued field (`why_now_trigger` / `recent_investments`), project
+field is a prose-valued field (`important_insight` / `recent_investments`), project
 the claim's `answer` instead. Entity fields (`principal_name`, `principal_title`,
 `principal_linkedin`) NEVER fall back — a whole sentence in `principal_name` is the
 T26/T27/T29 defect. T30.2 guards the fallback against statement-of-absence answers
@@ -58,13 +58,13 @@ def _projected_field(claims: list[Claim], field_name: str) -> Claim | None:
 # --- T30.1: prose fallback -------------------------------------------------
 
 
-def test_g3q2_prose_projects_why_now_trigger_with_source_preserved():
+def test_g3q2_prose_projects_important_insight_with_source_preserved():
     """(a) A settled G3.Q2 with subject_value=None and a dated job-posting answer
-    projects a why_now_trigger claim carrying that prose, with the original
+    projects a important_insight claim carrying that prose, with the original
     source_url/source_class preserved (the citation must survive the projection so
     the row stays auditable back to the page the fact came from)."""
     layer1 = _g3q2_classvi_job_posting(subject_value=None)
-    projected = _projected_field([layer1], "why_now_trigger")
+    projected = _projected_field([layer1], "important_insight")
     assert projected is not None, "settled G3.Q2 with prose answer must project"
     assert (
         projected.answer
@@ -119,7 +119,7 @@ def test_explicit_subject_value_wins_over_prose_fallback():
     """(d) When both subject_value and a prose answer are present, subject_value
     wins — the model deliberately distilled a value and that is respected."""
     layer1 = _g3q2_classvi_job_posting(subject_value="Associate Wealth Advisor role posted")
-    projected = _projected_field([layer1], "why_now_trigger")
+    projected = _projected_field([layer1], "important_insight")
     assert projected is not None
     assert projected.answer == "Associate Wealth Advisor role posted"
     assert projected.source_url == _CLASS_VI_JOB_URL
@@ -141,7 +141,7 @@ def test_negative_answer_does_not_project():
         confidence="high",
         produced_by="research",
     )
-    assert _projected_field([layer1], "why_now_trigger") is None
+    assert _projected_field([layer1], "important_insight") is None
 
 
 def test_norwegian_trap_projects():
@@ -158,7 +158,7 @@ def test_norwegian_trap_projects():
         confidence="high",
         produced_by="research",
     )
-    projected = _projected_field([layer1], "why_now_trigger")
+    projected = _projected_field([layer1], "important_insight")
     assert projected is not None
     assert projected.answer == "Norwegian sovereign fund commitment announced this quarter."
 
@@ -175,7 +175,7 @@ def test_none_leading_projects_nothing():
         confidence="high",
         produced_by="research",
     )
-    assert _projected_field([layer1], "why_now_trigger") is None
+    assert _projected_field([layer1], "important_insight") is None
 
 
 def test_is_negative_answer_unit():
@@ -202,7 +202,7 @@ def test_is_negative_answer_unit():
 def test_could_not_verify_g3q2_projects_nothing():
     """(f) A could_not_verify G3.Q2 still projects nothing — the T28 status gate
     (`status in _PROJECTABLE_STATUSES`) is unchanged by the prose fallback, so a
-    question the researcher could not answer does not emit a prose why_now_trigger
+    question the researcher could not answer does not emit a prose important_insight
     even though the answer text is non-empty and non-negative."""
     layer1 = Claim(
         question_id="G3.Q2",
@@ -214,4 +214,4 @@ def test_could_not_verify_g3q2_projects_nothing():
         confidence="high",
         produced_by="research",
     )
-    assert _projected_field([layer1], "why_now_trigger") is None
+    assert _projected_field([layer1], "important_insight") is None

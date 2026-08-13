@@ -52,8 +52,8 @@ def test_score_claims_ignores_claims_without_field_name():
 
 def test_urgency_tier_rank_levels():
     assert _urgency_tier_rank([]) == 0
-    assert _urgency_tier_rank([_claim("why_now_trigger", confidence="low")]) == 1
-    assert _urgency_tier_rank([_claim("why_now_trigger", confidence="high")]) == 2
+    assert _urgency_tier_rank([_claim("important_insight", confidence="low")]) == 1
+    assert _urgency_tier_rank([_claim("important_insight", confidence="high")]) == 2
 
 
 def test_discovery_class_info_picks_first_alphabetically():
@@ -246,7 +246,7 @@ def test_high_value_columns_exist_even_when_no_record_has_the_field():
          "source_class": "13f_filing", "confidence": "high"},
     ])
     cols, rows = _records_rows([cand])
-    for f in ("principal_email", "principal_phone", "principal_name", "why_now_trigger"):
+    for f in ("principal_email", "principal_phone", "principal_name", "important_insight"):
         assert f in cols, f"{f} must always be a column"
         assert f"{f}_status" in cols
         assert f"{f}_source_class" in cols
