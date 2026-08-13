@@ -235,6 +235,77 @@ def _is_negative_answer(text: str) -> bool:
     return False
 
 
+def _title_matches_firm(text: str, canonical_name: str) -> bool:
+    """PLAN.md T31.1 firm-match clause — does the title text read as the firm's name?
+    Compares ``_core_name_phrase(text)`` against ``_core_name_phrase(canonical_name)``
+    (both from T20): equal, or either containing the other, means the "title" is the
+    company name. Used by ``_is_plausible_title`` (full check) and by
+    ``_reconcile_principal_title`` (supersede-never-delete attribution), so a firm
+    name in the title column is rejected the same way T27 rejects a person's name —
+    with the record left in the ledger as ``superseded``.
+    """
+    title_phrase = _core_name_phrase(text)
+    firm_phrase = _core_name_phrase(canonical_name)
+    if not title_phrase or not firm_phrase:
+        return False
+    return (
+        title_phrase == firm_phrase
+        or title_phrase in firm_phrase
+        or firm_phrase in title_phrase
+    )
+
+
+def _is_malformed_title(text: str | None) -> bool:
+    """PLAN.md T31.2 — the projection-path gates that ``_reconcile_principal_title``
+    cannot sensibly own. A value the MODEL asserted as a title (a present
+    ``subject_value``) is projected and then superseded by reconcile if it is
+    mis-attributed (a name or a firm name) — the ledger records what the model
+    claimed. But a malformed value (empty/blank, longer than 80 characters, or a
+    statement-of-absence) has no audit value as a superseded record, so projection
+    drops it outright. ``_is_negative_answer`` is applied here even on the
+    subject_value path because "No title could be determined" distilled as a
+    subject_value is still not a title.
+    """
+    if not text or not text.strip():
+        return True
+    t = text.strip()
+    if len(t) > 80:
+        return True
+    return _is_negative_answer(t)
+
+
+def _is_plausible_title(
+    text: str | None, principal_name: str | None, canonical_name: str | None
+) -> bool:
+    """PLAN.md T31.1 — is ``text`` a plausible job title?
+
+    Returns False when any of these hold, True otherwise:
+    * empty/blank after stripping;
+    * longer than 80 characters — a real title is short ("Co-Founder, Managing
+      Partner and Chief Investment Officer" is 57; MB's live "Managing Partner at
+      MB Family Advisors, LLC" is 43), and anything longer is prose;
+    * ``_person_names_match(text, principal_name)`` — a title is not the person's
+      name (the existing T27 rule, now applied on the projection fallback path too);
+    * it matches the firm (``_title_matches_firm``);
+    * ``_is_negative_answer(text)`` — "No title could be determined" is not a title.
+
+    The FULL check (including name/firm attribution) gates only the FALLBACK path of
+    projection (a value WE derive from the answer text — we never mint a claim we
+    already know is invalid). The MODEL-ASSERTED path (a present subject_value) gates
+    only on the malformed subset (``_is_malformed_title``) and leaves name/firm
+    attribution to ``_reconcile_principal_title``, which supersedes and keeps the
+    audit record (PLAN.md T31 round 2).
+    """
+    if _is_malformed_title(text):
+        return False
+    t = text.strip()
+    if _person_names_match(t, principal_name):
+        return False
+    if canonical_name and _title_matches_firm(t, canonical_name):
+        return False
+    return True
+
+
 # PLAN.md T29.1: ordered role seniority for the principal pick. Each group is a set
 # of substrings matched case-insensitively against the title; the FIRST group that
 # matches wins (lower index = more senior). An unrecognised or missing title ranks
@@ -280,7 +351,9 @@ def _role_rank(title: str | None) -> int:
     return len(_ROLE_PRIORITY)
 
 
-def _project_question_claims(claims: list[Claim]) -> list[Claim]:
+def _project_question_claims(
+    claims: list[Claim], canonical_name: str | None = None
+) -> list[Claim]:
     """Project Layer-1 question claims into field-name claims the row pivots on
     (PLAN.md T19.3). `claims` is the combined list the caller already holds — both the
     Layer-1 research claims (which carry `question_id` + `subject_value`) and any
@@ -299,6 +372,17 @@ def _project_question_claims(claims: list[Claim]) -> list[Claim]:
     13F/5500/conference structured derivation. Never project a claim whose status is
     could_not_verify / contradicted / superseded (the `status not in
     _PROJECTABLE_STATUSES` guard covers all three and the other excluded statuses)."""
+    # PLAN.md T31.2: the principal name used by the FALLBACK path's full
+    # `_is_plausible_title` check (the name-match clause). The MODEL-ASSERTED path
+    # does NOT use this — it leaves name/firm attribution to
+    # `_reconcile_principal_title`, which supersedes and keeps the audit record.
+    principal_name = next(
+        (c.subject_value.strip() for c in claims
+         if c.question_id == "G2.Q1"
+         and isinstance(c.subject_value, str) and c.subject_value.strip()),
+        None,
+    )
+
     settled_by_structured = {
         c.field_name for c in claims
         if c.produced_by == "derived"
@@ -378,11 +462,28 @@ def _project_question_claims(claims: list[Claim]) -> list[Claim]:
         # title found on the SAME page. A G2.Q3 with no source_url cannot be paired and
         # is intentionally excluded — the whole point of T29.2 is name+title from the
         # same source.
+        # T31.2: a G2.Q3 whose subject_value the model omitted is still pairable
+        # by source_url — its `answer` is the title text on the fallback path. Only
+        # the status gate (projectable status) and a source_url are required here;
+        # the plausibility gate is applied at emission below.
         q3_by_url: dict[str, list[Claim]] = {}
         for c in layer1_by_q.get("G2.Q3", []):
-            if not _projectable(c) or not c.source_url:
+            if c.status not in _PROJECTABLE_STATUSES or not c.source_url:
                 continue
             q3_by_url.setdefault(c.source_url, []).append(c)
+
+        def _q3_title_text(c: Claim | None) -> str | None:
+            # The title text a G2.Q3 contributes: the model-distilled subject_value
+            # when present, else the answer (the T31.2 fallback). Used both for the
+            # seniority ranking and for the emission text.
+            if c is None:
+                return None
+            sv = c.subject_value
+            if isinstance(sv, str) and sv.strip():
+                return sv.strip()
+            ans = c.answer
+            return str(ans).strip() if ans is not None else None
+
         # Rank each projectable G2.Q1 by its paired title's seniority (lower is better),
         # breaking ties with the T23.2 key on the G2.Q1 claim itself.
         ranked: list[tuple[int, tuple[int, int, float, str], Claim, Claim | None]] = []
@@ -390,16 +491,29 @@ def _project_question_claims(claims: list[Claim]) -> list[Claim]:
             paired_q3: Claim | None = None
             if q1.source_url and q1.source_url in q3_by_url:
                 paired_q3 = select_claim_for_question(q3_by_url[q1.source_url])
-            title_sv = (paired_q3.subject_value
-                        if paired_q3 is not None and isinstance(paired_q3.subject_value, str)
-                        else None)
-            ranked.append((_role_rank(title_sv), _t23_key(q1), q1, paired_q3))
+            ranked.append((_role_rank(_q3_title_text(paired_q3)), _t23_key(q1), q1, paired_q3))
         ranked.sort(key=lambda t: (t[0], t[1]))
         _, _, best_q1, best_q3 = ranked[0]
         if "principal_name" not in settled_by_structured:
             out.append(_emit(best_q1, "G2.Q1", "principal_name"))
         if best_q3 is not None and "principal_title" not in settled_by_structured:
-            out.append(_emit(best_q3, "G2.Q3", "principal_title"))
+            title = _q3_title_text(best_q3)
+            if title:
+                has_q3_sv = isinstance(best_q3.subject_value, str) and bool(
+                    best_q3.subject_value.strip()
+                )
+                if has_q3_sv:
+                    # T31.2 MODEL-ASSERTED path: project the subject_value, gating
+                    # only on malformed (empty/long/negative). Reconcile owns
+                    # name/firm attribution and supersedes with the record kept.
+                    if not _is_malformed_title(title):
+                        out.append(_emit(best_q3, "G2.Q3", "principal_title", answer=title))
+                else:
+                    # T31.2 FALLBACK path: we derive the title from `answer` — mint
+                    # it ONLY if fully plausible (name/firm/length/negation), because
+                    # we do not manufacture a claim we already know is invalid.
+                    if _is_plausible_title(title, best_q1.subject_value, canonical_name):
+                        out.append(_emit(best_q3, "G2.Q3", "principal_title", answer=title))
 
     # All other questions (and G2.Q1/G2.Q3 when no projectable G2.Q1 exists, preserving
     # the pre-T29 behaviour for a lone G2.Q3): project the per-question winner the
@@ -412,12 +526,36 @@ def _project_question_claims(claims: list[Claim]) -> list[Claim]:
             continue
         sv = c.subject_value
         has_sv = isinstance(sv, str) and bool(sv.strip())
+        field_name = QUESTION_FIELD_PROJECTIONS.get(qid)
+
+        if field_name == "principal_title":
+            # PLAN.md T31.2 — principal_title has its own gating on BOTH paths.
+            if c.status not in _PROJECTABLE_STATUSES:
+                continue
+            if has_sv:
+                # MODEL-ASSERTED path: project the subject_value, gating only on
+                # malformed (empty/long/negative). `_reconcile_principal_title`
+                # supersedes a name/firm-as-title and keeps the audit record.
+                text = sv.strip()
+                if _is_malformed_title(text):
+                    continue
+            else:
+                # FALLBACK path: we derive the title from `answer` — mint it ONLY if
+                # fully plausible (name/firm/length/negation). We do not manufacture
+                # a claim we already know is invalid.
+                text = str(c.answer).strip() if c.answer is not None else ""
+                if not text or not _is_plausible_title(text, principal_name, canonical_name):
+                    continue
+            if field_name in settled_by_structured:
+                continue
+            out.append(_emit(c, qid, field_name, answer=text))
+            continue
+
         if has_sv:
             # Explicit subject_value path — the model distilled a bare value. This is
             # the only path that ever populates an entity field (principal_*).
             if c.status not in _PROJECTABLE_STATUSES:
                 continue
-            field_name = QUESTION_FIELD_PROJECTIONS.get(qid)
             if field_name is None:
                 # G2.Q2 -> principal_linkedin ONLY when subject_value is a
                 # linkedin.com/in/ URL — a generic profile URL or a company LinkedIn
@@ -433,11 +571,10 @@ def _project_question_claims(claims: list[Claim]) -> list[Claim]:
             # recent_investments), fall back to the claim's `answer` — the compress
             # model routinely omits subject_value for prose answers because the bare
             # value and the answer are the same kind of thing (G3.Q2 is 0-for-6 on
-            # the live ledger). Entity fields (principal_*) NEVER fall back — a whole
-            # sentence in principal_name is the T26/T27/T29 defect. The T30.2
-            # negation guard applies ONLY to this fallback, never to an explicit
-            # subject_value.
-            field_name = QUESTION_FIELD_PROJECTIONS.get(qid)
+            # the live ledger). Entity fields (principal_name`, `principal_linkedin`)
+            # NEVER fall back — a whole sentence in principal_name is the T26/T27/T29
+            # defect. The T30.2 negation guard applies ONLY to this fallback, never
+            # to an explicit subject_value.
             if field_name not in _PROSE_PROJECTION_FIELDS:
                 continue
             if c.status not in _PROJECTABLE_STATUSES:
@@ -578,7 +715,9 @@ def _person_names_match(a: str | None, b: str | None) -> bool:
 
 
 def _reconcile_principal_title(
-    claims: list[Claim], title_owner_by_claim_id: dict[str, str]
+    claims: list[Claim],
+    title_owner_by_claim_id: dict[str, str],
+    canonical_name: str | None = None,
 ) -> list[Claim]:
     """PLAN.md T27.2 — attribute discovery-feed titles to the person they belong to.
 
@@ -614,11 +753,16 @@ def _reconcile_principal_title(
         c for c in claims
         if c.field_name == "principal_name" and isinstance(c.answer, str) and c.answer.strip()
     ]
-    if not name_claims:
-        return claims
-    winner = min(name_claims, key=lambda c: _provenance_rank(c.extraction_method))
-    winning_name = winner.answer
-    if not isinstance(winning_name, str) or not winning_name.strip():
+    winning_name: str | None = None
+    if name_claims:
+        winner = min(name_claims, key=lambda c: _provenance_rank(c.extraction_method))
+        if isinstance(winner.answer, str) and winner.answer.strip():
+            winning_name = winner.answer
+    # T31 round 2: when there is no principal_name to attribute against, we still
+    # run the loop so the firm-match clause can supersede a firm-name-as-title
+    # (e.g. WE FAMILY's "WE Family Offices" with no G2.Q1). Only bail when there
+    # is neither a winning name nor a canonical name to check against.
+    if not winning_name and not canonical_name:
         return claims
 
     out: list[Claim] = []
@@ -627,21 +771,32 @@ def _reconcile_principal_title(
             out.append(c)
             continue
         value = c.answer if isinstance(c.answer, str) else None
-        # 2. Type guard — a title that IS the principal's name is not a title.
-        if value and _person_names_match(value, winning_name):
+        # 2a. Type guard — a title that IS the principal's name is not a title.
+        if winning_name and value and _person_names_match(value, winning_name):
+            out.append(c.model_copy(update={"status": "superseded"}))
+            continue
+        # 2b. T31 firm guard — a title that IS the firm's name is not a title.
+        # Same treatment as the name guard: supersede, never delete, so the ledger
+        # records what the model asserted (PLAN.md T31 round 2).
+        if canonical_name and value and _title_matches_firm(value, canonical_name):
             out.append(c.model_copy(update={"status": "superseded"}))
             continue
         method = c.extraction_method or ""
         if method.startswith("derived_"):
             # 3. Keep a derived title ONLY when its owner matches the winning
             #    principal. Every other derived title is superseded (never deleted).
-            owner = title_owner_by_claim_id.get(c.claim_id)
-            if owner and _person_names_match(owner, winning_name):
-                out.append(c)
+            #    Without a winning principal there is nobody to attribute against,
+            #    so keep derived titles untouched (pre-T31 behaviour).
+            if winning_name:
+                owner = title_owner_by_claim_id.get(c.claim_id)
+                if owner and _person_names_match(owner, winning_name):
+                    out.append(c)
+                else:
+                    out.append(c.model_copy(update={"status": "superseded"}))
             else:
-                out.append(c.model_copy(update={"status": "superseded"}))
+                out.append(c)
         else:
-            # 4. projected_/other titles that survived the type guard are kept.
+            # 4. projected_/other titles that survived the type/firm guards are kept.
             out.append(c)
     return out
 
@@ -749,13 +904,15 @@ def wave_minus_1(
     # AFTER the structured derivations, so a field already settled by a 13F/5500/
     # conference derivation is not overwritten by a lower-confidence projection.
     if layer1_claims:
-        claims.extend(_project_question_claims([*claims, *layer1_claims]))
+        claims.extend(_project_question_claims([*claims, *layer1_claims], canonical_name))
 
     # PLAN.md T27.2: attribute discovery-feed titles to the person they belong to,
     # AFTER the projection so the researched (projected_) principal is known. Runs
     # before the entity_id re-stamping below so the title_owner_by_claim_id mapping
     # (keyed on the uuid4 claim_ids _principal_from_people emitted) still resolves.
-    claims = _reconcile_principal_title(claims, title_owner_by_claim_id)
+    # T31 round 2: ``canonical_name`` threads the firm-match guard so a firm name
+    # in the title column is superseded the same way a person's name is.
+    claims = _reconcile_principal_title(claims, title_owner_by_claim_id, canonical_name)
 
     if entity_id:
         claims = [
