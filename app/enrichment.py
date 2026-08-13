@@ -188,6 +188,52 @@ QUESTION_FIELD_PROJECTIONS: dict[str, str] = {
 # `removed_failed_validation`, `pattern_inferred`, `format_only`.
 _PROJECTABLE_STATUSES: frozenset[str] = frozenset({"confirmed", "single_source", "verified"})
 
+# PLAN.md T30.1: the projected fields whose value is legitimately a sentence rather
+# than a discrete entity, so a Layer-1 claim's `answer` is an acceptable substitute
+# when the compress model omitted `subject_value`. The compress model fills
+# `subject_value` reliably for entity answers (G2.Q1 a name, G2.Q2 a URL, G2.Q3 a
+# title) and unreliably or never for prose answers (G3.Q1/G3.Q2 are 0-for-6 on the
+# live ledger) — for a prose field the `subject_value` and the `answer` are the same
+# kind of thing, so the model sees no reason to emit both. Entity-valued fields
+# (`principal_name`, `principal_title`, `principal_linkedin`) are deliberately NOT
+# in this set: a whole sentence in `principal_name` is exactly the T26/T27/T29
+# defect. A present, non-blank `subject_value` always wins over this fallback.
+_PROSE_PROJECTION_FIELDS: frozenset[str] = frozenset({"why_now_trigger", "recent_investments"})
+
+
+def _is_negative_answer(text: str) -> bool:
+    """PLAN.md T30.2 — a settled claim can still carry a statement-of-absence answer
+    ("No recent exits, hires, or commitments were found for ..."), and projecting
+    that would put a *reason not to call* into a field meant to hold a reason to call.
+    This guards the T30.1 prose fallback (ONLY the fallback — an explicit
+    `subject_value` the model deliberately distilled is always respected).
+
+    LEADING-TOKEN match, never a substring match: `"No"` must not match inside
+    `"Norwegian sovereign fund commitment announced"`. `app/validation.py` draws
+    this same distinction in `_is_negative_fo_answer`; reimplemented locally because
+    validation is not a dependency of the projection path."""
+    cleaned = _re.sub(r"[^\w\s]+", " ", text, flags=_re.UNICODE).strip().lower()
+    if not cleaned:
+        return False
+    tokens = cleaned.split()
+    # Single leading tokens that signal a statement of absence / inability.
+    negative_tokens = {"no", "none", "not", "never", "unable", "insufficient"}
+    if tokens[0] in negative_tokens:
+        return True
+    # Multi-word leading phrases — compare the first N tokens so the phrase is
+    # matched as a unit ("there is no", "there are no", "no recent") rather than as
+    # a single token, and so "no recent" is caught even though "recent" alone is
+    # not a negation.
+    negative_phrases = (
+        ("there", "is", "no"),
+        ("there", "are", "no"),
+        ("no", "recent"),
+    )
+    for phrase in negative_phrases:
+        if tuple(tokens[: len(phrase)]) == phrase:
+            return True
+    return False
+
 
 # PLAN.md T29.1: ordered role seniority for the principal pick. Each group is a set
 # of substrings matched case-insensitively against the title; the FIRST group that
@@ -291,15 +337,20 @@ def _project_question_claims(claims: list[Claim]) -> list[Claim]:
             ra = (1, 0.0)
         return (rank, ra[0], ra[1], c.claim_id)
 
-    def _emit(c: Claim, qid: str, field_name: str) -> Claim:
+    def _emit(c: Claim, qid: str, field_name: str, answer: str | None = None) -> Claim:
         # Preserve the original claim's timestamp alongside its url/source_class — the
         # date is part of the provenance the projection must carry (PLAN.md T19.3), and
         # `check_v5_staleness` skips any claim whose retrieved_at is None, so dropping it
         # would silently make a two-year-old researched principal look freshly found.
         # `_parse_dt` accepts an ISO string and returns None for None, so a Layer-1 claim
         # with no timestamp keeps behaving exactly as it did before this fix.
+        # T30.1: `answer` defaults to `c.subject_value`; the prose-fallback path passes
+        # the claim's `answer` instead (when the compress model omitted subject_value
+        # for a prose field). The source provenance is preserved either way.
+        if answer is None:
+            answer = c.subject_value
         return _derived_claim(
-            field_name=field_name, answer=c.subject_value,
+            field_name=field_name, answer=answer,
             source={
                 "url": c.source_url,
                 "retrieved_at": c.retrieved_at.isoformat() if c.retrieved_at else None,
@@ -359,21 +410,45 @@ def _project_question_claims(claims: list[Claim]) -> list[Claim]:
         c = select_claim_for_question(group)
         if c is None:
             continue
-        if not _projectable(c):
-            continue
-        field_name = QUESTION_FIELD_PROJECTIONS.get(qid)
-        if field_name is None:
-            # G2.Q2 -> principal_linkedin ONLY when subject_value is a linkedin.com/in/
-            # URL — a generic profile URL or a company LinkedIn page is not a person's
-            # LinkedIn field (PLAN.md T19.3).
-            sv = c.subject_value
-            if qid == "G2.Q2" and "linkedin.com/in/" in sv.lower():
-                field_name = "principal_linkedin"
-            else:
+        sv = c.subject_value
+        has_sv = isinstance(sv, str) and bool(sv.strip())
+        if has_sv:
+            # Explicit subject_value path — the model distilled a bare value. This is
+            # the only path that ever populates an entity field (principal_*).
+            if c.status not in _PROJECTABLE_STATUSES:
                 continue
+            field_name = QUESTION_FIELD_PROJECTIONS.get(qid)
+            if field_name is None:
+                # G2.Q2 -> principal_linkedin ONLY when subject_value is a
+                # linkedin.com/in/ URL — a generic profile URL or a company LinkedIn
+                # page is not a person's LinkedIn field (PLAN.md T19.3).
+                if qid == "G2.Q2" and "linkedin.com/in/" in sv.lower():
+                    field_name = "principal_linkedin"
+                else:
+                    continue
+            answer = sv
+        else:
+            # PLAN.md T30.1: prose fallback. When subject_value is missing/blank and
+            # the target field is a prose-valued field (why_now_trigger /
+            # recent_investments), fall back to the claim's `answer` — the compress
+            # model routinely omits subject_value for prose answers because the bare
+            # value and the answer are the same kind of thing (G3.Q2 is 0-for-6 on
+            # the live ledger). Entity fields (principal_*) NEVER fall back — a whole
+            # sentence in principal_name is the T26/T27/T29 defect. The T30.2
+            # negation guard applies ONLY to this fallback, never to an explicit
+            # subject_value.
+            field_name = QUESTION_FIELD_PROJECTIONS.get(qid)
+            if field_name not in _PROSE_PROJECTION_FIELDS:
+                continue
+            if c.status not in _PROJECTABLE_STATUSES:
+                continue
+            prose = str(c.answer).strip() if c.answer is not None else ""
+            if not prose or _is_negative_answer(prose):
+                continue
+            answer = prose
         if field_name in settled_by_structured:
             continue
-        out.append(_emit(c, qid, field_name))
+        out.append(_emit(c, qid, field_name, answer=answer))
     return out
 
 
