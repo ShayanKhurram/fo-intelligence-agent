@@ -16,7 +16,7 @@ from app.config import SETTINGS
 from app.llm import get_model
 from app.questions import HARD_GATE_QUESTION_IDS, QUESTIONS_BY_LANE
 from app.researcher import run_researcher_lane
-from app.state import LANES, Claim, SupervisorState, trace_event
+from app.state import LANES, Claim, SupervisorState, claims_by_question, trace_event
 
 
 @tool
@@ -53,17 +53,8 @@ def think_tool(reflection: str) -> str:
 SUPERVISOR_TOOLS = [think_tool, conduct_research, research_complete]
 
 
-def _claims_by_question(claims: list[dict[str, Any]]) -> dict[str, Claim]:
-    by_q: dict[str, Claim] = {}
-    for c in claims:
-        claim = Claim(**c)
-        # last write wins — a refinement dispatch's claim supersedes the earlier one
-        by_q[claim.question_id] = claim
-    return by_q
-
-
 def _unanswered_hard_questions(claims: list[dict[str, Any]]) -> list[str]:
-    by_q = _claims_by_question(claims)
+    by_q = claims_by_question(claims)
     unanswered = []
     for qid in HARD_GATE_QUESTION_IDS:
         claim = by_q.get(qid)
@@ -84,7 +75,7 @@ def _budget_exhausted(state: SupervisorState) -> bool:
 
 
 def _lane_status_summary(state: SupervisorState) -> str:
-    by_q = _claims_by_question(state["claims"])
+    by_q = claims_by_question(state["claims"])
     lines = []
     for lane in LANES:
         qids = [q.question_id for q in QUESTIONS_BY_LANE.get(lane, [])]

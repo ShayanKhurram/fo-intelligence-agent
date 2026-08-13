@@ -16,15 +16,7 @@ from app.config import SETTINGS
 from app.db import upsert_claims, write_decision, write_lead_trace, write_rejection
 from app.llm import get_model
 from app.questions import HARD_GATE_QUESTION_IDS, QUESTIONS_BY_ID
-from app.state import Claim, SupervisorState, trace_event
-
-
-def _claims_by_question(claims: list[dict[str, Any]]) -> dict[str, Claim]:
-    by_q: dict[str, Claim] = {}
-    for c in claims:
-        claim = Claim(**c)
-        by_q[claim.question_id] = claim
-    return by_q
+from app.state import Claim, SupervisorState, claims_by_question, trace_event
 
 
 def evaluate_hard_gates(claims: list[dict[str, Any]]) -> dict[str, Any]:
@@ -33,7 +25,7 @@ def evaluate_hard_gates(claims: list[dict[str, Any]]) -> dict[str, Any]:
     `force_low` covers on_unknown="deprioritize" — the lead survives but is capped at
     pursue_low regardless of what the SOFT-gate LLM pass would otherwise conclude, since
     that policy exists specifically to keep judgment out of an unresolved HARD question."""
-    by_q = _claims_by_question(claims)
+    by_q = claims_by_question(claims)
     reject_reasons: list[str] = []
     labels: list[str] = []
     force_low = False
@@ -70,7 +62,7 @@ def evaluate_hard_gates(claims: list[dict[str, Any]]) -> dict[str, Any]:
 
 def compute_dead_ends(claims: list[dict[str, Any]]) -> list[str]:
     """Questions research attempted but never resolved — layer 2 shouldn't re-walk these."""
-    by_q = _claims_by_question(claims)
+    by_q = claims_by_question(claims)
     return [
         f"{qid}: {claim.answer}"
         for qid, claim in sorted(by_q.items())
@@ -86,7 +78,7 @@ def compute_thin_reason(claims: list[dict[str, Any]]) -> str:
     reject it regardless, so spending wave-2 budget on it is pure waste. "fixable" —
     everything else: a missing AUM/thesis/signal that wave -1/1 enrichment can plausibly
     fill without needing to invent a decision-maker out of nothing."""
-    by_q = _claims_by_question(claims)
+    by_q = claims_by_question(claims)
 
     def _unresolved(qid: str) -> bool:
         c = by_q.get(qid)

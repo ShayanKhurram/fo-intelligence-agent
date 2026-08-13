@@ -40,7 +40,7 @@ from app.db import (
 )
 from app.config import SETTINGS
 from app.parser import compute_injected_facts
-from app.state import Claim, Finding, ValidationInput, utcnow
+from app.state import Claim, Finding, ValidationInput, select_claim_for_question, utcnow
 from app.validation import run_validation
 from app.tools.adv import distinctive_name_tokens
 from app.tools.edgar import edgar_full_text_search_raw
@@ -195,8 +195,24 @@ def _project_question_claims(claims: list[Claim]) -> list[Claim]:
         and c.status not in ("could_not_verify", "removed_failed_validation", "superseded")
         and (c.extraction_method or "").startswith(("derived_13f", "derived_5500", "derived_conference"))
     }
-    out: list[Claim] = []
+    # PLAN.md T23.3: a lane may now emit several claims for one question (one per
+    # supporting page). Project ONLY the winner `select_claim_for_question` picks —
+    # the same rule the HARD gates use — so the row and the gate can never disagree
+    # about which claim won, and we never project N claims onto one field_name.
+    layer1_by_q: dict[str, list[Claim]] = {}
     for c in claims:
+        qid = c.question_id
+        if not qid:
+            continue
+        layer1_by_q.setdefault(qid, []).append(c)
+    winners = [
+        select_claim_for_question(group)
+        for group in layer1_by_q.values()
+    ]
+    out: list[Claim] = []
+    for c in winners:
+        if c is None:
+            continue
         qid = c.question_id
         if not qid or c.status != "confirmed":
             continue

@@ -79,6 +79,74 @@ class Claim(BaseModel):
     verified_at: datetime | None = None
 
 
+# Selection rank for `select_claim_for_question` (PLAN.md T23.2). `contradicted` is handled
+# out-of-band (any contradicted claim wins outright), so its entry here is only a
+# fallback for the tie-break among several contradicted claims — kept lowest so that
+# if the special-case ever drops, it still sorts first.
+_CLAIM_STATUS_RANK: dict[str, int] = {
+    "verified": 0,
+    "confirmed": 1,
+    "single_source": 2,
+    "pattern_inferred": 3,
+    "format_only": 4,
+    "could_not_verify": 5,
+    "superseded": 6,
+    "removed_failed_validation": 7,
+    "contradicted": -1,
+}
+
+
+def select_claim_for_question(claims: list[Claim]) -> Claim | None:
+    """Deterministic winner among several claims for the same question_id (PLAN.md T23.2).
+
+    A lane may now legitimately emit several claims for one question (one per supporting
+    page — see `_COMPRESS_SYSTEM_TEMPLATE`), so the gates and the projection need a single
+    canonical claim per question, picked by a rule that NEVER depends on input list order.
+
+    Precedence, in order:
+    1. any `contradicted` claim wins — a gate must not pass on the strength of one
+       confirming claim while another says contradicted (fail-safe; this project treats a
+       false positive as worse than no lead);
+    2. otherwise the strongest status: `verified` > `confirmed` > `single_source` >
+       `pattern_inferred` > `format_only` > `could_not_verify` > `superseded` >
+       `removed_failed_validation`;
+    3. tie-break on the most recent `retrieved_at` (a `None` timestamp sorts oldest);
+    4. final tie-break on `claim_id` string order, so the result is total.
+    """
+    if not claims:
+        return None
+
+    def _key(c: Claim) -> tuple[int, int, float, str]:
+        # contradicted wins outright: rank -1 sorts before every positive rank.
+        rank = -1 if c.status == "contradicted" else _CLAIM_STATUS_RANK.get(c.status, 99)
+        # Most recent retrieved_at first: a real timestamp negates to a negative number
+        # that sorts earlier; None sorts oldest (last) via the leading 1.
+        if c.retrieved_at is not None:
+            ra: tuple[int, float] = (0, -c.retrieved_at.timestamp())
+        else:
+            ra = (1, 0.0)
+        return (rank, ra[0], ra[1], c.claim_id)
+
+    return min(claims, key=_key)
+
+
+def claims_by_question(claims: list[dict[str, Any]]) -> dict[str, Claim]:
+    """Group claims by question_id and keep ONE deterministic winner per question
+    (PLAN.md T23.2) via `select_claim_for_question`. Replaces the old silent
+    last-write-wins assignment, which made gate outcomes depend on list ordering — a
+    live bug now that the compress step may emit several claims per question.
+
+    Accepts the dict form claims are carried in as graph state (Claim.model_dump()).
+    The single shared implementation lives here so the gates (`verdict.py`) and the
+    supervisor (`supervisor.py`) can never drift on the grouping/selection rule.
+    """
+    grouped: dict[str, list[Claim]] = {}
+    for c in claims:
+        claim = Claim(**c)
+        grouped.setdefault(claim.question_id, []).append(claim)
+    return {qid: select_claim_for_question(group) for qid, group in grouped.items()}
+
+
 class QuestionSpec(BaseModel):
     question_id: str
     text: str

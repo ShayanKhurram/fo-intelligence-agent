@@ -317,8 +317,16 @@ def _route_after_researcher(state: ResearcherState) -> str:
 
 
 _COMPRESS_SYSTEM_TEMPLATE = (
-    "You compress a researcher's raw notes into structured claims. For each question "
-    "below that the notes touch on, emit exactly one claim. Rules:\n"
+    "You compress a researcher's raw notes into structured claims. ONE CLAIM = ONE FACT "
+    "= THE PAGE THAT SUPPORTS IT. For each question below that the notes touch on, emit "
+    "one claim PER distinct supporting fact — never one combined claim. Rules:\n"
+    "- A claim's `answer` and `subject_value` must contain ONLY what its single cited "
+    "`source_url` actually states. Never join facts from different pages with \"and\" "
+    "(or any other tie word) under one claim — if the lane found several distinct "
+    "supporting facts on different pages, emit SEVERAL claims for that question, each "
+    "with its OWN `source_url`, rather than one combined claim. A claim cited to a page "
+    "that does not state every fact in its answer can never be verified and will be "
+    "fatally rejected, so do not bundle.\n"
     "- Every claim needs a source_url, UNLESS status is 'could_not_verify'.\n"
     "- Never invent a question_id not in the list below.\n"
     "- Never answer with a bare \"Yes\"/\"No\". Every answer must restate its subject so it "

@@ -550,7 +550,7 @@ def _latest_by_field(claims: list[Claim]) -> dict[str, Claim]:
     for c in claims:
         key = c.field_name or c.question_id
         if key is not None:
-            latest[key] = c  # last write wins, same convention as app.verdict._claims_by_question
+            latest[key] = c  # last write wins; app.verdict/supervisor now use app.state.claims_by_question
     return latest
 
 
