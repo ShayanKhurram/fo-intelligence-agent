@@ -745,16 +745,84 @@ async def _find_role_currency(canonical_name: str, principal_name: str) -> Claim
     return None
 
 
-async def _find_email_on_site(domain: str) -> Claim | None:
-    """Tier 1 — free fetch of common contact/team pages, first @domain email found."""
+# Generic firm inboxes are not a person's address. A contact page that offers only
+# `info@` / `contact@` / `admin@` is a channel for the firm, not the decision-maker, so
+# attributing it to `principal_email` asserts a named principal's address on a row that
+# may not even name a principal (the Class VI `info@classvipartners.com` row). These are
+# relabelled to `firm_email` — same contact, honestly labelled. The local part is matched
+# case-insensitively, before any `+suffix` (so `Info+sales@firm.com` is still a role address).
+_ROLE_LOCAL_PARTS = frozenset({
+    "info", "contact", "contacts", "hello", "admin", "office", "team", "support",
+    "help", "enquiries", "inquiries", "press", "media", "careers", "jobs", "sales",
+    "noreply", "no-reply", "donotreply", "webmaster", "mail", "general",
+})
+
+
+def _is_role_address(email: str) -> bool:
+    """True when the local part of `email` is a generic firm-inbox role word.
+    Case-insensitive; any `+suffix` is stripped before the comparison."""
+    if not email or "@" not in email:
+        return False
+    local = email.split("@", 1)[0].split("+", 1)[0].lower()
+    return local in _ROLE_LOCAL_PARTS
+
+
+def _email_matches_domain(email: str, domain: str) -> bool:
+    """True when `email`'s host is the queried `domain` or a subdomain of it.
+
+    Snov.io's name-targeted and domain-wide endpoints are NOT domain-scoped: a single
+    lookup can return addresses at other companies (observed live 2026-08-13 — a
+    `Matt Blackburn @ classvipartners.com` query returned `Matt@capitalvalue.net`
+    alongside the correct `Matt@classvipartners.com`). Accepting such an address would
+    present a different person at a different company as this principal's contact,
+    which is the exact failure this project exists to prevent. `_find_email_on_site`
+    already performs this check inline; only the Snov paths omitted it.
+
+    Both sides are casefolded and a leading `www.` is stripped, so
+    `matt@mail.classvipartners.com` matches `classvipartners.com` (subdomain) and
+    `Matt@capitalvalue.net` does not match `classvipartners.com` (different host).
+    An off-domain address is not evidence about this firm at any confidence, so the
+    caller drops it entirely rather than emitting, downgrading, or relabelling it."""
+    if not email or "@" not in email or not domain:
+        return False
+    host = email.rsplit("@", 1)[-1].strip().lower()
+    dom = domain.strip().lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if dom.startswith("www."):
+        dom = dom[4:]
+    return host == dom or host.endswith("." + dom)
+
+
+def _email_field_name(email: str, principal_name: str | None) -> str:
+    """Decide which column an discovered address belongs to.
+
+    * A role address (`info@`, `contact@`, ...) is always `firm_email` — it is the firm's
+      inbox, not a named principal's, regardless of whether a principal is known.
+    * A personal-looking address is `principal_email` only when a principal is actually
+      named on the row; with no principal, even a personal-looking address can't be
+      attributed to a decision-maker and is recorded as `firm_email` instead.
+    """
+    if _is_role_address(email):
+        return "firm_email"
+    return "principal_email" if principal_name else "firm_email"
+
+
+async def _find_email_on_site(domain: str, principal_name: str | None = None) -> Claim | None:
+    """Tier 1 — free fetch of common contact/team pages, first @domain email found.
+
+    A generic firm inbox (`info@`, `contact@`, ...) is emitted as `firm_email`, not
+    `principal_email`, and when no principal is named on the row any address found is
+    `firm_email` — a contact channel with nobody attached is not a personal address."""
     for path in _COMMON_SITE_PATHS:
         url = f"https://{domain}{path}"
         fetched = await fetch_page_free_first(url)
         content = fetched.get("content") or ""
         match = _EMAIL_RE.search(content)
         if match and domain.lower() in match.group(0).lower():
+            email = match.group(0)
             return Claim(
-                field_name="principal_email", answer=match.group(0), status="confirmed",
+                field_name=_email_field_name(email, principal_name), answer=email, status="confirmed",
                 source_url=url, source_class="site_scrape",
                 extraction_method=fetched.get("extraction_method", "site_scrape"),
                 confidence="medium", produced_by="enrichment", wave="1",
@@ -788,6 +856,11 @@ async def _find_email_via_snov(domain: str, principal_name: str | None) -> Claim
 
     `confidence` is carried from Snov.io's own 0-100 score where present; anything under 70
     stays "low" so a weak pattern-guess can't be presented as a solid contact.
+    `emails-by-domain-by-name` does not actually return a numeric `confidence` — it returns
+    `smtp_status`, and `smtp_status == "valid"` is the strongest deliverability signal the
+    endpoint offers (verified live 2026-08-12: `marc@msdcapital.com`, SMTP-valid and
+    name-matched, was being graded `"low"`). Treat `smtp_status == "valid"` as strong
+    (`"medium"`) in addition to the existing numeric rule.
     """
     first, last = _split_name(principal_name)
 
@@ -797,10 +870,21 @@ async def _find_email_via_snov(domain: str, principal_name: str | None) -> Claim
             email = row.get("email")
             if not email:
                 continue
+            # T22.2: a Snov row at a different company is not evidence about this firm
+            # at any confidence — drop it and keep scanning for an on-domain row rather
+            # than emitting/downgrading/relabeling it. (Live 2026-08-13: a Matt Blackburn
+            # @ classvipartners.com query returned Matt@capitalvalue.net first, then the
+            # correct Matt@classvipartners.com — both rows are preserved by
+            # _flatten_envelopes, so skipping the off-domain one unearths the valid hit.)
+            # Runs before _email_field_name so an off-domain role address can't slip in as
+            # firm_email.
+            if not _email_matches_domain(email, domain):
+                continue
             score = row.get("confidence")
-            strong = isinstance(score, (int, float)) and score >= 70
+            smtp_valid = str(row.get("smtp_status") or "").lower() == "valid"
+            strong = (isinstance(score, (int, float)) and score >= 70) or smtp_valid
             return Claim(
-                field_name="principal_email", answer=email, status="confirmed",
+                field_name=_email_field_name(email, principal_name), answer=email, status="confirmed",
                 source_url=f"https://{domain}", source_class="snov",
                 extraction_method="snov_emails_by_name_domain",
                 confidence="medium" if strong else "low",
@@ -810,22 +894,28 @@ async def _find_email_via_snov(domain: str, principal_name: str | None) -> Claim
     domain_wide = await snov_domain_search_raw(domain)
     rows = domain_wide.get("results") or []
     # A domain-wide hit is preferred only if it matches the known surname; otherwise take
-    # the first address but score it "low" — same policy the Hunter version used.
+    # the first address but score it "low" — same policy the Hunter version used. A generic
+    # firm inbox (`info@`, `contact@`, ...) is `firm_email` regardless of surname match, and
+    # with no principal named any address found is `firm_email` — it is the firm's channel,
+    # not an attributable personal address.
+    # T22.2: the domain guard runs first (before the surname check and before
+    # _email_field_name) on every row — an off-domain row is skipped entirely, never
+    # emitted as principal_email or firm_email.
     if last:
         for row in rows:
             email = row.get("email") or row.get("value")
-            if email and last.lower() in str(email).lower():
+            if email and last.lower() in str(email).lower() and _email_matches_domain(email, domain):
                 return Claim(
-                    field_name="principal_email", answer=email, status="confirmed",
+                    field_name=_email_field_name(email, principal_name), answer=email, status="confirmed",
                     source_url=f"https://{domain}", source_class="snov",
                     extraction_method="snov_domain_search", confidence="medium",
                     produced_by="enrichment", wave="1",
                 )
     for row in rows:
         email = row.get("email") or row.get("value")
-        if email:
+        if email and _email_matches_domain(email, domain):
             return Claim(
-                field_name="principal_email", answer=email, status="confirmed",
+                field_name=_email_field_name(email, principal_name), answer=email, status="confirmed",
                 source_url=f"https://{domain}", source_class="snov",
                 extraction_method="snov_domain_search", confidence="low",
                 produced_by="enrichment", wave="1",
@@ -978,13 +1068,22 @@ async def wave_1(
             new_claims.append(claim)
             settled.add("principal_title")
 
-    if "principal_email" not in settled and domain:
-        claim = await _find_email_on_site(domain)
-        if claim is None:
+    if domain and "principal_email" not in settled:
+        # T21.5: with a principal named, the Snov name-targeted lookup is attributable to
+        # the decision-maker and the site scrape is not — run Snov first so a site-scraped
+        # `info@` can't short-circuit the good tier. With no principal named, any address
+        # found (site or Snov domain-wide) is `firm_email`, never `principal_email`.
+        if principal_name:
             claim = await _find_email_via_snov(domain, principal_name)
+            if claim is None:
+                claim = await _find_email_on_site(domain, principal_name)
+        else:
+            claim = await _find_email_on_site(domain, principal_name)
+            if claim is None:
+                claim = await _find_email_via_snov(domain, principal_name)
         if claim:
             new_claims.append(claim)
-            settled.add("principal_email")
+            settled.add(claim.field_name)
 
     if "principal_phone" not in settled and domain:
         if claim := await _find_phone_via_site(domain):
@@ -997,7 +1096,12 @@ async def wave_1(
             settled.add("recent_news")
 
     have_decision_maker = "principal_name" in settled
-    have_channel = "principal_email" in settled or "principal_phone" in settled
+    # T21.5: a firm inbox plus a phone is still a usable outreach channel — gating wave 2
+    # off unless a *personal* email is present would re-break T19's cascade (verified live:
+    # that gate is what kept 13 depth fields blank).
+    have_channel = (
+        "principal_email" in settled or "principal_phone" in settled or "firm_email" in settled
+    )
     gated = not (have_decision_maker and have_channel)
     return new_claims, gated
 

@@ -216,7 +216,15 @@ async def _run_task(start_path: str, result_path: str, body: dict[str, Any]) -> 
     """Drive one start->poll->result cycle. Returns `{"results": [...]}` on success or
     `{"results": [], "error": ...}`. A task that never reports completion inside
     `_POLL_MAX_WAIT_S` is an error, not an empty result — reporting a timeout as "no data"
-    is what made the previous scraper's failures invisible."""
+    is what made the previous scraper's failures invisible.
+
+    Some endpoints embed a ready-made result URL in the start response under
+    `links.result` — verified live 2026-08-12 for `/v2/domain-search/domain-emails/start`,
+    whose result endpoint is **path-based** (`/v2/domain-search/domain-emails/result/{task_hash}`)
+    rather than the query-param form every other endpoint uses. Polling the query form for
+    that endpoint 404s forever, so when `links.result` is present we poll it directly
+    (with no `task_hash` query param) and fall back to `result_path?task_hash=...` only
+    when the link is absent or malformed."""
     started = await _request("POST", start_path, json_body=body)
     if started.get("error"):
         return _err(started["error"])
@@ -224,9 +232,30 @@ async def _run_task(start_path: str, result_path: str, body: dict[str, Any]) -> 
     if not task_hash:
         return _err(f"Snov.io {start_path} returned no task_hash: {str(started)[:200]}")
 
+    # Resolve the poll endpoint. `links.result` is a full URL; strip the API base to turn
+    # it into a path the rest of this client can hand to `_request`. Read defensively —
+    # `links` is missing on most endpoints and may not be a dict.
+    result_link_path: str | None = None
+    links = started.get("links")
+    if isinstance(links, dict):
+        link = links.get("result")
+        if isinstance(link, str) and link:
+            base = SETTINGS.tools.snov_base_url
+            if link.startswith(base):
+                result_link_path = link[len(base):]
+            elif link.startswith("http"):
+                # An absolute URL on a different host — strip the scheme/host so it is
+                # polled through the configured base, preserving auth/headers.
+                from urllib.parse import urlsplit
+
+                parts = urlsplit(link)
+                result_link_path = parts.path
+    poll_path = result_link_path or result_path
+    poll_params = None if result_link_path else {"task_hash": task_hash}
+
     deadline = time.monotonic() + _POLL_MAX_WAIT_S
     while True:
-        result = await _request("GET", result_path, params={"task_hash": task_hash})
+        result = await _request("GET", poll_path, params=poll_params)
         if result.get("error"):
             return _err(result["error"])
         status = str(result.get("status") or "").lower()
@@ -299,12 +328,18 @@ async def snov_domain_search_raw(domain: str) -> dict[str, Any]:
     )
 
 
-async def snov_company_domain_by_name_raw(names: list[str]) -> dict[str, Any]:
+async def snov_company_domain_by_name_raw(names: list[str] | str) -> dict[str, Any]:
     """Resolve company name(s) -> domain. Needed because Snov.io's company data is keyed on
     domain while the researcher only knows the entity's name (and `linkedin_company_profile`
-    was previously handed a LinkedIn slug)."""
+    was previously handed a LinkedIn slug). Accepts a single name or a list of names — the
+    API's `names` field must be an array, so a bare string is coerced into a one-element
+    list."""
     if _credentials_missing():
         return _err("SNOV_CLIENT_ID/SNOV_CLIENT_SECRET not set")
+    # The API rejects a bare string with 422 ("The names must be an array.") — verified
+    # live 2026-08-13. Accept either a single name or a list for ergonomics and coerce.
+    if isinstance(names, str):
+        names = [names]
     if not names:
         return _err("no names given")
     return await _run_task(
