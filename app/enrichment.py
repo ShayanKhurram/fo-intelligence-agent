@@ -40,7 +40,7 @@ from app.db import (
 )
 from app.config import SETTINGS
 from app.parser import compute_injected_facts
-from app.state import Claim, Finding, ValidationInput, select_claim_for_question, utcnow
+from app.state import Claim, Finding, ValidationInput, select_claim_for_question, utcnow, _CLAIM_STATUS_RANK
 from app.validation import run_validation
 # PLAN.md T27.2: reuse the EXACT T26 provenance ranking the shipped row uses
 # (app.dataset._records_rows), so the wave -1 view of "which principal won" can never
@@ -189,6 +189,51 @@ QUESTION_FIELD_PROJECTIONS: dict[str, str] = {
 _PROJECTABLE_STATUSES: frozenset[str] = frozenset({"confirmed", "single_source", "verified"})
 
 
+# PLAN.md T29.1: ordered role seniority for the principal pick. Each group is a set
+# of substrings matched case-insensitively against the title; the FIRST group that
+# matches wins (lower index = more senior). An unrecognised or missing title ranks
+# `len(_ROLE_PRIORITY)` (last) — so an unknown role loses to a recognised one but a
+# named principal with an unknown title still beats no principal at all (T29.2).
+# Word-boundary guards (\b) stop short labels matching inside longer words: "ceo"
+# must not match inside "Deceased"/"sociology"-style tokens, and "cio"/"coo"/"cfo"
+# likewise (PLAN.md T29.1's substring trap).
+_ROLE_PRIORITY: tuple[tuple[str, ...], ...] = (
+    ("chief executive", "ceo"),
+    ("managing partner",),
+    ("managing member",),
+    ("founder", "co-founder"),
+    ("president",),
+    ("chief investment officer", "cio"),
+    ("managing director",),
+    ("principal",),
+    ("partner",),
+    ("chief operating officer", "coo"),
+    ("chief financial officer", "cfo"),
+)
+
+_ROLE_GROUP_RES: tuple[_re.Pattern[str], ...] = tuple(
+    _re.compile(
+        r"\b(?:" + r"|".join(_re.escape(term) for term in group) + r")\b",
+        _re.IGNORECASE,
+    )
+    for group in _ROLE_PRIORITY
+)
+
+
+def _role_rank(title: str | None) -> int:
+    """Rank a title by role seniority (PLAN.md T29.1). Returns the index of the first
+    matching `_ROLE_PRIORITY` group, or `len(_ROLE_PRIORITY)` when the title is
+    missing, blank, or matches no recognised role. Case-insensitive and
+    word-boundary guarded so short labels ("ceo", "cio", ...) never match inside a
+    longer word."""
+    if not title or not title.strip():
+        return len(_ROLE_PRIORITY)
+    for idx, rx in enumerate(_ROLE_GROUP_RES):
+        if rx.search(title):
+            return idx
+    return len(_ROLE_PRIORITY)
+
+
 def _project_question_claims(claims: list[Claim]) -> list[Claim]:
     """Project Layer-1 question claims into field-name claims the row pivots on
     (PLAN.md T19.3). `claims` is the combined list the caller already holds — both the
@@ -225,46 +270,110 @@ def _project_question_claims(claims: list[Claim]) -> list[Claim]:
         if not qid:
             continue
         layer1_by_q.setdefault(qid, []).append(c)
-    winners = [
-        select_claim_for_question(group)
-        for group in layer1_by_q.values()
-    ]
-    out: list[Claim] = []
-    for c in winners:
-        if c is None:
-            continue
-        qid = c.question_id
-        if not qid or c.status not in _PROJECTABLE_STATUSES:
-            continue
+
+    def _projectable(c: Claim) -> bool:
+        """A Layer-1 claim that may be projected: projectable status AND a non-empty
+        string subject_value to lift into the field_name claim."""
+        if c.status not in _PROJECTABLE_STATUSES:
+            return False
         sv = c.subject_value
-        if not isinstance(sv, str) or not sv.strip():
-            continue
-        field_name = QUESTION_FIELD_PROJECTIONS.get(qid)
-        if field_name is None:
-            # G2.Q2 -> principal_linkedin ONLY when subject_value is a linkedin.com/in/
-            # URL — a generic profile URL or a company LinkedIn page is not a person's
-            # LinkedIn field (PLAN.md T19.3).
-            if qid == "G2.Q2" and "linkedin.com/in/" in sv.lower():
-                field_name = "principal_linkedin"
-            else:
-                continue
-        if field_name in settled_by_structured:
-            continue
+        return isinstance(sv, str) and bool(sv.strip())
+
+    def _t23_key(c: Claim) -> tuple[int, int, float, str]:
+        # The EXACT tie-break `select_claim_for_question` uses (PLAN.md T23.2):
+        # status rank, then most-recent retrieved_at, then claim_id. Re-implemented
+        # here so the G2.Q1 seniority pick can layer role-rank AHEAD of this key
+        # without changing the underlying tie-break.
+        rank = _CLAIM_STATUS_RANK.get(c.status, 99)
+        if c.retrieved_at is not None:
+            ra: tuple[int, float] = (0, -c.retrieved_at.timestamp())
+        else:
+            ra = (1, 0.0)
+        return (rank, ra[0], ra[1], c.claim_id)
+
+    def _emit(c: Claim, qid: str, field_name: str) -> Claim:
         # Preserve the original claim's timestamp alongside its url/source_class — the
         # date is part of the provenance the projection must carry (PLAN.md T19.3), and
         # `check_v5_staleness` skips any claim whose retrieved_at is None, so dropping it
         # would silently make a two-year-old researched principal look freshly found.
         # `_parse_dt` accepts an ISO string and returns None for None, so a Layer-1 claim
         # with no timestamp keeps behaving exactly as it did before this fix.
-        out.append(_derived_claim(
-            field_name=field_name, answer=sv,
+        return _derived_claim(
+            field_name=field_name, answer=c.subject_value,
             source={
                 "url": c.source_url,
                 "retrieved_at": c.retrieved_at.isoformat() if c.retrieved_at else None,
             },
             extraction_method=f"projected_{qid}", confidence="medium",
             source_class=c.source_class,
-        ))
+        )
+
+    out: list[Claim] = []
+    # PLAN.md T29.2: project G2.Q1 (principal_name) and G2.Q3 (principal_title) as a
+    # PAIR keyed on shared `source_url`, selecting the principal whose paired title is
+    # the most senior by `_role_rank`. This makes the pick DETERMINISTIC given a ledger
+    # (the regression guard for "a different principal every run") and guarantees the
+    # name and title describe the SAME person from the SAME page — closing the
+    # coherence gap that produced "Chris Younger, Director of Wealth Advisory" (someone
+    # else's title) on a prior run. Only the winning pair projects; remaining ties use
+    # the existing T23.2 order (status, then retrieved_at, then claim_id).
+    # A G2.Q1 with no paired title still projects (ranked last) — a named principal
+    # with an unknown title beats no principal (PLAN.md T29.2).
+    skip_pair_qids: set[str] = set()
+    g2q1_proj = [c for c in layer1_by_q.get("G2.Q1", []) if _projectable(c)]
+    if g2q1_proj:
+        skip_pair_qids = {"G2.Q1", "G2.Q3"}
+        # Projectable G2.Q3 titles grouped by their source_url, so a G2.Q1 can find the
+        # title found on the SAME page. A G2.Q3 with no source_url cannot be paired and
+        # is intentionally excluded — the whole point of T29.2 is name+title from the
+        # same source.
+        q3_by_url: dict[str, list[Claim]] = {}
+        for c in layer1_by_q.get("G2.Q3", []):
+            if not _projectable(c) or not c.source_url:
+                continue
+            q3_by_url.setdefault(c.source_url, []).append(c)
+        # Rank each projectable G2.Q1 by its paired title's seniority (lower is better),
+        # breaking ties with the T23.2 key on the G2.Q1 claim itself.
+        ranked: list[tuple[int, tuple[int, int, float, str], Claim, Claim | None]] = []
+        for q1 in g2q1_proj:
+            paired_q3: Claim | None = None
+            if q1.source_url and q1.source_url in q3_by_url:
+                paired_q3 = select_claim_for_question(q3_by_url[q1.source_url])
+            title_sv = (paired_q3.subject_value
+                        if paired_q3 is not None and isinstance(paired_q3.subject_value, str)
+                        else None)
+            ranked.append((_role_rank(title_sv), _t23_key(q1), q1, paired_q3))
+        ranked.sort(key=lambda t: (t[0], t[1]))
+        _, _, best_q1, best_q3 = ranked[0]
+        if "principal_name" not in settled_by_structured:
+            out.append(_emit(best_q1, "G2.Q1", "principal_name"))
+        if best_q3 is not None and "principal_title" not in settled_by_structured:
+            out.append(_emit(best_q3, "G2.Q3", "principal_title"))
+
+    # All other questions (and G2.Q1/G2.Q3 when no projectable G2.Q1 exists, preserving
+    # the pre-T29 behaviour for a lone G2.Q3): project the per-question winner the
+    # gates themselves use (`select_claim_for_question`).
+    for qid, group in layer1_by_q.items():
+        if qid in skip_pair_qids:
+            continue
+        c = select_claim_for_question(group)
+        if c is None:
+            continue
+        if not _projectable(c):
+            continue
+        field_name = QUESTION_FIELD_PROJECTIONS.get(qid)
+        if field_name is None:
+            # G2.Q2 -> principal_linkedin ONLY when subject_value is a linkedin.com/in/
+            # URL — a generic profile URL or a company LinkedIn page is not a person's
+            # LinkedIn field (PLAN.md T19.3).
+            sv = c.subject_value
+            if qid == "G2.Q2" and "linkedin.com/in/" in sv.lower():
+                field_name = "principal_linkedin"
+            else:
+                continue
+        if field_name in settled_by_structured:
+            continue
+        out.append(_emit(c, qid, field_name))
     return out
 
 

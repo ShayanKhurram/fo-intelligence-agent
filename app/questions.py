@@ -54,7 +54,10 @@ QUESTION_BATTERY: list[QuestionSpec] = [
     # --- people (G2): is there a reachable decision-maker? ---
     QuestionSpec(
         question_id="G2.Q1",
-        text="Is a named decision-maker (principal, CIO, or similar) identified?",
+        text="Is the firm's MOST SENIOR named decision-maker identified? Name the "
+        "CEO if the firm has one, otherwise the Managing Partner, Managing Member, "
+        "Founder, President, CIO, Managing Director, Principal, Partner, COO, or CFO — "
+        "in that priority order. Report the single most senior person found.",
         lane="people",
         gate="HARD",
         on_unknown="deprioritize",
@@ -68,7 +71,8 @@ QUESTION_BATTERY: list[QuestionSpec] = [
     ),
     QuestionSpec(
         question_id="G2.Q3",
-        text="Is their title/role current (not a stale or superseded bio)?",
+        text="What is the EXACT title/role of the person named in G2.Q1, as stated on "
+        "the same page that named them? Report the title verbatim from that page.",
         lane="people",
         gate="SOFT",
         on_unknown="ship_with_label",
