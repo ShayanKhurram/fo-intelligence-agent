@@ -64,6 +64,32 @@ _HIGH_VALUE_FIELDS: frozenset[str] = frozenset({
     "principal_name", "principal_email", "principal_phone", "aum_usd", "why_now_trigger",
 })
 
+# T26 — provenance tiers for multi-valued fields. An extraction_method PREFIX maps to a
+# rank; lower is better. `_provenance_rank` does longest-prefix match. The point: a
+# researcher-verified `projected_G2.Q1` principal must not be concatenated in the same
+# cell as `derived_fec_employer` donors (campaign contributors who named the firm as their
+# employer). `projected_` is a Layer-1 researched, source-cited finding; `derived_` is a raw
+# discovery-feed payload value; everything else (serper_xray, serper_organic, jsonld,
+# site_scrape, and anything unrecognised) is a search-snippet / scrape tier. `None` ranks
+# 2 — unknown provenance is not evidence of quality.
+_PROVENANCE_TIER: dict[str, int] = {
+    "projected_": 0,
+    "derived_": 1,
+}
+
+
+def _provenance_rank(extraction_method: str | None) -> int:
+    """Longest-prefix match against `_PROVENANCE_TIER`; unmatched and `None` -> 2."""
+    if extraction_method is None:
+        return 2
+    best = 2
+    best_prefix_len = -1
+    for prefix, rank in _PROVENANCE_TIER.items():
+        if extraction_method.startswith(prefix) and len(prefix) > best_prefix_len:
+            best = rank
+            best_prefix_len = len(prefix)
+    return best
+
 
 @dataclass
 class ProductionCandidate:
@@ -251,7 +277,11 @@ def _records_rows(selected: list[ProductionCandidate]) -> tuple[list[str], list[
     rows = []
     for c in selected:
         latest: dict[str, dict[str, Any]] = {}
-        multi: dict[str, list[str]] = {}
+        # Multi-valued field -> {field: {rank: [answers in first-seen order]}}. T26: build
+        # the cell from ONLY the best (lowest) rank present for that field, not from
+        # every eligible claim — otherwise a researcher-verified `projected_G2.Q1`
+        # principal gets concatenated in the same cell as `derived_fec_employer` donors.
+        multi: dict[str, dict[int, list[str]]] = {}
         for cl in c.claims:
             fname = cl.get("field_name")
             if not fname:
@@ -267,7 +297,8 @@ def _records_rows(selected: list[ProductionCandidate]) -> tuple[list[str], list[
             ):
                 answer = cl.get("answer")
                 if answer not in (None, ""):
-                    bucket = multi.setdefault(fname, [])
+                    rank = _provenance_rank(cl.get("extraction_method"))
+                    bucket = multi.setdefault(fname, {}).setdefault(rank, [])
                     if str(answer) not in bucket:
                         bucket.append(str(answer))
         # lead_origin_source_class is a candidate-level attribute (which discovery feed
@@ -284,10 +315,14 @@ def _records_rows(selected: list[ProductionCandidate]) -> tuple[list[str], list[
                 continue
             claim = latest.get(f)
             if f in _MULTI_VALUED_FIELDS and multi.get(f):
-                # "; " rather than a list, so the XLSX cell and the Postgres TEXT column
-                # both stay a plain string. Order is first-seen (wave -1 discovery data
-                # before wave-1 research), not ranked.
-                row[f] = "; ".join(multi[f])
+                # T26: emit ONLY the best (lowest) tier present for this field, in
+                # first-seen order within the tier. A "; " rather than a list so the
+                # XLSX cell and the Postgres TEXT column both stay a plain string.
+                # Co-principals arriving in the same tier both survive; a researcher's
+                # projected principal is no longer buried among discovery-feed donors.
+                tiers = multi[f]
+                best = min(tiers)
+                row[f] = "; ".join(tiers[best])
             else:
                 row[f] = claim["answer"] if claim and claim["status"] != "removed_failed_validation" else None
             if f in _HIGH_VALUE_FIELDS:
