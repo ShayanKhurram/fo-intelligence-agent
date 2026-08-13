@@ -42,6 +42,11 @@ from app.config import SETTINGS
 from app.parser import compute_injected_facts
 from app.state import Claim, Finding, ValidationInput, select_claim_for_question, utcnow
 from app.validation import run_validation
+# PLAN.md T27.2: reuse the EXACT T26 provenance ranking the shipped row uses
+# (app.dataset._records_rows), so the wave -1 view of "which principal won" can never
+# drift from the row's view. `_provenance_rank` is a pure longest-prefix-match helper;
+# importing it (rather than re-implementing) is what guarantees the no-drift property.
+from app.dataset import _provenance_rank
 from app.tools.adv import distinctive_name_tokens
 from app.tools.edgar import edgar_full_text_search_raw
 from app.tools.freefetch import fetch_page_free_first, fetch_raw_html
@@ -303,14 +308,24 @@ def _access_window_claims(conf_rows: list[dict[str, Any]], today: date) -> list[
     return claims
 
 
-def _principal_from_people(sources: list[dict[str, Any]]) -> list[Claim]:
+def _principal_from_people(
+    sources: list[dict[str, Any]]
+) -> tuple[list[Claim], dict[str, str]]:
     """principal_name / principal_title from discovery-class pass-through payloads
     carrying a "people" list (fec_employer, ppp_loans, and similar — see
     app/ingest.py's _map_source fallback branch). Payload shape for these classes is
     whatever the raw discovery feed carried, not a normalized schema, so this reads
     defensively (name/full_name, title/occupation/role) and skips anyone with no name
-    rather than guessing at field names that aren't there."""
+    rather than guessing at field names that aren't there.
+
+    Returns ``(claims, title_owner_by_claim_id)``. The second element is a LOCAL
+    structure (no schema change) mapping each emitted ``principal_title`` claim's
+    ``claim_id`` to the person-name it came from, so a later step
+    (``_reconcile_principal_title``) can tell whose title each claim is — the whole
+    point of PLAN.md T27.2. A title emitted here has no inherent link to its
+    principal_name sibling otherwise."""
     claims: list[Claim] = []
+    title_owner_by_claim_id: dict[str, str] = {}
     for s in sources:
         if s["source_class"] in _STRUCTURED_CLASSES:
             continue
@@ -327,12 +342,109 @@ def _principal_from_people(sources: list[dict[str, Any]]) -> list[Claim]:
             ))
             title = person.get("title") or person.get("occupation") or person.get("role")
             if title:
-                claims.append(_derived_claim(
+                title_claim = _derived_claim(
                     field_name="principal_title", answer=title, source=s,
                     extraction_method=f"derived_{s['source_class']}",
-                ))
+                )
+                claims.append(title_claim)
+                title_owner_by_claim_id[title_claim.claim_id] = name
             break  # first named person only — a full roster isn't wave -1's job
-    return claims
+    return claims, title_owner_by_claim_id
+
+
+def _person_names_match(a: str | None, b: str | None) -> bool:
+    """PLAN.md T27.1 — does name `a` refer to the same person as name `b`?
+
+    Normalise each name to a set of alphabetic tokens of length >= 2 (casefold,
+    punctuation stripped: ``"TULLMAN, CAYLEY ELYSE"`` -> ``{tullman, cayley, elyse}``,
+    ``"Glen Tullman"`` -> ``{glen, tullman}``). Match when either token set is a
+    **subset** of the other:
+    - ``"TULLMAN, GLEN"`` matches ``"Glen Tullman"`` (equal sets);
+    - ``"TULLMAN, CAYLEY ELYSE"`` does NOT match ``"Glen Tullman"`` (different given
+      names — neither is a subset, so a shared surname alone never matches);
+    - ``"Santiago Ulloa"`` does not match ``"ORTEGA, ROCIO"``.
+    A single-token name matches an identical token or a superset containing it.
+    Empty/None on either side -> False.
+    """
+    if not a or not b:
+        return False
+
+    def _tokens(name: str) -> set[str]:
+        return {tok.lower() for tok in _re.findall(r"[A-Za-z]+", name) if len(tok) >= 2}
+
+    ta, tb = _tokens(a), _tokens(b)
+    if not ta or not tb:
+        return False
+    return ta.issubset(tb) or tb.issubset(ta)
+
+
+def _reconcile_principal_title(
+    claims: list[Claim], title_owner_by_claim_id: dict[str, str]
+) -> list[Claim]:
+    """PLAN.md T27.2 — attribute discovery-feed titles to the person they belong to.
+
+    The user's rule: if the researched principal name IS in the discovery input, take
+    that person's title from the input; if it is NOT, leave ``principal_title`` unsettled
+    so wave 1's ``_find_role_currency`` searches the name together with the firm. Today
+    wave -1's ``_principal_from_people`` emits a ``principal_name`` and a
+    ``principal_title`` per source row with no link between them, and wave 1's guard
+    (``if principal_name and "principal_title" not in settled``) then never runs the
+    search tier because an arbitrary donor's title has already settled the field —
+    dead code on the whole ``fec_employer`` path. This reconciler restores the link.
+
+    Called at the END of ``wave_minus_1`` (after ``_project_question_claims``, so the
+    researched principal is known). Steps, in order:
+    1. Pick the winning ``principal_name`` by the T26 provenance ranking
+       (``projected_`` > ``derived_`` > other); ties keep first-seen.
+    2. **Type guard** — mark ``superseded`` any ``principal_title`` whose value
+       ``_person_names_match``es the winning ``principal_name``. A title is not a
+       name; this is what stops T26 promoting ``"Glen Tullman"`` into the title column.
+    3. Keep a ``derived_`` title ONLY when its owner (looked up in
+       ``title_owner_by_claim_id``) ``_person_names_match``es the winning
+       ``principal_name``. Mark every other ``derived_`` title ``superseded`` — do
+       NOT delete: the ledger keeps the evidence and ``_settled_fields`` already
+       ignores that status.
+    4. Keep ``projected_``/other titles that survived step 2 untouched.
+
+    If nothing survives, ``principal_title`` is left unsettled so wave 1's
+    ``_find_role_currency`` runs — the user's second rule.
+    """
+    # 1. Winning principal_name by the T26 provenance ranking. `min` returns the FIRST
+    #    minimum element, so ties keep first-seen.
+    name_claims = [
+        c for c in claims
+        if c.field_name == "principal_name" and isinstance(c.answer, str) and c.answer.strip()
+    ]
+    if not name_claims:
+        return claims
+    winner = min(name_claims, key=lambda c: _provenance_rank(c.extraction_method))
+    winning_name = winner.answer
+    if not isinstance(winning_name, str) or not winning_name.strip():
+        return claims
+
+    out: list[Claim] = []
+    for c in claims:
+        if c.field_name != "principal_title":
+            out.append(c)
+            continue
+        value = c.answer if isinstance(c.answer, str) else None
+        # 2. Type guard — a title that IS the principal's name is not a title.
+        if value and _person_names_match(value, winning_name):
+            out.append(c.model_copy(update={"status": "superseded"}))
+            continue
+        method = c.extraction_method or ""
+        if method.startswith("derived_"):
+            # 3. Keep a derived title ONLY when its owner matches the winning
+            #    principal. Every other derived title is superseded (never deleted).
+            owner = title_owner_by_claim_id.get(c.claim_id)
+            if owner and _person_names_match(owner, winning_name):
+                out.append(c)
+            else:
+                out.append(c.model_copy(update={"status": "superseded"}))
+        else:
+            # 4. projected_/other titles that survived the type guard are kept.
+            out.append(c)
+    return out
 
 
 def _discovery_class_claims(sources: list[dict[str, Any]]) -> list[Claim]:
@@ -427,7 +539,8 @@ def wave_minus_1(
     conf_rows = _by_class(entity_sources, "conference_sighting")
     claims.extend(_access_window_claims(conf_rows, today))
 
-    claims.extend(_principal_from_people(entity_sources))
+    people_claims, title_owner_by_claim_id = _principal_from_people(entity_sources)
+    claims.extend(people_claims)
     claims.extend(_discovery_class_claims(entity_sources))
 
     if overlap := _public_list_overlap_claim(canonical_name, aliases, public_list):
@@ -438,6 +551,12 @@ def wave_minus_1(
     # conference derivation is not overwritten by a lower-confidence projection.
     if layer1_claims:
         claims.extend(_project_question_claims([*claims, *layer1_claims]))
+
+    # PLAN.md T27.2: attribute discovery-feed titles to the person they belong to,
+    # AFTER the projection so the researched (projected_) principal is known. Runs
+    # before the entity_id re-stamping below so the title_owner_by_claim_id mapping
+    # (keyed on the uuid4 claim_ids _principal_from_people emitted) still resolves.
+    claims = _reconcile_principal_title(claims, title_owner_by_claim_id)
 
     if entity_id:
         claims = [
@@ -1054,6 +1173,32 @@ def _settled_fields(claims: list[Claim]) -> set[str]:
     }
 
 
+def _select_principal_name(claims: list[Claim]) -> str | None:
+    """The principal_name wave 1 should search/attribute against.
+
+    PLAN.md T27.3: this used to be `next(...)` — first principal_name claim in list
+    order. On a `fec_employer` lead that order is the discovery-feed donor (a
+    `derived_fec_employer` claim appended before the `projected_G2.Q1` projection),
+    so wave 1 searched the DONOR's name together with the firm instead of the
+    researched principal — the fall-through fired but with the wrong name, defeating
+    the user's rule ("use the extracted name and search for it with the corporate
+    name"). Pick the T26 provenance winner instead (`projected_` > `derived_` > other;
+    ties keep first-seen), the SAME ranking `_reconcile_principal_title` and the
+    shipped row use, so the name wave 1 acts on can never disagree with the name the
+    row ships. `min` returns the first minimum element, so first-seen wins ties.
+    """
+    candidates = [
+        c for c in claims
+        if c.field_name == "principal_name"
+        and isinstance(c.answer, str)
+        and c.answer.strip()
+        and c.status not in ("could_not_verify", "removed_failed_validation", "superseded")
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda c: _provenance_rank(c.extraction_method)).answer
+
+
 async def wave_1(
     claims: list[Claim], canonical_name: str, domain: str | None = None,
     aliases: list[str] | None = None,
@@ -1074,10 +1219,7 @@ async def wave_1(
             new_claims.append(claim)
             settled.add("principal_name")
 
-    principal_name = next(
-        (c.answer for c in [*claims, *new_claims] if c.field_name == "principal_name" and isinstance(c.answer, str)),
-        None,
-    )
+    principal_name = _select_principal_name([*claims, *new_claims])
 
     if principal_name and "principal_title" not in settled:
         if claim := await _find_role_currency(canonical_name, principal_name):
