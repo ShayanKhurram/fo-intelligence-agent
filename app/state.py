@@ -79,10 +79,13 @@ class Claim(BaseModel):
     verified_at: datetime | None = None
 
 
-# Selection rank for `select_claim_for_question` (PLAN.md T23.2). `contradicted` is handled
-# out-of-band (any contradicted claim wins outright), so its entry here is only a
-# fallback for the tie-break among several contradicted claims — kept lowest so that
-# if the special-case ever drops, it still sorts first.
+# Selection rank for `select_claim_for_question` (PLAN.md T23.2, corrected by T24.1).
+# `contradicted` means "this specific claim's own page does not bear it out" — a claim
+# actively refuted by its own source. `could_not_verify` means "we don't know". Both are
+# weak answers and either loses to a `confirmed` sibling, but a refuted claim ranks below
+# one that simply could not be checked — hence `could_not_verify` (5) < `contradicted` (6).
+# A question whose only claim is `contradicted` is still returned: selection picks a
+# winner, it never filters.
 _CLAIM_STATUS_RANK: dict[str, int] = {
     "verified": 0,
     "confirmed": 1,
@@ -90,9 +93,9 @@ _CLAIM_STATUS_RANK: dict[str, int] = {
     "pattern_inferred": 3,
     "format_only": 4,
     "could_not_verify": 5,
-    "superseded": 6,
-    "removed_failed_validation": 7,
-    "contradicted": -1,
+    "contradicted": 6,
+    "superseded": 7,
+    "removed_failed_validation": 8,
 }
 
 
@@ -103,22 +106,25 @@ def select_claim_for_question(claims: list[Claim]) -> Claim | None:
     page — see `_COMPRESS_SYSTEM_TEMPLATE`), so the gates and the projection need a single
     canonical claim per question, picked by a rule that NEVER depends on input list order.
 
-    Precedence, in order:
-    1. any `contradicted` claim wins — a gate must not pass on the strength of one
-       confirming claim while another says contradicted (fail-safe; this project treats a
-       false positive as worse than no lead);
-    2. otherwise the strongest status: `verified` > `confirmed` > `single_source` >
-       `pattern_inferred` > `format_only` > `could_not_verify` > `superseded` >
-       `removed_failed_validation`;
-    3. tie-break on the most recent `retrieved_at` (a `None` timestamp sorts oldest);
-    4. final tie-break on `claim_id` string order, so the result is total.
+    Precedence, in order (T24.1: `contradicted` no longer wins outright — see the
+    rationale on `_CLAIM_STATUS_RANK`. A `contradicted` claim means *this particular
+    fact* is not supported by *its own* cited page, which says nothing about a sibling
+    claim answering the same question from a different, well-supported source):
+    1. the strongest status: `verified` > `confirmed` > `single_source` >
+       `pattern_inferred` > `format_only` > `could_not_verify` > `contradicted` >
+       `superseded` > `removed_failed_validation`;
+    2. tie-break on the most recent `retrieved_at` (a `None` timestamp sorts oldest);
+    3. final tie-break on `claim_id` string order, so the result is total.
+
+    Selection picks a winner; it never filters. A question whose only claim is
+    `contradicted` still returns that claim.
     """
     if not claims:
         return None
 
     def _key(c: Claim) -> tuple[int, int, float, str]:
-        # contradicted wins outright: rank -1 sorts before every positive rank.
-        rank = -1 if c.status == "contradicted" else _CLAIM_STATUS_RANK.get(c.status, 99)
+        # Status rank drives selection (T24.1: no contradicted-wins special case).
+        rank = _CLAIM_STATUS_RANK.get(c.status, 99)
         # Most recent retrieved_at first: a real timestamp negates to a negative number
         # that sorts earlier; None sorts oldest (last) via the leading 1.
         if c.retrieved_at is not None:

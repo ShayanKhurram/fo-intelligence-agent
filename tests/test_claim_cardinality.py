@@ -135,9 +135,14 @@ def test_selection_is_deterministic_under_shuffle():
     assert selected_ids == {expected}
 
 
-def test_contradicted_beats_confirmed_for_same_question():
-    """T23.4(d): fail-safe — a gate must not pass because one claim confirms while another
-    contradicts. The contradicted claim must win selection for that question."""
+def test_confirmed_beats_contradicted_for_same_question():
+    """T24.2 (inverts the old T23.4(d) fail-safe): under the one-claim/one-fact/one-source
+    model (T23.1), `contradicted` means *this particular fact* is not supported by *its
+    own* cited page — which says nothing about a sibling claim answering the same
+    question from a different, well-supported source. A `confirmed` sibling therefore
+    outranks a `contradicted` claim for the same question (PLAN.md T24).
+
+    Order must not matter — `confirmed` wins either way."""
     confirmed = Claim(
         question_id="G3.Q2",
         answer="a confirmed signal",
@@ -158,6 +163,22 @@ def test_contradicted_beats_confirmed_for_same_question():
         retrieved_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
         claim_id="contradicted-id",
     )
-    # Order must not matter — contradicted wins either way.
-    assert select_claim_for_question([confirmed, contradicted]).claim_id == "contradicted-id"
-    assert select_claim_for_question([contradicted, confirmed]).claim_id == "contradicted-id"
+    assert select_claim_for_question([confirmed, contradicted]).claim_id == "confirmed-id"
+    assert select_claim_for_question([contradicted, confirmed]).claim_id == "confirmed-id"
+
+
+def test_lone_contradicted_claim_is_still_returned():
+    """T24.2 companion: "prefer a good sibling" must never be mistaken for "discard
+    contradicted claims". A question whose only claim is `contradicted` still returns
+    that claim — selection picks a winner, it never filters."""
+    contradicted = Claim(
+        question_id="G3.Q2",
+        answer="a contradicted signal",
+        subject_value="contradicted-value",
+        status="contradicted",
+        source_url="https://example.com/contradicted",
+        confidence="low",
+        retrieved_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        claim_id="contradicted-id",
+    )
+    assert select_claim_for_question([contradicted]).claim_id == "contradicted-id"
