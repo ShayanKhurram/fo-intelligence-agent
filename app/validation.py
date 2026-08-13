@@ -452,13 +452,32 @@ _V1_EXEMPT_FIELDS: frozenset[str] = frozenset({
 _V1_SKIP_SOURCE_CLASSES: frozenset[str] = frozenset({"serper_organic"})
 
 _V1_SYSTEM_PROMPT = (
-    "You are checking whether a web page's content supports a specific factual claim "
-    "about an organization. Judge the SUBSTANCE of the claim, not exact wording: if the "
-    "page states the same fact using different phrasing, units, or labels, that counts "
-    "as support. Only mark a claim unsupported if the page is actually silent on it or "
-    "states something different. Respond with ONLY a JSON object: "
-    '{"supported": true|false, "reason": "<one sentence>"}. No markdown fences, no extra keys.'
+    "You are checking ONE thing only: whether a web page's content is consistent with a "
+    "single factual claim about an organization. Use NOTHING but the page content and the "
+    "claim. Do NOT apply outside knowledge, do NOT draw distinctions the page itself does "
+    "not draw, and do NOT require the page to prove anything beyond what the claim asserts.\n\n"
+    "Respond with ONLY a JSON object: "
+    '{"verdict": "supported"|"contradicted"|"not_stated", "reason": "<one sentence>"}. '
+    "No markdown fences, no extra keys.\n\n"
+    "Verdict rules:\n"
+    "- \"supported\" — ANY indication pointing toward the claim is enough: a partial "
+    "statement, synonym, label, navigation element, or implication. A hint is enough. "
+    "Never require the claim's exact wording. A status label that differs only in wording "
+    "(e.g. \"Approved\" vs \"ACTIVE\") is supported. A page that IS the artifact the "
+    "claim refers to (a LinkedIn profile page as evidence of that profile) is supported. "
+    "If the claim states several things and the page supports any of them, that is "
+    "supported — incidental detail the page does not cover is not grounds for failure.\n"
+    "- \"contradicted\" — ONLY when the page positively asserts something incompatible "
+    "with the claim (e.g. the page says the firm dissolved in 2019 while the claim says it "
+    "is active).\n"
+    "- \"not_stated\" — the page is genuinely silent on the claim, or is about something "
+    "else entirely.\n"
+    "This is a consistency check, not a research task: never adjudicate the world, only "
+    "whether the page and the claim agree."
 )
+
+
+_V1_VERDICTS = ("supported", "contradicted", "not_stated")
 
 
 def _parse_v1_json(text: str) -> dict[str, Any]:
@@ -468,11 +487,27 @@ def _parse_v1_json(text: str) -> dict[str, Any]:
         if text.startswith("json"):
             text = text[4:]
     data = json.loads(text)
-    if not isinstance(data.get("supported"), bool):
-        raise ValueError(f"invalid 'supported' value: {data.get('supported')!r}")
-    if not isinstance(data.get("reason"), str):
-        raise ValueError("'reason' must be a string")
-    return data
+    if not isinstance(data, dict):
+        raise ValueError(f"judge output must be a JSON object, got {type(data).__name__}")
+    if "verdict" in data:
+        verdict = data.get("verdict")
+        if verdict not in _V1_VERDICTS:
+            raise ValueError(f"invalid 'verdict' value: {verdict!r}")
+        if not isinstance(data.get("reason"), str):
+            raise ValueError("'reason' must be a string")
+        return {"verdict": verdict, "reason": data["reason"]}
+    # Legacy fallback (T25.3): an old-shaped {"supported": bool} reply from a model that
+    # ignored the new prompt. "false" is genuinely ambiguous between "contradicted" and
+    # "not_stated", and the whole point of T25 is that this ambiguity must NEVER produce
+    # a fatal — so map false -> not_stated (the safer reading). true -> supported.
+    if "supported" in data:
+        supported = data.get("supported")
+        if not isinstance(supported, bool):
+            raise ValueError(f"invalid 'supported' value: {supported!r}")
+        reason = data.get("reason")
+        reason = reason if isinstance(reason, str) else ""
+        return {"verdict": "supported" if supported else "not_stated", "reason": reason}
+    raise ValueError(f"judge output has neither 'verdict' nor 'supported': {data!r}")
 
 
 async def check_v1_source_supports_claim(claim: Claim, page_content: str, model: Any) -> tuple[Finding, float]:
@@ -497,7 +532,11 @@ async def check_v1_source_supports_claim(claim: Claim, page_content: str, model:
         ), 0.0
 
     human = HumanMessage(
-        content=f"Claim: {field} = {claim.answer!r}\n\nPage content (truncated):\n{page_content[:4000]}"
+        content=(
+            f"Claim: {field} = {str(claim.answer)}\n"
+            f"Retrieved via: {claim.extraction_method}\n\n"
+            f"Page content (truncated):\n{page_content[:4000]}"
+        )
     )
     response = await model.ainvoke([SystemMessage(content=_V1_SYSTEM_PROMPT), human])
     cost = response.response_metadata.get("cost_usd", 0.0)
@@ -510,9 +549,19 @@ async def check_v1_source_supports_claim(claim: Claim, page_content: str, model:
             claim_id=claim.claim_id, evidence_url=claim.source_url,
         ), cost
 
-    severity = "info" if data["supported"] else "fatal"
+    verdict = data["verdict"]
+    reason = data.get("reason", "")
+    if verdict == "supported":
+        severity = "info"
+        detail = reason
+    elif verdict == "contradicted":
+        severity = "fatal"
+        detail = reason
+    else:  # not_stated — unproven, NOT disproven; leaves the claim's status untouched
+        severity = "warn"
+        detail = f"claim unproven, not disproven — {reason}" if reason else "claim unproven, not disproven"
     return Finding(
-        check_id="V1_source_supports", severity=severity, field=field, detail=data["reason"],
+        check_id="V1_source_supports", severity=severity, field=field, detail=detail,
         claim_id=claim.claim_id, evidence_url=claim.source_url,
     ), cost
 

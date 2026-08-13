@@ -185,6 +185,15 @@ def _merge_lane_counts(left: dict[str, int], right: dict[str, int]) -> dict[str,
     return merged
 
 
+def _merge_url_provenance(left: dict[str, str], right: dict[str, str]) -> dict[str, str]:
+    """Merge per-URL retrieval-tool maps across researcher supersteps. A later write may
+    refresh the tool recorded for a URL it actually saw, but must not clobber an earlier
+    entry for a *different* URL — plain dict.update gives exactly that (T25.1)."""
+    merged = dict(left)
+    merged.update(right)
+    return merged
+
+
 def trace_event(phase: str, event: str, **fields: Any) -> dict[str, Any]:
     """One entry in the full reasoning/tool-call trace persisted to `lead_traces`
     (app/db.py). Not part of the original plan's state models — added because none of
@@ -210,6 +219,7 @@ class ResearcherState(TypedDict):
     tool_calls_used: int
     had_real_evidence: bool  # True once any tool result produced usable content
     claims: Annotated[list[dict[str, Any]], operator.add]  # Claim.model_dump()
+    url_provenance: Annotated[dict[str, str], _merge_url_provenance]  # {url: tool_name} (T25.1)
     lane_status: str  # "ok" | "capped" | "failed"
     cost_usd: float
     trace: Annotated[list[dict[str, Any]], operator.add]  # trace_event() dicts

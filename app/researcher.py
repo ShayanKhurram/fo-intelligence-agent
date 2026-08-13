@@ -265,12 +265,35 @@ def _result_is_usable(tool_name: str, result: Any) -> bool:
     return True
 
 
+def _urls_in_result(result: Any) -> set[str]:
+    """Every URL a tool result cites about itself — top-level `url`/`source_url` plus the
+    same keys inside a `results` list (T25.1). Used to stamp `extraction_method` on the
+    claims later compressed from this result, so *how* a claim was reached is recoverable
+    from code, never model-asserted."""
+    urls: set[str] = set()
+    if not isinstance(result, dict):
+        return urls
+    for key in ("url", "source_url"):
+        v = result.get(key)
+        if isinstance(v, str) and v:
+            urls.add(v)
+    rs = result.get("results")
+    if isinstance(rs, list):
+        for item in rs:
+            if isinstance(item, dict):
+                for key in ("url", "source_url"):
+                    v = item.get(key)
+                    if isinstance(v, str) and v:
+                        urls.add(v)
+    return urls
+
+
 async def researcher_tools_node(state: ResearcherState) -> dict[str, Any]:
     last = state["researcher_messages"][-1]
     tool_calls = last.tool_calls if isinstance(last, AIMessage) else []
     tools_by_name = {t.name: t for t in LANE_TOOLS[state["lane"]]}
 
-    async def run_one(tc: dict[str, Any]) -> tuple[ToolMessage, str, float, dict[str, Any], bool]:
+    async def run_one(tc: dict[str, Any]) -> tuple[ToolMessage, str, float, dict[str, Any], bool, dict[str, str]]:
         tool = tools_by_name.get(tc["name"])
         if tool is None:
             result: Any = {"error": f"unknown tool {tc['name']!r} for this lane"}
@@ -282,6 +305,13 @@ async def researcher_tools_node(state: ResearcherState) -> dict[str, Any]:
                 result = {"error": str(exc)}
         note, note_cost = await _format_tool_result_as_note(tc["name"], result)
         usable = _result_is_usable(tc["name"], result)
+        # T25.1: record which tool retrieved each URL this result cites, so the compress
+        # step can stamp `extraction_method` deterministically. Only usable results
+        # contribute — an errored/empty result's URLs are not evidence of retrieval.
+        provenance: dict[str, str] = {}
+        if usable:
+            for url in _urls_in_result(result):
+                provenance[url] = tc["name"]
         event = trace_event(
             "researcher_tool",
             "tool_call",
@@ -290,7 +320,7 @@ async def researcher_tools_node(state: ResearcherState) -> dict[str, Any]:
             args=tc["args"],
             result=result,
         )
-        return ToolMessage(content=json.dumps(result, default=str), tool_call_id=tc["id"]), note, note_cost, event, usable
+        return ToolMessage(content=json.dumps(result, default=str), tool_call_id=tc["id"]), note, note_cost, event, usable, provenance
 
     outcomes = await asyncio.gather(*(run_one(tc) for tc in tool_calls))
     tool_messages = [o[0] for o in outcomes]
@@ -298,11 +328,15 @@ async def researcher_tools_node(state: ResearcherState) -> dict[str, Any]:
     summarizer_cost = sum(o[2] for o in outcomes)
     events = [o[3] for o in outcomes]
     batch_has_evidence = any(o[4] for o in outcomes)
+    url_provenance: dict[str, str] = {}
+    for o in outcomes:
+        url_provenance.update(o[5])
     return {
         "researcher_messages": tool_messages,
         "raw_notes": notes,
         "tool_calls_used": state["tool_calls_used"] + len(tool_calls),
         "had_real_evidence": state["had_real_evidence"] or batch_has_evidence,
+        "url_provenance": url_provenance,
         "cost_usd": state["cost_usd"] + summarizer_cost,
         "trace": events,
     }
@@ -406,6 +440,20 @@ def _downgrade_unsupported_contradictions(claims: list[Claim]) -> list[tuple[str
 _PLACEHOLDER_SOURCE_CLASSES = frozenset({"unknown", "none", "null", "n/a", "na", "-", ""})
 
 
+def _stamp_extraction_method(
+    claims: list[Claim], url_provenance: dict[str, str], lane: str
+) -> None:
+    """T25.1: stamp `extraction_method` deterministically from the URL->tool map the
+    researcher-tools node built, never model-asserted. A claim citing a URL some tool
+    reported gets that tool's name; a claim citing a URL no tool reported (or a
+    could_not_verify claim with no source_url) falls back to `researcher_<lane>`. An
+    `extraction_method` the model already supplied is never overwritten."""
+    for c in claims:
+        if c.extraction_method:
+            continue
+        c.extraction_method = url_provenance.get(c.source_url) or f"researcher_{lane}"
+
+
 def _tag_evidence_gaps(claims: list[Claim], had_real_evidence: bool) -> None:
     """Distinguish "the tool was broken/empty" from "genuinely no evidence exists" on
     could_not_verify claims the LLM left unclassified.
@@ -465,6 +513,7 @@ async def compress_to_claims_node(state: ResearcherState) -> dict[str, Any]:
             claims = _parse_claims_json(str(response.content), lane_question_ids)
             downgraded = _downgrade_unsupported_contradictions(claims)
             _tag_evidence_gaps(claims, state["had_real_evidence"])
+            _stamp_extraction_method(claims, state.get("url_provenance") or {}, lane)
             event = trace_event(
                 "compress",
                 "compress_output",
@@ -504,6 +553,7 @@ async def compress_to_claims_node(state: ResearcherState) -> dict[str, Any]:
         for q in questions
     ]
     _tag_evidence_gaps(fallback_claims, state["had_real_evidence"])
+    _stamp_extraction_method(fallback_claims, state.get("url_provenance") or {}, lane)
     fallback_event = trace_event(
         "compress",
         "compress_parse_failed",
@@ -558,6 +608,7 @@ async def run_researcher_lane(
         "tool_calls_used": 0,
         "had_real_evidence": False,
         "claims": [],
+        "url_provenance": {},
         "lane_status": "ok",
         "cost_usd": 0.0,
         "trace": [],

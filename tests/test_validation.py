@@ -337,9 +337,9 @@ async def test_v1_supported_claim_yields_info_finding(fake_model):
 
 
 async def test_v1_unsupported_claim_yields_fatal_finding(fake_model):
-    fake_model.queue(AIMessage(content='{"supported": false, "reason": "page never mentions this"}'))
+    fake_model.queue(AIMessage(content='{"verdict": "contradicted", "reason": "page says otherwise"}'))
     claim = _claim(field_name="principal_name", answer="Jane Doe", source_url="http://x")
-    finding, _ = await check_v1_source_supports_claim(claim, "This page is about something else entirely.", fake_model)
+    finding, _ = await check_v1_source_supports_claim(claim, "The firm was dissolved in 2019 and no longer operates.", fake_model)
     assert finding.severity == "fatal"
 
 
@@ -601,7 +601,7 @@ async def test_v1_skips_contact_fields(fake_model):
 async def test_v1_still_runs_on_a_real_sourced_field(fake_model):
     """The scope reductions must not disarm V1 generally — a genuine page-backed claim is
     still checked, and an unsupportive verdict still flips it to contradicted."""
-    fake_model.queue(AIMessage(content='{"supported": false, "reason": "page says otherwise"}'))
+    fake_model.queue(AIMessage(content='{"verdict": "contradicted", "reason": "page says otherwise"}'))
 
     async def _fetch(url):
         return {"content": "page text that disagrees", "credits_spent": 1}
