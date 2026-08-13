@@ -278,9 +278,11 @@ def get_checkpoint(conn: sqlite3.Connection, entity_id: str) -> dict[str, Any] |
 
 
 def get_resumable_leads(conn: sqlite3.Connection) -> list[str]:
-    """Leads left 'running' or 'failed' by an interrupted run — the runner resumes these."""
+    """Leads the runner should pick up again: left 'running' or 'failed' by an interrupted
+    run, or marked 'retry' because their research never completed (all lanes timed out and
+    no claim was produced, so no verdict was recorded — see app.verdict.run_verdict)."""
     rows = conn.execute(
-        "SELECT entity_id FROM lead_checkpoints WHERE status IN ('running', 'failed')"
+        "SELECT entity_id FROM lead_checkpoints WHERE status IN ('running', 'failed', 'retry')"
     ).fetchall()
     return [r["entity_id"] for r in rows]
 

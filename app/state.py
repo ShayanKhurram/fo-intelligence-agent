@@ -244,6 +244,14 @@ class SupervisorState(TypedDict):
     rationale: str | None
     dead_ends: list[str]
     thin_reason: ThinReason | None  # set only on pursue_low — see verdict.compute_thin_reason
+    # Set when the HARD gates would reject purely because research never completed (every
+    # lane hit SETTINGS.researcher.timeout_seconds and returned zero claims). That is an
+    # infrastructure failure, not a finding about the firm, so no verdict is recorded and
+    # the lead is re-queued instead. Observed 2026-08-14: 11 of 30 leads in one batch were
+    # rejected "G1.Q1:unanswered;G1.Q3:unanswered" after 3/3 lanes timed out — including
+    # BILTMORE FAMILY OFFICE (CRD 167174, $3.47B RAUM), whose recorded verdict was that we
+    # could not establish it exists. See app.verdict.run_verdict.
+    retry_reason: str | None
 
 
 def new_supervisor_state(entity_id: str) -> SupervisorState:
@@ -263,6 +271,7 @@ def new_supervisor_state(entity_id: str) -> SupervisorState:
         rationale=None,
         dead_ends=[],
         thin_reason=None,
+        retry_reason=None,
     )
 
 

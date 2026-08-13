@@ -33,6 +33,10 @@ class PreflightError(RuntimeError):
 class BatchResult:
     processed: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
+    # Leads whose research never completed (all lanes timed out, zero claims) and which
+    # were therefore re-queued rather than judged. Kept apart from `processed` — nothing
+    # was assessed — and from `failed`, which means the lead itself errored.
+    retried: list[str] = field(default_factory=list)
     total_cost_usd: float = 0.0
     budget_aborted: bool = False
 
@@ -137,7 +141,18 @@ async def run_batch(
                         SETTINGS.runner.global_budget_usd,
                     )
 
+            retry_reason = final_state.get("retry_reason")
             with connection(db_path) as conn:
+                if retry_reason:
+                    # Research never completed (all lanes timed out, zero claims). Leave the
+                    # lead re-queueable instead of marking it done — `get_resumable_leads`
+                    # picks up 'retry', and the max_lead_attempts cap above stops it looping
+                    # forever. Counted separately from `processed`: nothing was assessed.
+                    upsert_checkpoint(
+                        conn, entity_id, status="retry", last_error=f"research incomplete: {retry_reason}"
+                    )
+                    result.retried.append(entity_id)
+                    return
                 upsert_checkpoint(conn, entity_id, status="verdict_done", cost_usd=lead_cost)
             result.processed.append(entity_id)
 

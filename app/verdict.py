@@ -144,12 +144,72 @@ async def _llm_soft_gate_pass(
     }, cost
 
 
+def _timed_out_lanes(state: SupervisorState) -> list[str]:
+    """Lanes that hit the hard per-lane timeout, read from the trace the lanes already
+    write (`app.researcher.run_researcher_lane` emits a `lane_timeout` event). Reading the
+    trace rather than threading a new counter through SupervisorState keeps this to one
+    module — the evidence is already recorded and already persisted."""
+    return [
+        e.get("lane")
+        for e in (state.get("trace") or [])
+        if e.get("event") == "lane_timeout" and e.get("lane")
+    ]
+
+
+def _rejected_only_because_research_never_ran(
+    state: SupervisorState, gates: dict[str, Any]
+) -> bool:
+    """True when the HARD-gate rejection is attributable to timed-out research rather than
+    to anything learned about the firm.
+
+    Deliberately narrow, because a false positive here means shipping a lead that should
+    have been rejected — the failure this pipeline exists to prevent. All three must hold:
+
+    * at least one lane timed out;
+    * NO claim was produced at all (a lane that timed out after answering something did
+      real work, and whatever it found should stand on its own);
+    * every rejection reason is an `:unanswered` one. A `:contradicted` or a
+      `V5_firm_is_fo` reason is a substantive finding and must still reject, even if a
+      different lane happened to time out.
+    """
+    if not _timed_out_lanes(state):
+        return False
+    if state.get("claims"):
+        return False
+    reasons = [r for r in (gates.get("reason_code") or "").split(";") if r]
+    return bool(reasons) and all(r.endswith(":unanswered") for r in reasons)
+
+
 async def run_verdict(state: SupervisorState) -> dict[str, Any]:
     claims = state["claims"]
     gates = evaluate_hard_gates(claims)
     dead_ends = compute_dead_ends(claims)
 
     if gates["reject"]:
+        if _rejected_only_because_research_never_ran(state, gates):
+            # An infrastructure failure, not a finding. Every lane hit
+            # SETTINGS.researcher.timeout_seconds and returned zero claims, so no question
+            # was ever researched — "unanswered" here means "we never looked", not "we
+            # looked and could not confirm". Recording a rejection would file the lead as
+            # judged, permanently, at ~$0 and invisibly: the reason_code reads exactly like
+            # a considered verdict. Observed 2026-08-14 on 11 of 30 leads in one batch,
+            # BILTMORE FAMILY OFFICE (CRD 167174, $3.47B RAUM) among them, whose recorded
+            # finding was that we could not establish it exists.
+            event = trace_event(
+                "verdict",
+                "retry_research_incomplete",
+                reason_code=gates["reason_code"],
+                gate_results=gates,
+                lanes_timed_out=_timed_out_lanes(state),
+            )
+            return {
+                "verdict": None,
+                "retry_reason": "lane_timeout",
+                "gate_results": gates,
+                "rationale": None,
+                "dead_ends": dead_ends,
+                "trace": [event],
+            }
         event = trace_event("verdict", "code_gate_reject", reason_code=gates["reason_code"], gate_results=gates)
         return {
             "verdict": "reject",
@@ -190,6 +250,13 @@ def persist_verdict(conn: sqlite3.Connection, state: SupervisorState) -> None:
     # decisions/rejections below, so Layer E/V/D never has to re-derive provenance from
     # a decisions row's blob.
     upsert_claims(conn, entity_id, claims)
+    if state.get("retry_reason"):
+        # No verdict was reached — research never completed. Persist the claims and the
+        # trace (the evidence of WHY it is being retried) but write neither a decision nor
+        # a rejection: an unassessed lead must not leave a record that looks assessed. The
+        # runner reads `retry_reason` off the returned state and checkpoints accordingly.
+        write_lead_trace(conn, entity_id, state["trace"])
+        return
     if state["verdict"] == "reject":
         write_rejection(
             conn,
