@@ -174,6 +174,20 @@ QUESTION_FIELD_PROJECTIONS: dict[str, str] = {
     "G3.Q2": "why_now_trigger",
 }
 
+# PLAN.md T28.1: the statuses a Layer-1 question claim may carry and STILL project
+# into a field-name claim. Layer 1 writes `confirmed`; Layer V then rewrites a
+# validated-good claim to `single_source` (confirmed from one source class) or
+# `verified` (cross-class corroborated). Both are *validated-good* and strictly
+# STRONGER evidence than the raw `confirmed` this set already accepts — so the gate
+# must include them, or a `process_entity(..., force=True)` re-run over an
+# already-validated ledger silently drops every researched projection and lets the
+# discovery feed (a FEC donor on a `fec_employer` lead) win `_select_principal_name`.
+# Do NOT collapse this back to a single `== "confirmed"` check — that was T19.3's
+# shortcut and it excluded the validated-good statuses by accident (PLAN.md T28).
+# Everything else stays excluded: `could_not_verify`, `contradicted`, `superseded`,
+# `removed_failed_validation`, `pattern_inferred`, `format_only`.
+_PROJECTABLE_STATUSES: frozenset[str] = frozenset({"confirmed", "single_source", "verified"})
+
 
 def _project_question_claims(claims: list[Claim]) -> list[Claim]:
     """Project Layer-1 question claims into field-name claims the row pivots on
@@ -184,15 +198,16 @@ def _project_question_claims(claims: list[Claim]) -> list[Claim]:
     structured ones are consulted only to decide what is already settled.
 
     For each Layer-1 claim whose question_id is in QUESTION_FIELD_PROJECTIONS (or G2.Q2
-    -> principal_linkedin when subject_value is a linkedin.com/in/ URL), whose status is
-    `confirmed`, and whose subject_value is a non-empty string: emit a _derived_claim
+    -> principal_linkedin when subject_value is a linkedin.com/in/ URL), whose status is in
+    `_PROJECTABLE_STATUSES` (`confirmed` / `single_source` / `verified`), and whose
+    subject_value is a non-empty string: emit a _derived_claim
     with that field_name, answer=subject_value, extraction_method=f"projected_{qid}",
     confidence=`medium`, PRESERVING the original claim's source_url and source_class — the
     researcher's citation must survive the projection so the row stays auditable back to
     the page the fact came from. Skip a field already settled by a higher-confidence
     13F/5500/conference structured derivation. Never project a claim whose status is
-    could_not_verify / contradicted / superseded (the status != "confirmed" guard covers
-    all three)."""
+    could_not_verify / contradicted / superseded (the `status not in
+    _PROJECTABLE_STATUSES` guard covers all three and the other excluded statuses)."""
     settled_by_structured = {
         c.field_name for c in claims
         if c.produced_by == "derived"
@@ -219,7 +234,7 @@ def _project_question_claims(claims: list[Claim]) -> list[Claim]:
         if c is None:
             continue
         qid = c.question_id
-        if not qid or c.status != "confirmed":
+        if not qid or c.status not in _PROJECTABLE_STATUSES:
             continue
         sv = c.subject_value
         if not isinstance(sv, str) or not sv.strip():
