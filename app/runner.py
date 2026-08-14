@@ -18,6 +18,8 @@ from app.db import (
     get_resumable_leads,
     get_unstarted_entities,
     init_db,
+    start_run,
+    finish_run,
     upsert_checkpoint,
 )
 from app.graph import run_lead
@@ -39,6 +41,10 @@ class BatchResult:
     retried: list[str] = field(default_factory=list)
     total_cost_usd: float = 0.0
     budget_aborted: bool = False
+    # T35.1: the durable run identity for this batch, so a provenance log can attribute
+    # every tool call / output field back to the exact execution that produced it. None
+    # only if start_run failed to write — the run is opened before any lead runs.
+    run_id: str | None = None
 
 
 async def preflight(fail_fast: bool = True) -> bool:
@@ -89,6 +95,13 @@ async def run_batch(
 
     queue = _resolve_queue(db_path, entity_ids, resume)
     result = BatchResult()
+    # T35.1: open a `layer1` run and close it in a finally so a raised exception never
+    # leaves a run stuck at status='running'. entity_count is the size of the queue we
+    # are about to process; the outcome counters (processed/failed/retried + spend) are
+    # stamped on close. The run_id is exposed on BatchResult for downstream attribution.
+    with connection(db_path) as conn:
+        run_id = start_run(conn, "layer1", entity_count=len(queue))
+    result.run_id = run_id
     semaphore = asyncio.Semaphore(SETTINGS.runner.concurrency)
     lock = asyncio.Lock()
     warned = False
@@ -156,5 +169,22 @@ async def run_batch(
                 upsert_checkpoint(conn, entity_id, status="verdict_done", cost_usd=lead_cost)
             result.processed.append(entity_id)
 
-    await asyncio.gather(*(process_one(eid) for eid in queue))
-    return result
+    try:
+        await asyncio.gather(*(process_one(eid) for eid in queue))
+        notes = {
+            "processed": len(result.processed),
+            "failed": len(result.failed),
+            "retried": len(result.retried),
+            "total_cost_usd": result.total_cost_usd,
+            "budget_aborted": result.budget_aborted,
+        }
+        with connection(db_path) as conn:
+            finish_run(conn, run_id, status="done", notes=notes)
+        return result
+    except Exception:
+        # Any unhandled exception (not a per-lead crash — those are caught inside
+        # process_one — but e.g. KeyboardInterrupt, preflight re-raising, gather
+        # cancellation) must still close the run as failed, never leave it running.
+        with connection(db_path) as conn:
+            finish_run(conn, run_id, status="failed")
+        raise

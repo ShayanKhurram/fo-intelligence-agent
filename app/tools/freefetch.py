@@ -16,6 +16,8 @@ from typing import Any
 import httpx
 import trafilatura
 
+from app.toollog import logged
+
 _HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; FO-Intelligence-Agent/1.0; +research)"}
 _MIN_CONTENT_CHARS = 200
 
@@ -38,6 +40,7 @@ async def free_fetch_raw(url: str) -> dict[str, Any] | None:
     return {"url": url, "content": text.strip()}
 
 
+@logged("fetch_raw_html")
 async def fetch_raw_html(url: str) -> str | None:
     """Unextracted HTML — free, same GET as free_fetch_raw but without running it
     through trafilatura, which strips <script> blocks (including JSON-LD) as part of
@@ -53,6 +56,7 @@ async def fetch_raw_html(url: str) -> str | None:
         return None
 
 
+@logged("fetch_page_free_first")
 async def fetch_page_free_first(url: str, fallback=None) -> dict[str, Any]:
     """Tries the cheap httpx+trafilatura path first, then escalates.
 

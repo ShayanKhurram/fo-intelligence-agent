@@ -54,6 +54,7 @@ import httpx
 from app.config import SETTINGS
 from app.tools.keyrotation import is_exhaustion_response
 from app.tools.ratelimit import SNOV_BUCKET
+from app.toollog import logged
 
 logger = logging.getLogger(__name__)
 
@@ -294,6 +295,7 @@ async def snov_li_profiles_by_urls_raw(urls: list[str]) -> dict[str, Any]:
     )
 
 
+@logged("snov_emails_by_name_domain_raw")
 async def snov_emails_by_name_domain_raw(
     first_name: str, last_name: str, domain: str
 ) -> dict[str, Any]:
@@ -314,6 +316,7 @@ async def snov_emails_by_name_domain_raw(
     )
 
 
+@logged("snov_domain_search_raw")
 async def snov_domain_search_raw(domain: str) -> dict[str, Any]:
     """Every known address on a domain — the closest analogue to Hunter's domain search,
     used as the fallback when a name-targeted lookup finds nothing."""

@@ -1,0 +1,58 @@
+# Render blueprint — FO Intelligence Agent (T36).
+#
+# ONE service, not two, and that is a deliberate architectural choice rather than a
+# simplification: the pipeline's entire state is a SQLite file (`data/foia.db` — entities,
+# claims, runs, the provenance log, the scheduler's own tables), and a Render disk mounts
+# to exactly one service. A separate Render Cron Job or background worker would get its
+# own filesystem and therefore its own empty database. So the scheduler runs as an asyncio
+# task inside the web service (see app/api.py's lifespan and app/scheduler.scheduler_loop),
+# armed by FOIA_SCHEDULER=1 below.
+#
+# Consequences worth knowing before deploying:
+#   * The disk makes this a single-instance service. Do not scale it past 1 — two
+#     instances would mean two schedulers firing the same standing orders, and SQLite
+#     across two writers.
+#   * Render's free tier spins a service down when idle; a spun-down service runs no
+#     scheduler. Use a paid instance type if the schedule must actually fire unattended.
+#   * The disk survives deploys and restarts. Losing it loses every lead ever qualified,
+#     so keep the mount path stable.
+
+services:
+  - type: web
+    name: fo-intelligence-agent
+    runtime: python
+    plan: starter            # NOT free: a spun-down instance never fires a schedule
+    region: oregon
+    branch: main
+    numInstances: 1          # see the note above — never raise this
+    buildCommand: pip install -r requirements.txt
+    # 1 worker for the same reason as 1 instance: one scheduler, one SQLite writer.
+    startCommand: uvicorn app.api:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /api/scheduler/status
+    disk:
+      name: foia-data
+      mountPath: /var/data
+      sizeGB: 5
+    envVars:
+      - key: FOIA_DB_PATH
+        value: /var/data/foia.db          # on the persistent disk, not the ephemeral fs
+      - key: FOIA_SCHEDULER
+        value: "1"                        # arm the in-process scheduler loop
+      - key: FOIA_SCHEDULER_POLL_SECONDS
+        value: "60"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+
+      # --- secrets: set these in the Render dashboard, never in this file ---
+      - key: OLLAMA_API_KEY               # the LLM provider (app/llm.py)
+        sync: false
+      - key: SERPER_API_KEY               # web_search / fetch_page — the one hard dependency
+        sync: false
+      - key: SNOV_CLIENT_ID
+        sync: false
+      - key: SNOV_CLIENT_SECRET
+        sync: false
+      - key: SCRAPEOPS_API_KEY            # vendor/linkedin_scraper
+        sync: false
+      - key: DATABASE_URL                 # micro-RAG Postgres; unset = RAG ingest stays queued
+        sync: false

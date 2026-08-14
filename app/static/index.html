@@ -385,6 +385,155 @@
     font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
   }
   .estimate .lbl { color: var(--text-dim); }
+
+  /* ---- tabs (T36): Run | Log ---- */
+  nav.tabs {
+    display: flex;
+    gap: 0.4rem;
+    border-bottom: 1px solid var(--line);
+    margin-bottom: 1.6rem;
+  }
+  nav.tabs button {
+    font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.78rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    padding: 0.55rem 0.9rem;
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text-dim);
+    cursor: pointer;
+  }
+  nav.tabs button[aria-selected="true"] {
+    color: var(--accent-text);
+    border-bottom-color: var(--accent);
+    font-weight: 700;
+  }
+
+  /* ---- scheduler panel ---- */
+  .sched-panel {
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--paper-soft);
+    padding: 1.1rem;
+    margin-bottom: 1.6rem;
+  }
+  .sched-panel h2, .log-section h2 {
+    font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.82rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin: 0 0 0.8rem;
+    color: var(--accent-text);
+  }
+  .sched-status {
+    font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.78rem;
+    color: var(--text-dim);
+    margin: 0 0 0.9rem;
+  }
+  .sched-form {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: flex-end;
+    margin-top: 0.9rem;
+    padding-top: 0.9rem;
+    border-top: 1px solid var(--line);
+  }
+  /* `display: flex` beats the [hidden] attribute's default display:none, so the
+     daily/interval fields both showed at once. Restore it explicitly. */
+  .sched-form label[hidden] { display: none; }
+  .sched-form label {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--text-dim);
+  }
+  .sched-form input, .sched-form select {
+    font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.85rem;
+    padding: 0.4rem 0.5rem;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    background: var(--paper);
+    color: var(--text);
+    min-width: 7rem;
+  }
+  .sched-list { font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace; }
+  .sched-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: center;
+    padding: 0.55rem 0;
+    border-bottom: 1px solid var(--line);
+    font-size: 0.82rem;
+  }
+  .sched-row:last-child { border-bottom: none; }
+  .sched-row .nm { font-weight: 700; }
+  .sched-row .spec { color: var(--text-dim); }
+  .sched-row .spacer { flex: 1; }
+  .mini-btn {
+    font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.7rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 0.28rem 0.55rem;
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    background: var(--paper);
+    color: var(--text);
+    cursor: pointer;
+  }
+  .mini-btn:hover { border-color: var(--accent); color: var(--accent-text); }
+  .mini-btn.danger:hover { border-color: var(--reject); color: var(--reject); }
+
+  /* ---- run log drill-down: run -> leads -> field logs ---- */
+  .log-section { font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace; }
+  .run-row summary, .loglead summary {
+    list-style: none;
+    display: flex;
+    gap: 0.6rem;
+    align-items: center;
+    padding: 0.6rem 0.2rem;
+    border-bottom: 1px solid var(--line);
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
+  .run-row summary::-webkit-details-marker, .loglead summary::-webkit-details-marker { display: none; }
+  .run-row summary:hover, .loglead summary:hover { color: var(--accent-text); }
+  .run-row .when { font-variant-numeric: tabular-nums; }
+  .run-row .kind, .loglead .eid { color: var(--text-dim); font-size: 0.78rem; }
+  .run-row .spacer, .loglead .spacer { flex: 1; }
+  .run-body, .loglead-body { padding: 0.3rem 0 0.6rem 1rem; }
+  .pill.scheduled { background: var(--pursue-low-bg); color: var(--pursue-low); }
+  .pill.done { background: var(--pursue-bg); color: var(--pursue); }
+  .pill.ship, .pill.ship_with_caveats { background: var(--pursue-bg); color: var(--pursue); }
+  .pill.target_reached { background: var(--pursue-bg); color: var(--pursue); }
+  .pill.leads_exhausted, .pill.max_leads_reached { background: var(--pursue-low-bg); color: var(--pursue-low); }
+
+  .fieldlog {
+    border-left: 2px solid var(--line);
+    padding: 0.45rem 0 0.45rem 0.7rem;
+    margin: 0.5rem 0;
+    font-size: 0.8rem;
+  }
+  .fieldlog.shipped { border-left-color: var(--pursue); }
+  .fieldlog.blank { border-left-color: var(--text-dim); }
+  .fieldlog .fname { font-weight: 700; }
+  .fieldlog .fval { color: var(--accent-text); }
+  .fieldlog .fval.empty { color: var(--text-dim); font-style: italic; }
+  .fieldlog .how { color: var(--text-dim); margin-top: 0.2rem; }
+  .fieldlog .meta { color: var(--text-dim); font-size: 0.72rem; margin-top: 0.2rem; }
+  .fieldlog a { color: var(--accent-text); }
+  .fieldlog ul { margin: 0.25rem 0 0; padding-left: 1.1rem; color: var(--text-dim); font-size: 0.74rem; }
+  .empty-note { color: var(--text-dim); font-size: 0.82rem; padding: 0.6rem 0; }
+
   button.start-btn {
     font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
     font-size: 0.92rem;
@@ -423,6 +572,12 @@
     <p class="subhead">Run the research-layer graph across a slice of the discovery feed and watch each lead qualify in real time — supervisor turns, lane dispatches, tool calls, and the final verdict.</p>
   </header>
 
+  <nav class="tabs" role="tablist">
+    <button id="tab-btn-run" role="tab" aria-selected="true" aria-controls="tab-run">Run</button>
+    <button id="tab-btn-log" role="tab" aria-selected="false" aria-controls="tab-log">Log</button>
+  </nav>
+
+  <div id="tab-run">
   <!-- start view -->
   <section id="start-view">
     <div class="start-card">
@@ -442,6 +597,36 @@
   <section id="results-view" hidden>
     <div class="summary-bar" id="summary-bar"></div>
     <div class="leads" id="leads"></div>
+  </section>
+  </div><!-- /tab-run -->
+
+  <!-- log tab (T36): schedules + every run, drilling down to per-field provenance -->
+  <section id="tab-log" hidden>
+    <div class="sched-panel">
+      <h2>Scheduler</h2>
+      <p class="sched-status" id="sched-status">loading…</p>
+      <div class="sched-list" id="sched-list"></div>
+      <div class="sched-form">
+        <label>Name<input type="text" id="s-name" placeholder="nightly"></label>
+        <label>When
+          <select id="s-kind">
+            <option value="daily">Daily at</option>
+            <option value="interval">Every N minutes</option>
+          </select>
+        </label>
+        <label id="s-time-wrap">Time (UTC)<input type="time" id="s-time" value="03:00"></label>
+        <label id="s-interval-wrap" hidden>Minutes<input type="number" id="s-interval" min="1" value="60"></label>
+        <label>Stop at N confirmed<input type="number" id="s-target" min="1" placeholder="10"></label>
+        <label>Max leads<input type="number" id="s-max" min="1" placeholder="50"></label>
+        <button class="mini-btn" id="s-create">Add schedule</button>
+      </div>
+      <p class="err-msg" id="sched-err" hidden></p>
+    </div>
+
+    <div class="log-section">
+      <h2>Runs</h2>
+      <div id="runs-list"><p class="empty-note">loading…</p></div>
+    </div>
   </section>
 </main>
 
@@ -693,6 +878,267 @@
         pollTimer = null;
       }
     } catch (e) { /* keep polling on transient errors */ }
+  }
+
+  // ================= Log tab (T36) =================
+  // Three levels, each loaded lazily on expand so opening the tab costs one request:
+  //   runs  ->  the leads that run touched  ->  that lead's per-field provenance.
+  const tabBtnRun = document.getElementById('tab-btn-run');
+  const tabBtnLog = document.getElementById('tab-btn-log');
+  const tabRun = document.getElementById('tab-run');
+  const tabLog = document.getElementById('tab-log');
+  const schedStatus = document.getElementById('sched-status');
+  const schedList = document.getElementById('sched-list');
+  const schedErr = document.getElementById('sched-err');
+  const runsList = document.getElementById('runs-list');
+  let logLoaded = false;
+
+  function selectTab(which) {
+    const isLog = which === 'log';
+    tabBtnRun.setAttribute('aria-selected', String(!isLog));
+    tabBtnLog.setAttribute('aria-selected', String(isLog));
+    tabRun.hidden = isLog;
+    tabLog.hidden = !isLog;
+    if (isLog && !logLoaded) { logLoaded = true; refreshScheduler(); refreshRuns(); }
+  }
+  tabBtnRun.addEventListener('click', () => selectTab('run'));
+  tabBtnLog.addEventListener('click', () => selectTab('log'));
+
+  const kindSel = document.getElementById('s-kind');
+  kindSel.addEventListener('change', () => {
+    const daily = kindSel.value === 'daily';
+    document.getElementById('s-time-wrap').hidden = !daily;
+    document.getElementById('s-interval-wrap').hidden = daily;
+  });
+
+  function fmtWhen(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    if (isNaN(d)) return iso;
+    return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+  }
+  function scheduleSpec(s) {
+    return s.kind === 'interval'
+      ? 'every ' + s.interval_minutes + ' min'
+      : 'daily at ' + (s.time_utc || '??:??') + ' UTC';
+  }
+  function stopRule(s) {
+    const bits = [];
+    if (s.target_confirmed) bits.push('stop at ' + s.target_confirmed + ' confirmed');
+    if (s.max_leads) bits.push('max ' + s.max_leads + ' leads');
+    // No target and no cap is a legitimate choice: run until the lead queue is empty.
+    return bits.length ? bits.join(' · ') : 'until leads run out';
+  }
+
+  async function refreshScheduler() {
+    try {
+      const [st, sc] = await Promise.all([
+        fetch('/api/scheduler/status').then(r => r.json()),
+        fetch('/api/schedules').then(r => r.json()),
+      ]);
+      const rag = st.rag_queue || {};
+      const ragBits = Object.keys(rag).length
+        ? Object.entries(rag).map(([k, v]) => v + ' ' + k).join(', ')
+        : 'empty';
+      schedStatus.textContent =
+        'loop ' + (st.loop_running ? 'running' : (st.enabled ? 'starting…' : 'not running (set FOIA_SCHEDULER=1)')) +
+        ' · next due ' + (st.next_due ? fmtWhen(st.next_due.next_run_at) + ' (' + st.next_due.name + ')' : '—') +
+        ' · RAG queue: ' + ragBits;
+      const rows = sc.schedules || [];
+      schedList.innerHTML = rows.length ? '' : '<p class="empty-note">No schedules yet.</p>';
+      rows.forEach(s => {
+        const row = document.createElement('div');
+        row.className = 'sched-row';
+        row.innerHTML =
+          '<span class="nm">' + esc(s.name) + '</span>' +
+          '<span class="spec">' + esc(scheduleSpec(s)) + ' · ' + esc(stopRule(s)) + '</span>' +
+          '<span class="pill ' + (s.enabled ? 'pursue' : 'queued') + '">' + (s.enabled ? 'enabled' : 'paused') + '</span>' +
+          '<span class="spec">next ' + esc(fmtWhen(s.next_run_at)) + '</span>' +
+          '<span class="spacer"></span>' +
+          '<button class="mini-btn" data-act="run">Run now</button>' +
+          '<button class="mini-btn" data-act="toggle">' + (s.enabled ? 'Pause' : 'Enable') + '</button>' +
+          '<button class="mini-btn danger" data-act="del">Delete</button>';
+        row.querySelector('[data-act="run"]').addEventListener('click', async () => {
+          await fetch('/api/schedules/' + s.schedule_id + '/run-now', { method: 'POST' });
+          schedStatus.textContent = 'run started for "' + s.name + '" — refresh the runs list in a moment';
+          setTimeout(refreshRuns, 1500);
+        });
+        row.querySelector('[data-act="toggle"]').addEventListener('click', async () => {
+          await fetch('/api/schedules/' + s.schedule_id, {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: !s.enabled }),
+          });
+          refreshScheduler();
+        });
+        row.querySelector('[data-act="del"]').addEventListener('click', async () => {
+          await fetch('/api/schedules/' + s.schedule_id, { method: 'DELETE' });
+          refreshScheduler();
+        });
+        schedList.appendChild(row);
+      });
+    } catch (e) {
+      schedStatus.textContent = 'scheduler status unavailable';
+    }
+  }
+
+  document.getElementById('s-create').addEventListener('click', async () => {
+    schedErr.hidden = true;
+    const kind = kindSel.value;
+    const body = {
+      name: document.getElementById('s-name').value || 'schedule',
+      kind: kind,
+      time_utc: kind === 'daily' ? document.getElementById('s-time').value : null,
+      interval_minutes: kind === 'interval' ? parseInt(document.getElementById('s-interval').value, 10) : null,
+      target_confirmed: parseInt(document.getElementById('s-target').value, 10) || null,
+      max_leads: parseInt(document.getElementById('s-max').value, 10) || null,
+    };
+    const r = await fetch('/api/schedules', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      schedErr.hidden = false;
+      schedErr.textContent = d.detail || ('could not create schedule (' + r.status + ')');
+      return;
+    }
+    document.getElementById('s-name').value = '';
+    refreshScheduler();
+  });
+
+  async function refreshRuns() {
+    try {
+      const d = await fetch('/api/runs?limit=50').then(r => r.json());
+      const runs = d.runs || [];
+      runsList.innerHTML = runs.length ? '' : '<p class="empty-note">No runs recorded yet.</p>';
+      runs.forEach(run => {
+        const n = run.notes || {};
+        const det = document.createElement('details');
+        det.className = 'run-row';
+        const termination = n.termination ? '<span class="pill ' + esc(n.termination) + '">' + esc(n.termination) + '</span>' : '';
+        det.innerHTML =
+          '<summary>' +
+            '<span class="when">' + esc(fmtWhen(run.started_at)) + '</span>' +
+            '<span class="kind">' + esc(run.kind) + (n.schedule_name ? ' · ' + esc(n.schedule_name) : '') + '</span>' +
+            '<span class="pill ' + esc(run.status) + '">' + esc(run.status) + '</span>' +
+            termination +
+            '<span class="spacer"></span>' +
+            '<span class="kind">' +
+              (n.processed != null ? n.processed + ' processed' : run.entity_count + ' queued') +
+              (n.confirmed != null ? ' · ' + n.confirmed + ' confirmed' : '') +
+            '</span>' +
+          '</summary>' +
+          '<div class="run-body"><p class="empty-note">loading leads…</p></div>';
+        const body = det.querySelector('.run-body');
+        let loaded = false;
+        det.addEventListener('toggle', async () => {
+          if (!det.open || loaded) return;
+          loaded = true;
+          await loadRunLeads(run.run_id, body);
+        });
+        runsList.appendChild(det);
+      });
+    } catch (e) {
+      runsList.innerHTML = '<p class="empty-note">could not load runs</p>';
+    }
+  }
+
+  async function loadRunLeads(runId, container) {
+    try {
+      const d = await fetch('/api/runs/' + encodeURIComponent(runId)).then(r => r.json());
+      const leads = d.leads || [];
+      if (!leads.length) {
+        container.innerHTML = '<p class="empty-note">No lead provenance recorded for this run.</p>';
+        return;
+      }
+      container.innerHTML = '';
+      leads.forEach(lead => {
+        const det = document.createElement('details');
+        det.className = 'loglead';
+        det.innerHTML =
+          '<summary>' +
+            '<span>' + esc(lead.canonical_name) + '</span>' +
+            '<span class="eid">' + esc(lead.entity_id) + '</span>' +
+            '<span class="spacer"></span>' +
+            '<span class="eid">' + lead.shipped_count + '/' + lead.field_count + ' fields populated</span>' +
+          '</summary>' +
+          '<div class="loglead-body"><p class="empty-note">loading field log…</p></div>';
+        const body = det.querySelector('.loglead-body');
+        let loaded = false;
+        det.addEventListener('toggle', async () => {
+          if (!det.open || loaded) return;
+          loaded = true;
+          await loadFieldLog(runId, lead.entity_id, body);
+        });
+        container.appendChild(det);
+      });
+    } catch (e) {
+      container.innerHTML = '<p class="empty-note">could not load leads for this run</p>';
+    }
+  }
+
+  function renderFieldRecord(rec) {
+    const how = rec.how || {};
+    const shipped = rec.value !== null && rec.value !== undefined && rec.value !== '';
+    const valHtml = shipped
+      ? '<span class="fval">' + esc(truncate(String(rec.value), 220)) + '</span>'
+      : '<span class="fval empty">(blank)</span>';
+    let out =
+      '<div class="fieldlog ' + (shipped ? 'shipped' : 'blank') + '">' +
+        '<div><span class="fname">' + esc(rec.field) + '</span> — ' + valHtml +
+        ' <span class="pill status-' + esc(rec.status) + '">' + esc(rec.status) + '</span></div>';
+    if (shipped) {
+      out += '<div class="how">' + esc(how.summary || '') + '</div>';
+      const bits = [];
+      if (how.wave) bits.push('wave ' + esc(how.wave));
+      if (how.question_id) bits.push(esc(how.question_id));
+      if (how.extraction_method) bits.push(esc(how.extraction_method));
+      if (how.source_class) bits.push(esc(how.source_class));
+      if (how.retrieved_at) bits.push(esc(String(how.retrieved_at).slice(0, 19)));
+      out += '<div class="meta">' + bits.join(' · ') +
+        (how.source_url ? ' · <a href="' + esc(how.source_url) + '" target="_blank" rel="noopener">source</a>' : '') +
+        '</div>';
+      (how.also_produced_by || []).forEach(p => {
+        out += '<div class="meta">also from ' + esc(p.source_class || p.extraction_method || '') +
+          (p.source_url ? ' · <a href="' + esc(p.source_url) + '" target="_blank" rel="noopener">source</a>' : '') + '</div>';
+      });
+    } else if (rec.blank_reason) {
+      // Why a cell is empty is the half of the story a spreadsheet cannot tell.
+      out += '<div class="how">' + esc(rec.blank_reason.code) + ' — ' + esc(rec.blank_reason.detail || '') + '</div>';
+    }
+    const calls = rec.tool_calls || [];
+    if (calls.length) {
+      out += '<ul>' + calls.slice(0, 6).map(tc =>
+        '<li>' + esc(tc.tool) + '(' + esc(truncate(JSON.stringify(tc.args || {}), 90)) + ') → ' +
+        esc(tc.result_summary || '') + (tc.ok ? '' : ' [failed]') + (tc.cache_hit ? ' [cached]' : '') + '</li>'
+      ).join('') + '</ul>';
+    }
+    const alts = rec.alternatives || [];
+    if (alts.length) {
+      out += '<ul>' + alts.slice(0, 6).map(a =>
+        '<li>rejected: ' + esc(truncate(String(a.value), 80)) + ' — ' + esc(a.why_not_used) +
+        (a.source_class ? ' (' + esc(a.source_class) + ')' : '') + '</li>'
+      ).join('') + '</ul>';
+    }
+    const checks = rec.checks || [];
+    if (checks.length) {
+      out += '<ul>' + checks.slice(0, 6).map(c =>
+        '<li>check ' + esc(c.check_id) + ': ' + esc(c.severity) + (c.detail ? ' — ' + esc(truncate(c.detail, 90)) : '') + '</li>'
+      ).join('') + '</ul>';
+    }
+    return out + '</div>';
+  }
+
+  async function loadFieldLog(runId, entityId, container) {
+    try {
+      const d = await fetch('/api/runs/' + encodeURIComponent(runId) + '/provenance?entity_id=' +
+                            encodeURIComponent(entityId)).then(r => r.json());
+      const recs = d.records || [];
+      container.innerHTML = recs.length
+        ? recs.map(renderFieldRecord).join('')
+        : '<p class="empty-note">No field log for this lead in this run.</p>';
+    } catch (e) {
+      container.innerHTML = '<p class="empty-note">could not load the field log</p>';
+    }
   }
 
   startBtn.addEventListener('click', async () => {

@@ -197,3 +197,111 @@ CREATE TABLE IF NOT EXISTS production_records (
 );
 
 CREATE INDEX IF NOT EXISTS idx_production_records_entity ON production_records(entity_id);
+
+-- ============================================================================
+-- T35 — per-run field provenance log (PLAN.md T35). `runs` is the durable identity
+-- of one execution of any of the pipeline's layers (layer1 / enrichment / dataset /
+-- api): started_at/ended_at, status, and a free-form JSON `notes` blob for the
+-- layer-specific outcome counters. `tool_calls` records every external tool call
+-- enrichment makes while processing an entity, attributed to a run + entity + wave,
+-- so each output lead field can later be traced back to the exact call that
+-- produced it. New tables, additive only — no migration of existing rows.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS runs (
+    run_id       TEXT PRIMARY KEY,
+    kind         TEXT NOT NULL,                  -- layer1 | enrichment | dataset | api
+    status       TEXT NOT NULL DEFAULT 'running',-- running | done | failed
+    git_sha      TEXT,
+    entity_count INTEGER NOT NULL DEFAULT 0,
+    started_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    ended_at     TEXT,
+    notes        TEXT NOT NULL DEFAULT '{}'      -- JSON
+);
+
+CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
+
+CREATE TABLE IF NOT EXISTS tool_calls (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id         TEXT,
+    entity_id      TEXT NOT NULL,
+    wave           TEXT,
+    tool           TEXT NOT NULL,
+    args           TEXT NOT NULL DEFAULT '{}',   -- JSON, redacted
+    ok             INTEGER NOT NULL DEFAULT 1,
+    error          TEXT,
+    result_summary TEXT,
+    result_url     TEXT,
+    cache_hit      INTEGER NOT NULL DEFAULT 0,
+    duration_ms    INTEGER,
+    called_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_calls_entity ON tool_calls(entity_id, called_at);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_run ON tool_calls(run_id);
+
+-- T35.5 — the persisted, per-run field provenance log (PLAN.md T35.5). One row per
+-- (run_id, entity_id, field): the scalar columns let the web page filter/sort without
+-- parsing the JSON blob, and `record` is the full schema_version-1 JSON the page renders.
+-- Re-running a run_id upserts (UNIQUE on run_id+entity_id+field) rather than duplicating —
+-- the log is immutable per run, snapshotted at emission (PLAN.md T35 point 2).
+CREATE TABLE IF NOT EXISTS field_provenance (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id            TEXT NOT NULL,
+    entity_id         TEXT NOT NULL,
+    field             TEXT NOT NULL,
+    value             TEXT,
+    status            TEXT,
+    shipped           INTEGER NOT NULL DEFAULT 0,
+    source_class      TEXT,
+    extraction_method TEXT,
+    record            TEXT NOT NULL,            -- the full JSON record
+    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(run_id, entity_id, field)
+);
+
+CREATE INDEX IF NOT EXISTS idx_field_provenance_entity ON field_provenance(entity_id);
+
+-- ============================================================================
+-- T36 — the scheduler (PLAN.md T36). `schedules` holds the user's standing orders:
+-- when to run, how many confirmed leads to stop at, and a hard cap on how many leads
+-- may be processed. A scheduled execution writes an ordinary `runs` row with
+-- kind='scheduled' (so the Log tab, the provenance log and the API all treat it like
+-- any other run) whose `notes` carry the schedule_id, the counters and — the part that
+-- matters for reading a log months later — WHY it stopped.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS schedules (
+    schedule_id      TEXT PRIMARY KEY,
+    name             TEXT NOT NULL,
+    kind             TEXT NOT NULL DEFAULT 'daily',   -- daily | interval
+    time_utc         TEXT,                            -- 'HH:MM', kind='daily'
+    interval_minutes INTEGER,                         -- kind='interval'
+    target_confirmed INTEGER,                         -- stop once this many leads confirm; NULL = no target
+    max_leads        INTEGER,                         -- hard cap on leads processed; NULL = until the queue empties
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    last_run_at      TEXT,
+    next_run_at      TEXT,
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_schedules_next ON schedules(enabled, next_run_at);
+
+-- T36.3 — leads awaiting micro-RAG ingestion. Written the moment a lead confirms (a
+-- local, microsecond SQLite write in the run's path); drained separately against
+-- Postgres + the embedding model, which are remote, optional and allowed to be down.
+-- A failed drain leaves the row 'pending' so the work is delayed, never dropped.
+-- UNIQUE(entity_id): a lead re-confirmed by a later run resets to pending so the fresher
+-- ledger is re-ingested (the RAG upserts by record_id — a correction, not a duplicate).
+CREATE TABLE IF NOT EXISTS rag_queue (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_id    TEXT NOT NULL UNIQUE,
+    run_id       TEXT,
+    status       TEXT NOT NULL DEFAULT 'pending',  -- pending | done | failed | stale
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    last_error   TEXT,
+    enqueued_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    completed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_rag_queue_status ON rag_queue(status, enqueued_at);

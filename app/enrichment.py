@@ -14,11 +14,14 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
+import logging
+import os
 import re as _re
 import sqlite3
 import uuid as _uuid
 from datetime import date, datetime, timezone
 from typing import Any
+from pathlib import Path
 from urllib.parse import urlsplit as _urlsplit
 
 import phonenumbers
@@ -37,6 +40,8 @@ from app.db import (
     write_field_status,
     write_finding,
     write_rejection,
+    start_run,
+    finish_run,
 )
 from app.config import SETTINGS
 from app.llm import get_model
@@ -47,7 +52,12 @@ from app.validation import run_validation
 # (app.dataset._records_rows), so the wave -1 view of "which principal won" can never
 # drift from the row's view. `_provenance_rank` is a pure longest-prefix-match helper;
 # importing it (rather than re-implementing) is what guarantees the no-drift property.
-from app.dataset import _provenance_rank
+from app.dataset import _provenance_rank, _atomic_write_json
+# T35.2: bind the tool-call provenance context around each entity's enrichment so every
+# external tool call made while processing waves 0-2 is attributed to the right entity +
+# run. Outside a bound context the recorder is a silent no-op, so process_entity called
+# directly from tests (no run) is unaffected.
+from app.toollog import tool_log_context
 from app.tools.adv import distinctive_name_tokens
 from app.tools.edgar import edgar_full_text_search_raw
 from app.tools.freefetch import fetch_page_free_first, fetch_raw_html
@@ -67,6 +77,8 @@ from app.validation import (
 # pass-through whose payload may carry a "people" list of unknown-but-conventional shape
 # (name/full_name, title/occupation/role) — see _principal_from_people below.
 _STRUCTURED_CLASSES = {"13f_filing", "5500_filing", "conference_sighting", "domain_check", "adv_index"}
+
+logger = logging.getLogger(__name__)
 
 # |QoQ 13F value change| at or above this triggers an important_insight claim. Chosen as a
 # deliberately conservative threshold — an important_insight is a claim the row ships, so
@@ -2068,7 +2080,8 @@ def _db_path_from_conn(conn: sqlite3.Connection) -> str:
 
 
 async def _process_entities_concurrently(
-    entity_ids: list[str], model: Any, db_path: str, concurrency: int, *, force: bool = False
+    entity_ids: list[str], model: Any, db_path: str, concurrency: int, *, force: bool = False,
+    run_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Runs process_entity() for each entity_id with bounded concurrency (same pattern
     as app.runner.run_batch's batch dispatch) — each call opens its own connection via
@@ -2078,13 +2091,24 @@ async def _process_entities_concurrently(
 
     `force=True` propagates to process_entity's `force`, re-running entities that already
     have an enrichment_runs row (needed when gate logic changed and prior outcomes must be
-    recomputed, not replayed from cache)."""
+    recomputed, not replayed from cache).
+
+    `run_id` (T35.2) binds a tool_log_context around each entity's processing so every
+    external tool call enrichment makes is attributed to the right entity + run. Bound
+    here — the narrowest place that covers all of waves 0-2 + Layer V without changing
+    process_entity's signature (which tests call directly). The wave is left None: an
+    unattributed wave is a small loss, a restructure of process_entity is a big risk."""
     semaphore = asyncio.Semaphore(concurrency)
 
     async def _bounded(entity_id: str) -> dict[str, Any]:
         async with semaphore:
             with connection(db_path) as isolated_conn:
-                return await process_entity(isolated_conn, entity_id, model, force=force)
+                # Bind for the whole per-entity body (waves 0-2 + Layer V). Outside a
+                # bound context (run_id is None — direct process_entity calls in tests)
+                # tool_log_context still works but the recorder is a no-op, so no test
+                # that calls these tools unmodified is affected.
+                with tool_log_context(entity_id, run_id=run_id, db_path=db_path):
+                    return await process_entity(isolated_conn, entity_id, model, force=force)
 
     return list(await asyncio.gather(*[_bounded(eid) for eid in entity_ids]))
 
@@ -2124,73 +2148,124 @@ async def run_pipeline(
 
     decisions = get_decisions_by_verdict(conn, ["pursue", "pursue_low"])
 
-    minus1_by_entity: dict[str, list[Claim]] = {}
-    for d in decisions:
-        entity_id = d["entity_id"]
-        entity = get_entity(conn, entity_id)
-        sources = get_entity_sources(conn, entity_id)
-        claims = wave_minus_1(sources, entity["canonical_name"], entity["aliases"], entity_id=entity_id,
-                              layer1_claims=[_claim_from_row(r) for r in get_claims(conn, entity_id)])
-        minus1_by_entity[entity_id] = claims
-        upsert_claims(conn, entity_id, [c.model_dump(mode="json") for c in claims])
+    # T35.1: open an `enrichment` run for this pipeline execution so every tool call
+    # made while processing the pursue queue + reserve draws can be attributed to it
+    # (run_id is threaded into _process_entities_concurrently -> tool_log_context). The
+    # run row is written on the caller's `conn` and committed with the wave -1 writes
+    # below, so it's visible to the isolated connections the concurrent workers open.
+    run_id = start_run(conn, "enrichment", entity_count=len(decisions))
+    try:
+        minus1_by_entity: dict[str, list[Claim]] = {}
+        for d in decisions:
+            entity_id = d["entity_id"]
+            entity = get_entity(conn, entity_id)
+            sources = get_entity_sources(conn, entity_id)
+            claims = wave_minus_1(sources, entity["canonical_name"], entity["aliases"], entity_id=entity_id,
+                                  layer1_claims=[_claim_from_row(r) for r in get_claims(conn, entity_id)])
+            minus1_by_entity[entity_id] = claims
+            upsert_claims(conn, entity_id, [c.model_dump(mode="json") for c in claims])
 
-    # Commit now, before any concurrent processing starts: `conn` is the CALLER's
-    # connection (only committed when their own `with connection()` block eventually
-    # exits, i.e. after this whole function returns) — if its wave -1 writes above stay
-    # uncommitted while _process_entities_concurrently opens NEW connections to the
-    # same file, SQLite's single-writer lock deadlocks (the new connections block
-    # waiting for `conn` to release the write lock, which never happens until this
-    # function returns, which never happens until they succeed). Found live 2026-07-29
-    # adding concurrent processing — see PROJECT_LOG.md.
-    conn.commit()
+        # Commit now, before any concurrent processing starts: `conn` is the CALLER's
+        # connection (only committed when their own `with connection()` block eventually
+        # exits, i.e. after this whole function returns) — if its wave -1 writes above stay
+        # uncommitted while _process_entities_concurrently opens NEW connections to the
+        # same file, SQLite's single-writer lock deadlocks (the new connections block
+        # waiting for `conn` to release the write lock, which never happens until this
+        # function returns, which never happens until they succeed). Found live 2026-07-29
+        # adding concurrent processing — see PROJECT_LOG.md. The run row opened above is
+        # committed here too, so the concurrent workers' tool_calls (which reference it by
+        # run_id) point at a row the caller can already see.
+        conn.commit()
 
-    pursue_queue: list[str] = []
-    reserve_pool: list[dict[str, Any]] = []
-    for d in decisions:
-        current = [_claim_from_row(r) for r in get_claims(conn, d["entity_id"])]
-        if d["verdict"] == "pursue" or _is_promotable(current):
-            pursue_queue.append(d["entity_id"])
-        else:
-            reserve_pool.append(d)
+        pursue_queue: list[str] = []
+        reserve_pool: list[dict[str, Any]] = []
+        for d in decisions:
+            current = [_claim_from_row(r) for r in get_claims(conn, d["entity_id"])]
+            if d["verdict"] == "pursue" or _is_promotable(current):
+                pursue_queue.append(d["entity_id"])
+            else:
+                reserve_pool.append(d)
 
-    db_path = _db_path_from_conn(conn)
-    processed: list[dict[str, Any]] = []
-    usd_spent = 0.0
-    for result in await _process_entities_concurrently(pursue_queue, model, db_path, concurrency, force=force):
-        processed.append(result)
-        usd_spent += result["usd_spent"]
-
-    def _survivor_count() -> int:
-        return sum(1 for r in processed if r["outcome"] in ("ship", "ship_with_caveats"))
-
-    processed_ids = {r["entity_id"] for r in processed}
-    remaining_reserve = sorted(
-        (d for d in reserve_pool if d["entity_id"] not in processed_ids and d.get("thin_reason") == "fixable"),
-        key=lambda d: _reserve_sort_key(d["entity_id"], minus1_by_entity),
-    )
-
-    reserve_draws = 0
-    reserve_spent = 0.0
-    while _survivor_count() < target_survivors and remaining_reserve and reserve_spent < reserve_cap_usd:
-        gap = target_survivors - _survivor_count()
-        draw_n = max(1, int(gap * 1.5))
-        draw, remaining_reserve = remaining_reserve[:draw_n], remaining_reserve[draw_n:]
-        if not draw:
-            break
-        # Processed as one concurrent batch (same as the pursue queue) — the budget cap
-        # is checked between batches rather than mid-batch, since a batch's cost isn't
-        # known until every call in it finishes. draw_n is already small (~1.5x the
-        # remaining gap), so any overshoot within one batch is bounded.
-        draw_ids = [d["entity_id"] for d in draw]
-        for result in await _process_entities_concurrently(draw_ids, model, db_path, concurrency, force=force):
+        db_path = _db_path_from_conn(conn)
+        processed: list[dict[str, Any]] = []
+        usd_spent = 0.0
+        for result in await _process_entities_concurrently(pursue_queue, model, db_path, concurrency, force=force, run_id=run_id):
             processed.append(result)
             usd_spent += result["usd_spent"]
-            reserve_spent += result["usd_spent"]
-            reserve_draws += 1
 
-    return {
-        "processed": processed,
-        "survivors": _survivor_count(),
-        "reserve_draws": reserve_draws,
-        "usd_spent": usd_spent,
-    }
+        def _survivor_count() -> int:
+            return sum(1 for r in processed if r["outcome"] in ("ship", "ship_with_caveats"))
+
+        processed_ids = {r["entity_id"] for r in processed}
+        remaining_reserve = sorted(
+            (d for d in reserve_pool if d["entity_id"] not in processed_ids and d.get("thin_reason") == "fixable"),
+            key=lambda d: _reserve_sort_key(d["entity_id"], minus1_by_entity),
+        )
+
+        reserve_draws = 0
+        reserve_spent = 0.0
+        while _survivor_count() < target_survivors and remaining_reserve and reserve_spent < reserve_cap_usd:
+            gap = target_survivors - _survivor_count()
+            draw_n = max(1, int(gap * 1.5))
+            draw, remaining_reserve = remaining_reserve[:draw_n], remaining_reserve[draw_n:]
+            if not draw:
+                break
+            # Processed as one concurrent batch (same as the pursue queue) — the budget cap
+            # is checked between batches rather than mid-batch, since a batch's cost isn't
+            # known until every call in it finishes. draw_n is already small (~1.5x the
+            # remaining gap), so any overshoot within one batch is bounded.
+            draw_ids = [d["entity_id"] for d in draw]
+            for result in await _process_entities_concurrently(draw_ids, model, db_path, concurrency, force=force, run_id=run_id):
+                processed.append(result)
+                usd_spent += result["usd_spent"]
+                reserve_spent += result["usd_spent"]
+                reserve_draws += 1
+
+        notes = {
+            "processed": len(processed),
+            "survivors": _survivor_count(),
+            "reserve_draws": reserve_draws,
+            "usd_spent": usd_spent,
+        }
+        finish_run(conn, run_id, status="done", notes=notes)
+        # T35.5: persist + emit the field provenance log for every entity this run
+        # processed, so the log appears on EVERY run, not only when a workbook is
+        # emitted. Lazy import avoids a cycle (app.provenance_log imports app.dataset).
+        # An emission failure must never fail the run — the leads are the deliverable.
+        try:
+            from app.provenance_log import build_run_log
+            from app.db import write_field_provenance
+            entity_outcomes = [(p["entity_id"], p.get("outcome")) for p in processed]
+            doc = build_run_log(conn, run_id, entity_outcomes)
+            rows = []
+            for lead in doc["leads"]:
+                for rec in lead["fields"]:
+                    rows.append({
+                        "run_id": run_id,
+                        "entity_id": lead["entity_id"],
+                        "field": rec["field"],
+                        "value": rec["value"],
+                        "status": rec["status"],
+                        "shipped": rec["shipped"],
+                        "source_class": (rec["how"] or {}).get("source_class"),
+                        "extraction_method": (rec["how"] or {}).get("extraction_method"),
+                        "record": _json.dumps(rec, ensure_ascii=False, default=str),
+                    })
+            write_field_provenance(conn, rows)
+            out_dir = Path(db_path).parent / "runs" / run_id
+            _atomic_write_json(out_dir / "field_provenance.json", doc)
+        except Exception:  # noqa: BLE001 — never fail the run over the log
+            logger.error("field provenance emission failed for run_id=%s", run_id, exc_info=True)
+        return {
+            "processed": processed,
+            "survivors": _survivor_count(),
+            "reserve_draws": reserve_draws,
+            "usd_spent": usd_spent,
+            "run_id": run_id,
+        }
+    except Exception:
+        # Any unhandled exception must still close the run as failed, never leave it
+        # running. The wave -1 writes already committed stay; the run row records that
+        # this execution did not complete.
+        finish_run(conn, run_id, status="failed")
+        raise

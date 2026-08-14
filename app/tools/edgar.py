@@ -11,10 +11,12 @@ from langchain_core.tools import tool
 from app.config import SETTINGS
 from app.tools.cache import cached_call
 from app.tools.ratelimit import SEC_BUCKET
+from app.toollog import logged
 
 _HEADERS = {"User-Agent": SETTINGS.tools.edgar_user_agent}
 
 
+@logged("edgar_full_text_search_raw")
 async def edgar_full_text_search_raw(
     query: str, forms: str | None = None
 ) -> dict[str, Any]:

@@ -17,10 +17,12 @@ from langchain_core.tools import tool
 from app.config import SETTINGS
 from app.tools.cache import cached_call
 from app.tools.ratelimit import GDELT_BUCKET
+from app.toollog import logged
 
 _MAX_ATTEMPTS = 3
 
 
+@logged("news_search_raw")
 async def news_search_raw(
     query: str, lookback_days: int = 365, max_records: int = 75
 ) -> dict[str, Any]:

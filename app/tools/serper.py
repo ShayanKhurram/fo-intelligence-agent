@@ -28,6 +28,7 @@ from langchain_core.tools import tool
 from app.config import SETTINGS
 from app.tools.keyrotation import KeyRotator, is_exhaustion_response
 from app.tools.ratelimit import SERPER_BUCKET
+from app.toollog import logged
 
 # Process-global rotator, built once from SETTINGS.tools.serper_api_keys (comma-
 # separated multi-key support, app/tools/keyrotation.py). A 429 on the current key
@@ -37,6 +38,7 @@ from app.tools.ratelimit import SERPER_BUCKET
 _SERPER_ROTATOR = KeyRotator(SETTINGS.tools.serper_api_keys)
 
 
+@logged("serper_search_raw")
 async def serper_search_raw(
     query: str, topic: str = "general", max_results: int = 5
 ) -> dict[str, Any]:

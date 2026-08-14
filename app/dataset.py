@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
+import os
 import subprocess
 from collections import Counter
 from dataclasses import dataclass, field
@@ -28,8 +30,13 @@ from app.db import (
     get_findings,
     get_rejections,
     write_production_record,
+    start_run,
+    finish_run,
+    write_field_provenance,
 )
 from app.validation import _MULTI_VALUED_FIELDS, decide_type_final
+
+logger = logging.getLogger(__name__)
 
 MAX_PER_CLASS = 15  # 30% of 50 — plan §6.1
 
@@ -233,6 +240,162 @@ def gather_survivors(conn, entity_outcomes: list[tuple[str, str] | tuple[str, st
 # ============================================================================
 
 
+@dataclass
+class CellResolution:
+    """The decision for one cell, extracted so the row (`_records_rows`) and the provenance
+    log (`app.provenance_log.build_field_records`) can never disagree on what a cell
+    contains — the T19 vocabulary split happened because two code paths each derived a
+    field's value and drifted. One function, two callers (PLAN.md T35.3).
+
+    - `value` is exactly what the row cell gets (None = blank).
+    - `winner` is the claim whose `status`/`source_class` the row's companion columns
+      carry (last write wins, same convention as the pre-refactor `_records_rows`). For a
+      multi-valued field the value can come from entirely different claims than the
+      winner — `winner` is the row's status representative, NOT necessarily the value's
+      source. The provenance log attributes `how`/`verification`/`confidence`/`status` to
+      `producers[0]`, not to `winner`, so the log never misattributes a shipped value to a
+      claim that did not produce it (the single failure mode this feature exists to
+      prevent).
+    - `producers` are the claims whose values are actually in the cell, in cell order:
+      `[winner]` for a single-valued field with a non-null value (empty for a blanked /
+      claim-less cell); the best-tier claims that contributed a de-duplicated answer for a
+      multi-valued field. Empty when the cell is blank.
+    - `alternatives` pairs every field claim that is NOT in `producers` with a
+      `why_not_used` code from the closed vocabulary (lower_provenance_tier | superseded |
+      failed_validation | not_latest_write | duplicate_value | weaker_status) — including
+      the winner when the winner did not produce the value.
+    - `multi_values` is the joined parts for a multi-valued field, else None.
+    """
+    value: Any
+    winner: dict[str, Any] | None
+    alternatives: list[tuple[dict[str, Any], str]]
+    multi_values: list[str] | None
+    producers: list[dict[str, Any]]
+
+
+def resolve_cell(claims: list[dict[str, Any]], field: str) -> CellResolution:
+    """Decide what one cell contains, purely from that entity's claim list. Reproduces
+    the pre-refactor `_records_rows` rules EXACTLY for `value`/`winner`/`multi_values` —
+    do not "improve" a rule here; the acceptance test is that the emitted sheet does not
+    change by one byte.
+
+    single-valued: last write wins; a winner whose status is `removed_failed_validation`
+    yields value=None (the value was killed, the claim is still the winner and is reported
+    as such so the companion `_status` column keeps `removed_failed_validation`).
+    multi-valued (`_MULTI_VALUED_FIELDS`): bucket eligible claims by
+    `_provenance_rank(extraction_method)`, keep ONLY the lowest (best) rank present,
+    first-seen order within that rank, de-duplicated, "; "-joined. Claims with status
+    `removed_failed_validation` or `superseded` are excluded from the buckets, and an
+    empty/None answer is skipped — same as today.
+
+    `producers` is new (T35.3 D1): the claims whose values are in the cell, so the
+    provenance log can attribute the shipped value to the claim that actually produced it
+    rather than to the last-written claim (which for a multi-valued field may be a
+    worse-tier claim that contributed nothing).
+    """
+    field_claims = [c for c in claims if c.get("field_name") == field]
+    if not field_claims:
+        return CellResolution(value=None, winner=None, alternatives=[],
+                              multi_values=None, producers=[])
+
+    # Last write wins — the last claim in iteration order with this field_name. This is
+    # the claim whose status/source_class the row's companion columns carry, for both
+    # single- and multi-valued fields (the pre-refactor code used `latest[f]` for the
+    # companion columns regardless of multi-valued). Must stay last-write to keep the
+    # emitted sheet byte-identical. NOTE: for a multi-valued field the winner may NOT be
+    # one of the producers — the row's _status column reflects the last write, the value
+    # reflects the best provenance tier, and those can be different claims.
+    winner = field_claims[-1]
+    multi_values: list[str] | None = None
+    producers: list[dict[str, Any]] = []
+    # rank of each eligible claim (status ok, non-empty answer), so the alternatives
+    # coding can distinguish a worse-tier claim from a duplicate answer in the winning
+    # tier (D2: two independent sources agreeing is corroboration, not a rejection).
+    eligible_rank: dict[int, int] = {}
+    tiers: dict[int, list[str]] = {}
+    best: int | None = None
+
+    if field in _MULTI_VALUED_FIELDS:
+        # {rank: [answers in first-seen order]}. T26: build the cell from ONLY the best
+        # (lowest) rank present, so a researcher-verified `projected_G2.Q1` principal is
+        # not concatenated in the same cell as `derived_fec_employer` donors.
+        tier_claims: dict[int, list[dict[str, Any]]] = {}
+        for cl in field_claims:
+            if cl.get("status") in ("removed_failed_validation", "superseded"):
+                continue
+            answer = cl.get("answer")
+            if answer in (None, ""):
+                continue
+            rank = _provenance_rank(cl.get("extraction_method"))
+            eligible_rank[id(cl)] = rank
+            bucket = tiers.setdefault(rank, [])
+            if str(answer) not in bucket:
+                bucket.append(str(answer))
+                tier_claims.setdefault(rank, []).append(cl)
+        if tiers:
+            best = min(tiers)
+            parts = tiers[best]
+            multi_values = list(parts)
+            value: Any = "; ".join(parts)
+            # the best-tier claims that contributed a de-duplicated answer, in cell order.
+            producers = list(tier_claims[best])
+        else:
+            # No eligible multi claim -> falls back to the single-valued rule using the
+            # winner (last write), matching the pre-refactor `else` branch.
+            value = winner.get("answer") if winner.get("status") != "removed_failed_validation" else None
+            producers = [winner] if value is not None else []
+    else:
+        value = winner.get("answer") if winner.get("status") != "removed_failed_validation" else None
+        producers = [winner] if value is not None else []
+
+    producing_set = {id(c) for c in producers}
+
+    # alternatives: every field claim NOT in `producers` — including the winner when the
+    # winner did not produce the value (D1). A last-write claim that contributed nothing
+    # is a rejected alternative, not a silently-dropped one.
+    alternatives: list[tuple[dict[str, Any], str]] = []
+    for cl in field_claims:
+        if id(cl) in producing_set:
+            continue
+        # An alternative is a VALUE that lost. A claim carrying no answer at all lost
+        # nothing — it is the record of a lookup that came back empty, and the cell's
+        # `blank_reason` already tells that story properly. Listing it here rendered as
+        # "rejected: null — not_latest_write" in the Log tab: noise that reads like a
+        # finding. Seen live on a `principal_phone` whose only claim was a
+        # tool_unavailable could_not_verify.
+        if cl.get("answer") in (None, ""):
+            continue
+        status = cl.get("status")
+        if status == "superseded":
+            code = "superseded"
+        elif status == "removed_failed_validation":
+            code = "failed_validation"
+        elif field in _MULTI_VALUED_FIELDS and tiers:
+            rank = eligible_rank.get(id(cl))
+            if rank is not None and rank == best:
+                # eligible, in the winning tier, but its answer was already shipped from
+                # an earlier claim in the same tier — two independent sources agreeing is
+                # corroboration (D2), not a rejection.
+                code = "duplicate_value"
+            elif rank is not None and rank > best:
+                # a multi-valued claim in a worse provenance bucket than the one that shipped.
+                code = "lower_provenance_tier"
+            else:
+                # an empty-answer claim or anything else that lost without a clearer code.
+                code = "weaker_status"
+        else:
+            # single-valued claim beaten by a later write for the same field.
+            code = "not_latest_write"
+        alternatives.append((cl, code))
+
+    # Deterministic order (created_at, then claim_id) — a web page renders this list and
+    # it must not reshuffle between reads.
+    alternatives.sort(key=lambda pair: (pair[0].get("created_at") or "", pair[0].get("claim_id") or ""))
+
+    return CellResolution(value=value, winner=winner, alternatives=alternatives,
+                          multi_values=multi_values, producers=producers)
+
+
 def _records_rows(selected: list[ProductionCandidate]) -> tuple[list[str], list[dict[str, Any]]]:
     """One row per entity, one column per field_name, plus `<field>_status` and
     `<field>_source_class` companion columns for every high-value field — plan §6.3:
@@ -255,6 +418,18 @@ def _records_rows(selected: list[ProductionCandidate]) -> tuple[list[str], list[
        point of the claim ledger is that the distinction stays attached to the value.
        (`provenance` remains the full audit trail — every field, plus confirming_url,
        confirming_class and verification_method.)
+
+    3. **The companion columns describe the claim that PRODUCED the value** (T35.7), not
+       whichever claim happened to be written last. They used to read `res.winner`, which
+       is the last write — correct for a single-valued field, wrong for a multi-valued one
+       whose cell is filled from the best provenance tier. Measured case: a row shipping
+       `principal_name = "Matt Blackburn"` (a researcher's `projected_G2.Q1` site-scrape
+       claim, which wins on tier) carried `principal_name_source_class = "fec_employer"` —
+       the class of a campaign-donor claim for a different person that merely arrived
+       later. The value was right and the label was wrong, in the deliverable itself.
+       `res.producers[0]` is the claim whose value is actually in the cell; `res.winner`
+       remains the fallback for a blanked cell (a `removed_failed_validation` winner
+       produces nothing, and its status is exactly what the reader needs to see).
     """
     present_fields: set[str] = set()
     for c in selected:
@@ -276,31 +451,6 @@ def _records_rows(selected: list[ProductionCandidate]) -> tuple[list[str], list[
 
     rows = []
     for c in selected:
-        latest: dict[str, dict[str, Any]] = {}
-        # Multi-valued field -> {field: {rank: [answers in first-seen order]}}. T26: build
-        # the cell from ONLY the best (lowest) rank present for that field, not from
-        # every eligible claim — otherwise a researcher-verified `projected_G2.Q1`
-        # principal gets concatenated in the same cell as `derived_fec_employer` donors.
-        multi: dict[str, dict[int, list[str]]] = {}
-        for cl in c.claims:
-            fname = cl.get("field_name")
-            if not fname:
-                continue
-            latest[fname] = cl  # last write wins, same convention as elsewhere
-            # Multi-valued fields must not lose their other values to last-write-wins: a
-            # firm with two co-managing members has two real principal_name claims, and
-            # keeping only the last one silently discards a decision-maker. See
-            # app.validation._MULTI_VALUED_FIELDS for why V4 no longer calls these a
-            # contradiction.
-            if fname in _MULTI_VALUED_FIELDS and cl.get("status") not in (
-                "removed_failed_validation", "superseded",
-            ):
-                answer = cl.get("answer")
-                if answer not in (None, ""):
-                    rank = _provenance_rank(cl.get("extraction_method"))
-                    bucket = multi.setdefault(fname, {}).setdefault(rank, [])
-                    if str(answer) not in bucket:
-                        bucket.append(str(answer))
         # lead_origin_source_class is a candidate-level attribute (which discovery feed
         # this lead came from), NOT a claim field_name — so it follows the type_final
         # precedent: a literal header entry + a literal row entry, never derived from
@@ -313,24 +463,27 @@ def _records_rows(selected: list[ProductionCandidate]) -> tuple[list[str], list[
         for f in ordered:
             if f in ("entity_id", "canonical_name", "type_final", "lead_origin_source_class"):
                 continue
-            claim = latest.get(f)
-            if f in _MULTI_VALUED_FIELDS and multi.get(f):
-                # T26: emit ONLY the best (lowest) tier present for this field, in
-                # first-seen order within the tier. A "; " rather than a list so the
-                # XLSX cell and the Postgres TEXT column both stay a plain string.
-                # Co-principals arriving in the same tier both survive; a researcher's
-                # projected principal is no longer buried among discovery-feed donors.
-                tiers = multi[f]
-                best = min(tiers)
-                row[f] = "; ".join(tiers[best])
-            else:
-                row[f] = claim["answer"] if claim and claim["status"] != "removed_failed_validation" else None
+            # One decision, two consumers: the cell value comes from resolve_cell, the
+            # same function app.provenance_log.build_field_records calls, so the row and
+            # the provenance log can never disagree on what a cell contains (T35.3 — the
+            # no-drift move T27.2 made by importing _provenance_rank rather than
+            # re-implementing it).
+            res = resolve_cell(c.claims, f)
+            row[f] = res.value
             if f in _HIGH_VALUE_FIELDS:
-                row[f"{f}_status"] = claim["status"] if claim else "could_not_verify"
+                # T35.7: describe the claim that PRODUCED the shipped value. `producers[0]`
+                # is that claim; it differs from `winner` (the last write) exactly when a
+                # multi-valued cell was filled from a better provenance tier than the
+                # last-written claim — the case that used to label a researcher-sourced
+                # principal `fec_employer`. A blanked cell has no producer, so it falls
+                # back to the winner, whose status is the very thing the reader needs
+                # (`removed_failed_validation`, `could_not_verify`, …).
+                describing = res.producers[0] if res.producers else res.winner
+                row[f"{f}_status"] = describing["status"] if describing else "could_not_verify"
                 # A blanked value keeps its source_class: the release rule killed the value,
                 # not the record of where it came from (the value itself is preserved in
                 # audit_rejected_values).
-                row[f"{f}_source_class"] = claim.get("source_class") if claim else None
+                row[f"{f}_source_class"] = describing.get("source_class") if describing else None
         rows.append(row)
     return columns, rows
 
@@ -411,6 +564,17 @@ def _git_sha() -> str:
         return "unknown"
 
 
+def _atomic_write_json(path: Path, obj: Any) -> None:
+    """Write JSON atomically: a temp file in the same directory, then ``os.replace``. A
+    half-written file must never be served — a web page reading
+    ``field_provenance.json`` mid-write would otherwise see truncated JSON. UTF-8 with
+    ``ensure_ascii=False`` because scraped content carries non-ASCII punctuation."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def write_workbook(
     conn,
     selected: list[ProductionCandidate],
@@ -419,9 +583,16 @@ def write_workbook(
     output_dir: str | Path,
     *,
     budget_spent: dict[str, Any] | None = None,
+    run_id: str | None = None,
 ) -> dict[str, str]:
     """Writes the six-sheet XLSX, records.csv, and run_manifest.json to `output_dir`.
-    Returns {"xlsx": path, "csv": path, "manifest": path}."""
+    Returns {"xlsx": path, "csv": path, "manifest": path, "field_provenance": path}.
+
+    T35.5: after the sheets are written, builds and persists the per-run field
+    provenance log for ``selected + excluded`` and writes ``field_provenance.json``.
+    ``run_id`` owns the log; when None a ``dataset`` run is opened (and closed) here so
+    the log always has an owning run. An emission failure is logged and does NOT fail
+    the workbook write — the leads are the deliverable, the log is the record of it."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -497,10 +668,55 @@ def write_workbook(
         "per_class_counts": per_class,
         "budget_spent": budget_spent or {},
     }
+
+    # T35.5: build + persist the per-run field provenance log for selected + excluded
+    # and write field_provenance.json. Lazy import avoids a cycle (app.provenance_log
+    # imports from app.dataset). An emission failure must never fail the workbook write —
+    # the leads are the deliverable, the log is the record of it.
+    provenance_path: Path | None = None
+    owns_run = run_id is None
+    if owns_run:
+        run_id = start_run(conn, "dataset", entity_count=len(selected) + len(excluded))
+    try:
+        from app.provenance_log import build_run_log
+        entity_outcomes = [(c.entity_id, c.outcome) for c in selected + excluded]
+        doc = build_run_log(conn, run_id, entity_outcomes)
+        rows = []
+        for lead in doc["leads"]:
+            for rec in lead["fields"]:
+                rows.append({
+                    "run_id": run_id,
+                    "entity_id": lead["entity_id"],
+                    "field": rec["field"],
+                    "value": rec["value"],
+                    "status": rec["status"],
+                    "shipped": rec["shipped"],
+                    "source_class": (rec["how"] or {}).get("source_class"),
+                    "extraction_method": (rec["how"] or {}).get("extraction_method"),
+                    "record": json.dumps(rec, ensure_ascii=False, default=str),
+                })
+        write_field_provenance(conn, rows)
+        provenance_path = output_dir / "field_provenance.json"
+        _atomic_write_json(provenance_path, doc)
+        manifest["field_provenance"] = str(provenance_path)
+        if owns_run:
+            finish_run(conn, run_id, status="done",
+                       notes={"selected": len(selected), "excluded": len(excluded)})
+    except Exception:  # noqa: BLE001 — never fail the run over the log
+        logger.error("field provenance emission failed for run_id=%s", run_id, exc_info=True)
+        if owns_run:
+            try:
+                finish_run(conn, run_id, status="failed")
+            except Exception:  # noqa: BLE001
+                pass
+
     manifest_path = output_dir / "run_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
 
-    return {"xlsx": str(xlsx_path), "csv": str(csv_path), "manifest": str(manifest_path)}
+    out = {"xlsx": str(xlsx_path), "csv": str(csv_path), "manifest": str(manifest_path)}
+    if provenance_path is not None:
+        out["field_provenance"] = str(provenance_path)
+    return out
 
 
 def _stringify(value: Any) -> Any:

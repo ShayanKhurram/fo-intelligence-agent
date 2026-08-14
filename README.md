@@ -24,6 +24,11 @@
 - [Repository layout](#repository-layout)
 - [Getting started](#getting-started)
 - [Testing](#testing)
+- [Field provenance log](#field-provenance-log)
+- [Scheduled runs](#scheduled-runs)
+- [Automatic RAG ingestion](#automatic-rag-ingestion)
+- [The Log tab](#the-log-tab)
+- [Deploying to Render](#deploying-to-render)
 - [Notable engineering decisions](#notable-engineering-decisions)
 - [Known limitations](#known-limitations)
 
@@ -255,6 +260,138 @@ PYTHONPATH=. python -m pytest -q     # 242 passing, fully offline
 ```
 
 The LLM layer falls back to a deterministic fake model when no API key is set, so the suite needs no network or credentials.
+
+---
+
+## Field provenance log
+
+Every time the pipeline runs it records, in a fetchable JSON form, **how each output lead field was obtained** -- which wave, which tool call, which URL, which validation checks, what else was found and rejected, or *why* a blank cell is blank. A reader looking at a shipped cell can see exactly how its value was produced; the log and the sheet share one cell-decision function (`resolve_cell`) so they can never disagree on what a cell contains.
+
+**Where it lives.** Each run's log is written to `<db dir>/runs/<run_id>/field_provenance.json` (self-contained, `schema_version: 1`, directly fetchable by a static web page) and persisted to the `field_provenance` table (one row per run x entity x field, with scalar columns for filtering and a `record` JSON blob the page renders). The log is a **snapshot** of what that run shipped -- the claim ledger keeps moving, the log does not, so a value the log explains is always the value the run produced.
+
+**`blank_reason` codes** (present only when a cell is blank, first match wins):
+
+| code | meaning |
+| --- | --- |
+| `removed_failed_validation` | a value was found but blanked by the release rule; the original is in `audit_rejected_values` |
+| `tool_unavailable` | the tool that would have found it was unavailable (a `tool_unavailable` source class or an `_error` extraction method) |
+| `searched_not_found` | a search/lookup ran (or tool calls ran for the lead) but found no usable value for this field |
+| `never_attempted` | no claim and no tool call for this field exists -- it was never tried |
+
+**`why_not_used` vocabulary** (one code per losing claim in `alternatives`):
+
+| code | meaning |
+| --- | --- |
+| `lower_provenance_tier` | a multi-valued claim in a worse provenance bucket than the one that shipped |
+| `superseded` | status `superseded` |
+| `failed_validation` | status `removed_failed_validation` (and not the shipped value) |
+| `not_latest_write` | a single-valued claim beaten by a later write for the same field |
+| `duplicate_value` | the same answer in the winning tier -- corroboration, not a rejection |
+| `weaker_status` | anything else that lost |
+
+**HTTP read endpoints** (every response carries `schema_version: 1`):
+
+| Method + path | returns |
+| --- | --- |
+| `GET /api/runs?limit=` | the run rows, newest first (`limit` clamped 1..200) |
+| `GET /api/runs/{run_id}` | the run row + a per-lead summary (`field_count`, `shipped_count`, `blank_count`) |
+| `GET /api/runs/{run_id}/provenance?entity_id=&field=` | the stored records for that run (filtered when the params are given; an empty result is `200`, never `404`) |
+| `GET /api/leads/{entity_id}/provenance?run_id=` | that lead's records, defaulting to the newest run that has any for it (also served at the singular `/api/lead/{entity_id}/provenance`) |
+
+Example (elided):
+
+```json
+{
+  "schema_version": 1, "run_id": "...", "count": 1,
+  "records": [{
+    "schema_version": 1, "entity_id": "disc_...", "canonical_name": "TARBOX FAMILY OFFICE, INC.",
+    "field": "principal_email", "value": "rob@tarbox.com", "status": "single_source",
+    "shipped": true,
+    "how": {"summary": "A Snov.io name-targeted email lookup returned this address ...",
+            "extraction_method": "snov_emails_by_name_domain", "source_url": "https://..."},
+    "verification": {"method": "mx_check", "verified_at": "2026-08-14T19:12:40Z"},
+    "checks": [{"check_id": "V7_email_domain_guard", "severity": "info", "detail": "..."}],
+    "alternatives": [{"value": "info@tarbox.com", "why_not_used": "lower_provenance_tier"}],
+    "tool_calls": [{"tool": "snov_emails_by_name_domain_raw", "ok": true,
+                    "result_summary": "1 email returned", "matched_by": "url"}],
+    "blank_reason": null
+  }]
+}
+```
+
+---
+
+## Scheduled runs
+
+The agent can run unattended on a schedule, stop as soon as it has what it was asked for, and publish what it confirms without anyone remembering to.
+
+**Standing orders.** A schedule is `daily at HH:MM UTC` or `every N minutes`, and carries two limits:
+
+| Field | Meaning |
+| --- | --- |
+| `target_confirmed` | stop the run once this many leads confirm (`ship` / `ship_with_caveats`) |
+| `max_leads` | never process more than this many leads, whatever happens |
+
+Either may be null. With neither, a run processes the queue until it runs out.
+
+**How a run ends.** The run walks the lead queue in chunks, taking each lead through Layer 1 and then — only if the verdict warrants it — through enrichment. After every chunk it checks its stop conditions, in this precedence, and records which one fired in the run's `notes`:
+
+| `termination` | meaning |
+| --- | --- |
+| `target_reached` | it got the confirmed leads it was asked for and stopped early |
+| `max_leads_reached` | it hit the hard cap first |
+| `leads_exhausted` | the queue emptied — the automatic termination; the run ends rather than waiting for work that will never arrive |
+| `error` | an unhandled failure; the run is closed `failed`, never left `running` |
+
+A single lead crashing never ends a run, and a lead Layer 1 rejects never reaches the expensive enrichment half.
+
+**Endpoints:** `GET/POST /api/schedules`, `PATCH/DELETE /api/schedules/{id}`, `POST /api/schedules/{id}/run-now` (fire now, without waiting for the window), `GET /api/scheduler/status` (whether the loop is *actually* running, the next schedule due, and the RAG queue depth).
+
+## Automatic RAG ingestion
+
+A lead that confirms during any scheduled run is queued for the micro-RAG immediately and ingested at the end of the run — no manual `micro_rag/ingest/ingest.py` step.
+
+The two halves are deliberately split. Confirming a lead writes one row to the local `rag_queue` table: microseconds, no network, inside the run. Draining that queue talks to Postgres and loads a 384-dim embedding model, and happens after the run's leads are safely persisted. The RAG side is remote, free-tier and auto-pausing, and neither it nor torch may be allowed to fail a lead's enrichment.
+
+Consequently:
+
+- No `DATABASE_URL`, or no psycopg2/torch installed → the drain **skips**, rows stay `pending`, and the next drain picks them up. Ingestion is delayed, never dropped.
+- A failing Postgres write → rows stay `pending` with the error recorded on the row.
+- A lead re-judged between queueing and draining → marked `stale` and never published. (The pipeline must not publish a record it no longer stands behind — the failure the batch job's "latest run only" rule exists to prevent.)
+- `POST /api/rag/drain` drains on demand, for the case the RAG was down when the run finished.
+
+Records are built through the same `build_record` mapping the manual batch job uses, so an automatically-ingested lead is identical to a manually-ingested one.
+
+## The Log tab
+
+The web UI has two tabs. **Run** is the existing interactive lead-qualification view. **Log** is the history:
+
+- the scheduler's live state, the schedules with their stop rules, and Run-now / Pause / Delete;
+- every run — scheduled or manual — newest first, with its status, why it terminated, and how many leads it processed and confirmed;
+- expand a run to list the leads it touched;
+- expand a lead to read its per-field log: the value, the plain-English account of how it was obtained, the tool calls behind it, the competing values that lost and why, and for a blank cell the reason it is blank.
+
+Each level is fetched only when expanded, so opening the tab costs a single request.
+
+## Deploying to Render
+
+`render.yaml` is a complete blueprint: `render blueprint launch`, then set the secrets in the dashboard.
+
+It provisions **one** web service with a persistent disk, and the scheduler runs as an asyncio task inside it rather than as a separate Cron Job or worker. That is forced by the data, not a shortcut: the pipeline's entire state is a SQLite file, and a Render disk mounts to exactly one service — a second service would get its own filesystem and its own empty database.
+
+Three things follow, and all three matter:
+
+- **Never scale past one instance or one worker.** Two instances means two schedulers firing the same standing orders and two SQLite writers.
+- **Not the free tier.** Render spins an idle free service down, and a spun-down service fires no schedules.
+- **The disk is the only copy** of every lead ever qualified. Keep the mount path stable across deploys.
+
+| Env var | Purpose |
+| --- | --- |
+| `FOIA_DB_PATH` | `/var/data/foia.db` — on the disk, not the ephemeral filesystem |
+| `FOIA_SCHEDULER` | `1` arms the in-process scheduler loop (off by default locally) |
+| `FOIA_SCHEDULER_POLL_SECONDS` | how often to check for due schedules (default 60) |
+| `OLLAMA_API_KEY`, `SERPER_API_KEY`, `SNOV_*`, `SCRAPEOPS_API_KEY` | pipeline credentials — dashboard secrets, never in the blueprint |
+| `DATABASE_URL` | micro-RAG Postgres; unset means confirmed leads stay queued rather than ingested |
 
 ---
 

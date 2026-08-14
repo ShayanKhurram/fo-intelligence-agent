@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -613,3 +614,224 @@ def backfill_claims_from_decisions(conn: sqlite3.Connection) -> int:
                 upsert_claim(conn, entity_id, claim)
                 written += 1
     return written
+
+
+# ============================================================================
+# T35 — per-run field provenance log (PLAN.md T35). `runs` is the durable identity of
+# one execution of a pipeline layer; `tool_calls` records the external calls each
+# entity's enrichment made. See app/toollog.py for the capture side and
+# app/schema.sql for the table definitions.
+# ============================================================================
+
+def _git_sha() -> str:
+    """git rev-parse HEAD of this repo, or "unknown" on any failure. Duplicated here
+    rather than imported from app.dataset to avoid a new import cycle (dataset already
+    imports this module). The behaviour matches app.dataset._git_sha exactly."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent.parent,
+            timeout=5,
+        ).decode().strip()
+    except Exception:
+        return "unknown"
+
+
+def start_run(
+    conn: sqlite3.Connection,
+    kind: str,
+    *,
+    run_id: str | None = None,
+    entity_count: int = 0,
+    notes: dict[str, Any] | None = None,
+) -> str:
+    """Open a run row with status='running' and return its run_id. A None run_id mints
+    a fresh uuid4().hex. `notes` is stored as JSON; merge with existing notes on
+    update is the caller's job — here it overwrites (used by finish_run for the merge)."""
+    run_id = run_id or uuid.uuid4().hex
+    conn.execute(
+        """
+        INSERT INTO runs (run_id, kind, status, git_sha, entity_count, notes)
+        VALUES (?, ?, 'running', ?, ?, ?)
+        """,
+        (run_id, kind, _git_sha(), entity_count, json.dumps(notes or {})),
+    )
+    return run_id
+
+
+def finish_run(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    status: str = "done",
+    entity_count: int | None = None,
+    notes: dict[str, Any] | None = None,
+) -> None:
+    """Close a run: stamp ended_at + status. When `notes` is given it OVERWRITES the
+    run's notes (callers compose the final dict before calling); `entity_count` is only
+    updated when explicitly provided so a caller that didn't know the count up front can
+    fill it in here without clobbering an earlier value."""
+    sets = ["status = ?", "ended_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')"]
+    params: list[Any] = [status]
+    if entity_count is not None:
+        sets.append("entity_count = ?")
+        params.append(entity_count)
+    if notes is not None:
+        sets.append("notes = ?")
+        params.append(json.dumps(notes))
+    params.append(run_id)
+    conn.execute(f"UPDATE runs SET {', '.join(sets)} WHERE run_id = ?", params)
+
+
+def get_run(conn: sqlite3.Connection, run_id: str) -> dict[str, Any] | None:
+    row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+    if row is None:
+        return None
+    d = dict(row)
+    d["notes"] = json.loads(d["notes"])
+    return d
+
+
+def list_runs(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, Any]]:
+    """Newest runs first (by started_at), notes parsed from JSON."""
+    rows = conn.execute(
+        "SELECT * FROM runs ORDER BY started_at DESC LIMIT ?", (limit,)
+    ).fetchall()
+    out = []
+    for row in rows:
+        d = dict(row)
+        d["notes"] = json.loads(d["notes"])
+        out.append(d)
+    return out
+
+
+def write_tool_call(conn: sqlite3.Connection, **fields: Any) -> None:
+    """Insert one tool_calls row. Fields map 1:1 to the tool_calls columns
+    (run_id, entity_id, wave, tool, args, ok, error, result_summary, result_url,
+    cache_hit, duration_ms). `args` is JSON-encoded here if a dict is passed; a str is
+    stored as-is. Called from app.toollog via asyncio.to_thread on a short-lived
+    connection — never from the event loop directly."""
+    args = fields.get("args")
+    if isinstance(args, dict):
+        # Re-serialise defensively: app.toollog already produces a JSON str, but accept a
+        # dict too so a direct caller can't accidentally store a Python repr.
+        clean: dict[str, Any] = {}
+        for k, v in args.items():
+            try:
+                json.dumps(v, default=str)
+                clean[k] = v
+            except (TypeError, ValueError):
+                clean[k] = str(v)
+        args = json.dumps(clean)
+    fields["args"] = args if args is not None else "{}"
+    # `ok` and `cache_hit` are NOT NULL in the schema with defaults (1 and 0),
+    # but a raw INSERT of NULL bypasses those defaults and raises IntegrityError.
+    # The production path (app.toollog) always passes them, but the helper is a
+    # sharp edge for a direct caller who omits them -- default to the schema
+    # defaults and coerce to int so a bool from the recorder round-trips.
+    fields["ok"] = int(fields["ok"]) if fields.get("ok") is not None else 1
+    fields["cache_hit"] = int(fields["cache_hit"]) if fields.get("cache_hit") is not None else 0
+    cols = ["run_id", "entity_id", "wave", "tool", "args", "ok", "error",
+            "result_summary", "result_url", "cache_hit", "duration_ms"]
+    values = [fields.get(c) for c in cols]
+    placeholders = ",".join("?" * len(cols))
+    conn.execute(
+        f"INSERT INTO tool_calls ({','.join(cols)}) VALUES ({placeholders})", values
+    )
+
+
+def get_tool_calls(
+    conn: sqlite3.Connection, entity_id: str, run_id: str | None = None
+) -> list[dict[str, Any]]:
+    """Tool calls for an entity, newest first. `args` parsed from JSON; `ok`/`cache_hit`
+    are returned as plain ints (sqlite booleans). Optional `run_id` scopes to one run."""
+    if run_id is not None:
+        rows = conn.execute(
+            "SELECT * FROM tool_calls WHERE entity_id = ? AND run_id = ? "
+            "ORDER BY called_at DESC, id DESC",
+            (entity_id, run_id),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM tool_calls WHERE entity_id = ? ORDER BY called_at DESC, id DESC",
+            (entity_id,),
+        ).fetchall()
+    out = []
+    for row in rows:
+        d = dict(row)
+        d["args"] = json.loads(d["args"])
+        d["cache_hit"] = bool(d["cache_hit"])
+        d["ok"] = bool(d["ok"])
+        out.append(d)
+    return out
+
+
+# ============================================================================
+# T35.5 — persisted per-run field provenance log (PLAN.md T35.5). The scalar columns
+# let the web page filter without parsing the JSON blob; `record` is the full
+# schema_version-1 JSON app.provenance_log.build_field_records produced.
+# ============================================================================
+
+def write_field_provenance(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> None:
+    """Upsert one or more field_provenance rows. Each row dict carries `run_id`,
+    `entity_id`, `field`, `value`, `status`, `shipped`, `source_class`,
+    `extraction_method`, and `record` (the full JSON blob). The UNIQUE(run_id,
+    entity_id, field) constraint means re-running a run_id updates in place rather than
+    duplicating — the log is immutable per run, snapshotted at emission (PLAN.md T35
+    point 2)."""
+    for r in rows:
+        conn.execute(
+            """
+            INSERT INTO field_provenance (
+                run_id, entity_id, field, value, status, shipped,
+                source_class, extraction_method, record
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id, entity_id, field) DO UPDATE SET
+                value = excluded.value,
+                status = excluded.status,
+                shipped = excluded.shipped,
+                source_class = excluded.source_class,
+                extraction_method = excluded.extraction_method,
+                record = excluded.record,
+                created_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            """,
+            (
+                r["run_id"], r["entity_id"], r["field"],
+                # `value` is stored as TEXT so it can be filtered on without parsing the
+                # blob; a non-string value is JSON-encoded so it round-trips losslessly.
+                r.get("value") if isinstance(r.get("value"), str) or r.get("value") is None
+                else json.dumps(r.get("value"), default=str),
+                r.get("status"), int(bool(r.get("shipped"))),
+                r.get("source_class"), r.get("extraction_method"),
+                r.get("record") if isinstance(r.get("record"), str)
+                else json.dumps(r.get("record"), default=str, ensure_ascii=False),
+            ),
+        )
+
+
+def get_field_provenance(
+    conn: sqlite3.Connection, *, run_id: str | None = None, entity_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Read field_provenance rows, `record` parsed back from JSON. Filter by run_id
+    and/or entity_id; unfiltered returns every row (ordered newest-first by created_at
+    then id, so a re-emission's latest snapshot leads)."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if run_id is not None:
+        clauses.append("run_id = ?")
+        params.append(run_id)
+    if entity_id is not None:
+        clauses.append("entity_id = ?")
+        params.append(entity_id)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = conn.execute(
+        f"SELECT * FROM field_provenance{where} ORDER BY entity_id, id",
+        params,
+    ).fetchall()
+    out = []
+    for row in rows:
+        d = dict(row)
+        d["shipped"] = bool(d["shipped"])
+        d["record"] = json.loads(d["record"])
+        out.append(d)
+    return out
