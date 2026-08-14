@@ -28,6 +28,7 @@
 - [Scheduled runs](#scheduled-runs)
 - [Automatic RAG ingestion](#automatic-rag-ingestion)
 - [The Log tab](#the-log-tab)
+- [Running the scheduler locally (free)](#running-the-scheduler-locally-free)
 - [Deploying to Render](#deploying-to-render)
 - [Notable engineering decisions](#notable-engineering-decisions)
 - [Known limitations](#known-limitations)
@@ -372,6 +373,41 @@ The web UI has two tabs. **Run** is the existing interactive lead-qualification 
 - expand a lead to read its per-field log: the value, the plain-English account of how it was obtained, the tool calls behind it, the competing values that lost and why, and for a blank cell the reason it is blank.
 
 Each level is fetched only when expanded, so opening the tab costs a single request.
+
+## Running the scheduler locally (free)
+
+Hosting is optional and, for this pipeline, mostly unnecessary: the agent needs *this*
+machine anyway -- the SQLite database, the tool credentials and the LinkedIn scraper all
+live here -- so the timer belongs here too. The real cost of a run is the Serper/Snov/LLM
+calls, which are identical wherever the code runs.
+
+```
+powershell -ExecutionPolicy Bypass -File scripts\install_scheduler_task.ps1
+```
+
+That registers a user-level Windows task that starts the service at logon on
+`http://127.0.0.1:8765` with its scheduler armed, logging to
+`data/scheduler-service.log`. Remove it with the same script and `-Uninstall`.
+
+**Arming the loop spends nothing on its own.** With no schedules defined it wakes, finds
+nothing due, and sleeps. Runs happen only after you create a schedule in the Log tab --
+deliberately, because each one makes real paid calls.
+
+**A missed window is not a lost run.** `due_schedules` fires anything whose `next_run_at`
+has already passed, so a 03:00 schedule missed because the machine was off runs shortly
+after the next logon.
+
+Two environment-specific details the setup script encodes, both found the hard way:
+
+* It runs `.venv\Scripts\python.exe`, not the system interpreter. This machine's Python
+  is a Microsoft Store install, and neither of its forms survives a scheduled task -- the
+  real binary under `C:\Program Files\WindowsApps\...` is ACL-locked, and the WindowsApps
+  alias exits immediately in a non-interactive session. Create the venv with
+  `python -m venv .venv --system-site-packages` so it reuses installed dependencies.
+* It drops `$ErrorActionPreference` to `Continue` before launching uvicorn. uvicorn logs
+  to stderr, including its ordinary startup banner, and under `Stop` PowerShell promotes
+  that to a terminating error -- the service was being killed by its own healthy startup
+  message.
 
 ## Deploying to Render
 
