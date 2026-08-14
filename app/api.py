@@ -35,6 +35,7 @@ from app.db import (
     finish_run,
 )
 from app.ingest import ingest_discovery_file
+from app.log_sync import sync_runs
 from app.rag_sync import drain_queue, queue_counts
 from app.runner import run_batch
 from app.scheduler import (
@@ -520,6 +521,16 @@ async def rag_drain(limit: int = 25) -> dict:
     still pending. Never fails — see app/rag_sync.drain_queue's contract."""
     limit = max(1, min(limit, 200))
     result = await asyncio.to_thread(drain_queue, None, limit=limit)
+    return {"schema_version": 1, **result}
+
+
+@app.post("/api/log/sync")
+async def log_sync_endpoint(limit: int = 50) -> dict:
+    """Push the recent run log to Postgres so the hosted view shows it. Runs
+    automatically at the end of every scheduled run; this is the manual trigger for a
+    run done from the Run tab, or a re-push after the database was unreachable."""
+    limit = max(1, min(limit, 200))
+    result = await asyncio.to_thread(sync_runs, None, limit=limit)
     return {"schema_version": 1, **result}
 
 

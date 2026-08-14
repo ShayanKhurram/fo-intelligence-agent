@@ -257,13 +257,22 @@ export function SearchApp() {
             </button>
           ))}
         </div>
-        <button
-          onClick={share}
-          disabled={!state.submittedQuery}
-          className="mono flex items-center gap-1.5 rounded-[var(--r-sm)] border border-[var(--edge)] px-3 py-1.5 text-xs text-[var(--text-mid)] hover:text-[var(--text-hi)] disabled:opacity-30"
-        >
-          <ShareIcon /> Share
-        </button>
+        <div className="flex items-center gap-2">
+          {/* T37 — the agent's run log, mirrored here from the machine that runs it. */}
+          <a
+            href="/log"
+            className="mono rounded-[var(--r-sm)] border border-[var(--edge)] px-3 py-1.5 text-xs text-[var(--text-mid)] hover:text-[var(--text-hi)]"
+          >
+            Log
+          </a>
+          <button
+            onClick={share}
+            disabled={!state.submittedQuery}
+            className="mono flex items-center gap-1.5 rounded-[var(--r-sm)] border border-[var(--edge)] px-3 py-1.5 text-xs text-[var(--text-mid)] hover:text-[var(--text-hi)] disabled:opacity-30"
+          >
+            <ShareIcon /> Share
+          </button>
+        </div>
       </header>
 
       <main className="flex-1 py-6">

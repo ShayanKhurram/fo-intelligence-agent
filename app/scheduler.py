@@ -53,6 +53,7 @@ from app.db import (
 from app.enrichment import process_entity
 from app.graph import run_lead
 from app.llm import get_model
+from app.log_sync import sync_runs
 from app.rag_sync import drain_queue, enqueue_entity, is_confirmed
 
 logger = logging.getLogger(__name__)
@@ -357,6 +358,10 @@ async def run_scheduled_job(
                 "termination": termination, "usd_spent": total_cost, "error": str(exc)[:300]}
 
     rag = drain_queue(db_path)
+    # T37: mirror this run's log to Postgres so the hosted (Vercel) view shows it. Same
+    # contract as the RAG drain — a `skipped`/`error` summary, never an exception, and
+    # the local SQLite log stays the source of truth either way.
+    log_push = sync_runs(db_path, limit=5)
 
     # The provenance log for what this run produced, under this run's id — so the Log tab
     # can go run -> leads -> field logs with no extra plumbing (PLAN.md T35.5).
@@ -379,6 +384,7 @@ async def run_scheduled_job(
                 "usd_spent": total_cost,
                 "termination": termination,
                 "rag": rag,
+                "log_push": log_push,
             })
             doc = build_run_log(conn, run_id, [(r["entity_id"], r["outcome"] or r["verdict"] or "processed")
                                                for r in processed])
@@ -405,7 +411,7 @@ async def run_scheduled_job(
 
     return {"run_id": run_id, "processed": len(processed), "confirmed": len(confirmed_ids),
             "confirmed_ids": confirmed_ids, "termination": termination,
-            "usd_spent": total_cost, "rag": rag}
+            "usd_spent": total_cost, "rag": rag, "log_push": log_push}
 
 
 def mark_schedule_fired(conn: sqlite3.Connection, schedule: dict[str, Any], *, now: datetime | None = None) -> None:
