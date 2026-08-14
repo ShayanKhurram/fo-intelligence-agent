@@ -91,9 +91,25 @@ def fetch_ship_records(sqlite_db_path: str | None = None) -> tuple[list[dict[str
     return records, provenance_by_record
 
 
-def write_to_postgres(pg_dsn: str, records: list[dict[str, Any]], provenance_by_record: dict[str, list[dict[str, Any]]]) -> str:
+def write_to_postgres(
+    pg_dsn: str,
+    records: list[dict[str, Any]],
+    provenance_by_record: dict[str, list[dict[str, Any]]],
+    *,
+    prune: bool = True,
+) -> str:
     """Upserts records + chunks + provenance, writes a new dataset_meta row, returns
-    the build_hash. Idempotent — safe to re-run as the live pipeline produces more rows."""
+    the build_hash. Idempotent — safe to re-run as the live pipeline produces more rows.
+
+    `prune=True` (the default, and correct for the full batch job) deletes every
+    pipeline record NOT in `records` — that is how an entity re-judged reject leaves the
+    corpus. It is therefore only safe when `records` is the COMPLETE current ship set.
+
+    `prune=False` is for incremental callers that hand over a partial set —
+    app/rag_sync.py drains a queue of newly-confirmed leads, a handful at a time. With
+    the prune left on, the first such drain would delete every record it did not happen
+    to be carrying: one confirmed lead in, twenty-nine destroyed. Removal of a
+    re-judged lead stays the batch job's responsibility."""
     build_hash = f"{_git_sha()}-{len(records)}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
 
     conn = psycopg2.connect(pg_dsn)
@@ -181,13 +197,14 @@ def write_to_postgres(pg_dsn: str, records: list[dict[str, Any]], provenance_by_
             # and must be removed so the live dataset matches the pipeline. Scoped to
             # source='pipeline' so a co-resident CSV import (source='csv_import') is never
             # touched by the pipeline's prune, and vice versa. chunks/provenance cascade.
-            cur.execute(
-                "DELETE FROM records WHERE build_hash <> %s AND COALESCE(source,'pipeline') = 'pipeline'",
-                (build_hash,),
-            )
-            pruned = cur.rowcount
-            if pruned:
-                print(f"Pruned {pruned} stale record(s) no longer in the ship set")
+            if prune:
+                cur.execute(
+                    "DELETE FROM records WHERE build_hash <> %s AND COALESCE(source,'pipeline') = 'pipeline'",
+                    (build_hash,),
+                )
+                pruned = cur.rowcount
+                if pruned:
+                    print(f"Pruned {pruned} stale record(s) no longer in the ship set")
 
             conn.commit()
         return build_hash

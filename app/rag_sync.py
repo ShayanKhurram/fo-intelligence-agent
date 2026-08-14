@@ -212,7 +212,14 @@ def drain_queue(
         return {"status": "ok", "ingested": 0, "failed": 0, "stale": len(stale)}
 
     try:
-        build_hash = ingest_mod.write_to_postgres(pg_dsn, records, provenance_by_record)
+        # prune=False is load-bearing: write_to_postgres's default prune deletes every
+        # pipeline record not in the batch it was handed, which is right for the full
+        # batch job and catastrophic here — this drain carries only the leads that
+        # confirmed since the last one, so a pruning write would trade one new record for
+        # the loss of every other. Removing a re-judged lead stays the batch job's work.
+        build_hash = ingest_mod.write_to_postgres(
+            pg_dsn, records, provenance_by_record, prune=False
+        )
     except Exception as exc:  # noqa: BLE001 — the RAG being down must not fail anything
         logger.error("rag_sync: Postgres ingest failed", exc_info=True)
         with connection(db_path) as conn:

@@ -108,8 +108,9 @@ def test_a_lead_no_longer_confirmed_is_marked_stale_not_ingested(db_path, monkey
             return {"record_id": entity_id, "entity_name": name, "outcome": outcome}
 
         @staticmethod
-        def write_to_postgres(dsn, records, provenance):
+        def write_to_postgres(dsn, records, provenance, *, prune=True):
             written["records"] = records
+            written["prune"] = prune
             return "hash-1"
 
     monkeypatch.setattr(rag_mod, "_load_ingest_module", lambda: FakeIngest)
@@ -141,8 +142,9 @@ def test_a_confirmed_lead_is_ingested_and_marked_done(db_path, monkeypatch):
             return {"record_id": entity_id, "entity_name": name, "outcome": outcome}
 
         @staticmethod
-        def write_to_postgres(dsn, records, provenance):
+        def write_to_postgres(dsn, records, provenance, *, prune=True):
             written["records"] = records
+            written["prune"] = prune
             return "hash-1"
 
     monkeypatch.setattr(rag_mod, "_load_ingest_module", lambda: FakeIngest)
@@ -175,7 +177,7 @@ def test_a_failing_postgres_write_keeps_the_row_pending(db_path, monkeypatch):
             return {"record_id": entity_id, "entity_name": name, "outcome": outcome}
 
         @staticmethod
-        def write_to_postgres(dsn, records, provenance):
+        def write_to_postgres(dsn, records, provenance, *, prune=True):
             raise RuntimeError("could not connect to server")
 
     monkeypatch.setattr(rag_mod, "_load_ingest_module", lambda: FakeIngest)
@@ -248,3 +250,39 @@ def test_no_test_can_reach_a_real_remote_database(monkeypatch):
     # ...and the sync paths therefore refuse to do anything remote.
     from app.log_sync import sync_runs
     assert sync_runs(limit=1)["reason"] == "no DATABASE_URL"
+
+
+def test_incremental_drain_never_prunes_the_rest_of_the_corpus(db_path, monkeypatch):
+    """The drain must call write_to_postgres with prune=False.
+
+    write_to_postgres's default prune deletes every pipeline record NOT in the batch it
+    was handed — correct for the full batch job, which always passes the complete ship
+    set, and catastrophic for an incremental drain, which passes only the leads that
+    confirmed since last time. With the prune left on, ingesting one new lead would
+    delete the other twenty-nine. The failure is silent: the drain reports success while
+    the corpus empties."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://nobody@localhost/none")
+    seen = {}
+
+    class FakeIngest:
+        @staticmethod
+        def _hq_state(conn, entity_id):
+            return None
+
+        @staticmethod
+        def build_record(entity_id, name, outcome, claims, hq_state=None):
+            return {"record_id": entity_id, "entity_name": name, "outcome": outcome}
+
+        @staticmethod
+        def write_to_postgres(dsn, records, provenance, *, prune=True):
+            seen["prune"] = prune
+            return "hash-1"
+
+    monkeypatch.setattr(rag_mod, "_load_ingest_module", lambda: FakeIngest)
+    with connection(db_path) as conn:
+        upsert_entity(conn, "e1", "Acme FO")
+        conn.execute("INSERT INTO enrichment_runs (entity_id, wave, outcome) VALUES ('e1','2','ship')")
+        enqueue_entity(conn, "e1")
+
+    assert drain_queue(db_path)["ingested"] == 1
+    assert seen["prune"] is False, "an incremental drain must not prune the corpus"
