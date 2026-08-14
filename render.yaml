@@ -23,7 +23,8 @@ services:
     runtime: python
     plan: starter            # NOT free: a spun-down instance never fires a schedule
     region: oregon
-    branch: main
+    repo: https://github.com/ShayanKhurram/fo-intelligence-agent
+    branch: main             # the deployed branch — this work must be merged here first
     numInstances: 1          # see the note above — never raise this
     buildCommand: pip install -r requirements.txt
     # 1 worker for the same reason as 1 instance: one scheduler, one SQLite writer.
