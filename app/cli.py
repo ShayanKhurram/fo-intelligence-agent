@@ -58,6 +58,80 @@ def _cmd_run(args: argparse.Namespace) -> None:
         print("failed entity_ids:", result.failed)
 
 
+def _cmd_backfill_log(args: argparse.Namespace) -> None:
+    """Write a provenance log for leads that were enriched BEFORE the log existed.
+
+    The claim ledger already holds everything the log is composed from — this makes no
+    tool calls, no LLM calls, and spends nothing; it is a read of work already done.
+    Without it, every lead enriched before T35 is invisible in the Log tab despite being
+    fully documented in the ledger.
+
+    Recorded as a run of kind='backfill' rather than pretending to be a scheduled or
+    layer1 run: the log must not claim these leads were processed at the moment the
+    backfill happened to run.
+    """
+    import json
+
+    from app.db import (
+        connection,
+        finish_run,
+        get_claims,
+        get_entity,
+        start_run,
+        write_field_provenance,
+    )
+    from app.provenance_log import build_run_log
+
+    with connection(args.db_path) as conn:
+        rows = conn.execute(
+            """
+            WITH latest AS (
+                SELECT entity_id, outcome,
+                       ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY id DESC) AS rn
+                FROM enrichment_runs
+            )
+            SELECT entity_id, outcome FROM latest WHERE rn = 1
+            """
+        ).fetchall()
+        outcomes = [(r["entity_id"], r["outcome"]) for r in rows]
+        if args.only_shipped:
+            outcomes = [(e, o) for e, o in outcomes if o in ("ship", "ship_with_caveats")]
+        if not outcomes:
+            print("Nothing to backfill — no entity has an enrichment_runs row yet.")
+            return
+
+        run_id = start_run(conn, "backfill", entity_count=len(outcomes),
+                           notes={"note": "provenance reconstructed from the existing claim "
+                                          "ledger for leads enriched before the log existed"})
+        doc = build_run_log(conn, run_id, outcomes)
+        rows_out = []
+        for lead in doc["leads"]:
+            for rec in lead["fields"]:
+                rows_out.append({
+                    "run_id": run_id, "entity_id": lead["entity_id"], "field": rec["field"],
+                    "value": rec["value"], "status": rec["status"], "shipped": rec["shipped"],
+                    "source_class": (rec["how"] or {}).get("source_class"),
+                    "extraction_method": (rec["how"] or {}).get("extraction_method"),
+                    "record": json.dumps(rec, ensure_ascii=False, default=str),
+                })
+        write_field_provenance(conn, rows_out)
+        shipped = sum(1 for _e, o in outcomes if o in ("ship", "ship_with_caveats"))
+        finish_run(conn, run_id, status="done", notes={
+            "note": "backfilled from the existing claim ledger; no tool or LLM calls were made",
+            "processed": len(doc["leads"]), "confirmed": shipped,
+            "termination": "backfill",
+        })
+    print(f"Backfilled run {run_id}: {len(doc['leads'])} leads, {len(rows_out)} field records "
+          f"({shipped} confirmed).")
+
+
+def _cmd_push_log(args: argparse.Namespace) -> None:
+    """Mirror the local run log to Postgres so the hosted view shows it."""
+    from app.log_sync import sync_runs
+
+    print(sync_runs(args.db_path, limit=args.limit))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="python -m app.cli")
     parser.add_argument("--db-path", dest="db_path", default=None)
@@ -73,6 +147,16 @@ def main() -> None:
     trace_parser = sub.add_parser("trace", help="Print the full reasoning/tool-call trace for one or more leads.")
     trace_parser.add_argument("entity_ids", nargs="+", help="entity_id(s) to show the trace for.")
 
+    backfill_parser = sub.add_parser(
+        "backfill-log",
+        help="Write a provenance log for leads enriched before the log existed. Reads the "
+             "claim ledger only — no tool calls, no LLM calls, no spend.")
+    backfill_parser.add_argument("--only-shipped", action="store_true",
+                                 help="Skip rejected leads (default: include them).")
+
+    push_parser = sub.add_parser("push-log", help="Mirror the run log to Postgres for the hosted view.")
+    push_parser.add_argument("--limit", type=int, default=50, help="How many recent runs to push.")
+
     args = parser.parse_args()
     if args.command == "init-db":
         _cmd_init_db(args)
@@ -80,6 +164,10 @@ def main() -> None:
         _cmd_run(args)
     elif args.command == "trace":
         _cmd_trace(args)
+    elif args.command == "backfill-log":
+        _cmd_backfill_log(args)
+    elif args.command == "push-log":
+        _cmd_push_log(args)
 
 
 if __name__ == "__main__":

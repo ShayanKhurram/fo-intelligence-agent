@@ -62,6 +62,20 @@ const pill =
 function FieldLog({ rec }: { rec: FieldRecord }) {
   const shipped = rec.value !== null && rec.value !== undefined && rec.value !== "";
   const how = rec.how ?? {};
+
+  // Layer V records one finding per claim examined, so a field backed by six claims shows
+  // the same check six times — six identical lines that read as six distinct problems.
+  // Collapse to one line per (check_id, severity, detail) with a count.
+  const dedupedChecks = Object.values(
+    (rec.checks ?? []).reduce<Record<string, { check_id: string; severity: string; detail?: string; count: number }>>(
+      (acc, c) => {
+        const key = `${c.check_id}|${c.severity}|${c.detail ?? ""}`;
+        acc[key] = acc[key] ? { ...acc[key], count: acc[key].count + 1 } : { ...c, count: 1 };
+        return acc;
+      },
+      {}
+    )
+  );
   const meta = [how.wave && `wave ${how.wave}`, how.question_id, how.extraction_method, how.source_class]
     .filter(Boolean)
     .join(" · ");
@@ -134,12 +148,13 @@ function FieldLog({ rec }: { rec: FieldRecord }) {
           ))}
         </ul>
       )}
-      {(rec.checks ?? []).length > 0 && (
+      {dedupedChecks.length > 0 && (
         <ul className="mono mt-1 list-disc pl-4 text-[11px] text-[var(--text-low)]">
-          {rec.checks!.slice(0, 6).map((c, i) => (
+          {dedupedChecks.slice(0, 4).map((c, i) => (
             <li key={i}>
               check {c.check_id}: {c.severity}
               {c.detail ? ` — ${c.detail}` : ""}
+              {c.count > 1 ? ` (×${c.count})` : ""}
             </li>
           ))}
         </ul>
