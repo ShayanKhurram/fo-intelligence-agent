@@ -232,3 +232,19 @@ async def test_a_lead_that_confirms_during_a_scheduled_run_is_queued_automatical
     assert queued == ["e0"]
     # The drain ran at the end of the job and, with no DATABASE_URL, skipped cleanly.
     assert result["rag"]["status"] == "skipped"
+
+
+def test_no_test_can_reach_a_real_remote_database(monkeypatch):
+    """The conftest guard, asserted rather than assumed.
+
+    Without it, any test that runs a scheduled job pushes its throwaway tmp-database rows
+    into whatever DATABASE_URL happens to be configured — which is exactly what happened
+    once a real Supabase DSN reached .env: ten junk 'scheduled/running' runs landed in the
+    production project. The guard is autouse, so this test simply confirms it is in force."""
+    import os
+
+    assert os.environ.get("DATABASE_URL") is None
+    assert os.environ.get("POSTGRES_URL") is None
+    # ...and the sync paths therefore refuse to do anything remote.
+    from app.log_sync import sync_runs
+    assert sync_runs(limit=1)["reason"] == "no DATABASE_URL"
