@@ -247,3 +247,55 @@ async def test_manual_run_never_redraws_an_already_submitted_lead(client, monkey
     drawn = r.json()["entity_ids"]
     assert drawn == ["fresh"]
     assert "old" not in drawn and "hedge" not in drawn
+
+
+async def test_every_discovery_file_is_ingested_not_one_hardcoded_path(client, monkeypatch, tmp_path):
+    """T40 — the agent reads EVERY discovery JSONL, not a single pinned filename.
+
+    It was pinned to a 28 July snapshot, so every connector run after that date wrote a
+    file the agent never opened. Measured when caught: 877 leads sat in
+    data/fo_leads_prioritized.jsonl and 659 of them had never reached the database. The
+    queue looked small because nothing was loading the leads, not because they were
+    missing."""
+    import json
+
+    import app.api as api_mod
+
+    old = tmp_path / "a_old_discovery.jsonl"
+    new = tmp_path / "b_new_discovery.jsonl"
+    old.write_text(json.dumps({
+        "entity_name_raw": "OLD FIRM", "discovery_class": "fec_employer",
+        "discovery_source_id": "x1", "discovery_url": "https://e.com",
+        "retrieved_at": "2026-07-28T00:00:00+00:00", "signals": {},
+    }) + "\n", encoding="utf-8")
+    new.write_text(json.dumps({
+        "entity_name_raw": "NEW FIRM", "discovery_class": "adv_web",
+        "discovery_source_id": "x2", "discovery_url": "https://n.com",
+        "retrieved_at": "2026-08-14T00:00:00+00:00", "signals": {},
+    }) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(api_mod, "DISCOVERY_DATA_DIR", tmp_path)
+
+    body = (await client.get("/api/leads/available")).json()
+    # Both files loaded, and in priority order: FEC (tier 1) ahead of adv_web (tier 2).
+    assert body["total"] == 2
+    assert body["sample_names"] == ["OLD FIRM", "NEW FIRM"]
+
+
+async def test_a_malformed_discovery_file_does_not_take_the_queue_down(client, monkeypatch, tmp_path):
+    """One bad file must not make every lead unavailable."""
+    import json
+
+    import app.api as api_mod
+
+    (tmp_path / "a_good.jsonl").write_text(json.dumps({
+        "entity_name_raw": "GOOD FIRM", "discovery_class": "fec_employer",
+        "discovery_source_id": "x1", "discovery_url": "https://e.com",
+        "retrieved_at": "2026-08-14T00:00:00+00:00", "signals": {},
+    }) + "\n", encoding="utf-8")
+    (tmp_path / "b_broken.jsonl").write_text("{not json at all\n", encoding="utf-8")
+
+    monkeypatch.setattr(api_mod, "DISCOVERY_DATA_DIR", tmp_path)
+
+    body = (await client.get("/api/leads/available")).json()
+    assert body["total"] == 1 and body["sample_names"] == ["GOOD FIRM"]

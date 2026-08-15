@@ -12,6 +12,7 @@ read functions, which are imported as module-level names so tests can monkeypatc
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
@@ -52,8 +53,34 @@ from app.scheduler import (
     update_schedule,
 )
 
-DISCOVERY_JSONL_PATH = "data/fo_discovery_c1-c3-c4-c8_20260728T090511Z.jsonl"
+# Every discovery JSONL in the data directory, not one hardcoded file.
+#
+# This was pinned to `fo_discovery_c1-c3-c4-c8_20260728T090511Z.jsonl` — a 28 July
+# snapshot — so every connector run after that date wrote a file the agent never read.
+# Measured when it was caught: `data/fo_leads_prioritized.jsonl` held 877 leads (592
+# adv_web, 161 fec_employer, 119 adv_name, 5 edgar_entity) of which **659 had never
+# reached the database**. The queue was not small because the leads were missing; it was
+# small because nothing was loading them.
+#
+# Ingest is an idempotent upsert keyed on the normalised name, so re-reading every file
+# on each call costs a little I/O and cannot duplicate a lead. A new connector output
+# dropped into data/ is picked up with no code change — which is the property that was
+# missing.
+DISCOVERY_DATA_DIR = Path("data")
+DISCOVERY_GLOB = "*.jsonl"
+
+
+def discovery_files() -> list[Path]:
+    """Discovery JSONL files, oldest first so the newest record wins on conflicting
+    fields. Sorted by name for a deterministic order across runs."""
+    if not DISCOVERY_DATA_DIR.exists():
+        return []
+    return sorted(DISCOVERY_DATA_DIR.glob(DISCOVERY_GLOB))
+
+
 STATIC_DIR = Path(__file__).parent / "static"
+
+logger = logging.getLogger(__name__)
 
 # run_id -> {"entity_ids", "status", "started_at", "result", "task"}. Module-level,
 # in-memory: lost on restart. See module docstring for why that's acceptable here.
@@ -134,9 +161,15 @@ def _resolve_order() -> list[str]:
     "83/100 processed" before any work had been done.
 
     Ingest still runs first (idempotent upsert) so newly-added discovery rows become
-    entities before the queue is computed."""
+    entities before the queue is computed — across EVERY discovery file, so a connector
+    run since the last agent run is picked up automatically."""
     with connection() as conn:
-        ingest_discovery_file(conn, DISCOVERY_JSONL_PATH)
+        for path in discovery_files():
+            try:
+                ingest_discovery_file(conn, path)
+            except Exception:  # noqa: BLE001
+                # One malformed file must not make the whole queue unavailable.
+                logger.warning("could not ingest discovery file %s", path, exc_info=True)
         return scheduler_queue_order(conn)
 
 
