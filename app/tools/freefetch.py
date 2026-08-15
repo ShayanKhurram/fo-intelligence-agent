@@ -11,6 +11,8 @@ directly (no trafilatura tier), so the two layers now share one page-fetch backe
 though Enrichment keeps its cheap fast path in front of it."""
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Any
 
 import httpx
@@ -19,6 +21,8 @@ import trafilatura
 from app.toollog import logged
 
 _HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; FO-Intelligence-Agent/1.0; +research)"}
+logger = logging.getLogger(__name__)
+
 _MIN_CONTENT_CHARS = 200
 
 
@@ -59,6 +63,58 @@ def _get_shared_client() -> httpx.AsyncClient:
     return _shared_client
 
 
+# Above this many characters a page is not read at all.
+#
+# `trafilatura.extract` is synchronous, and its `repair_faulty_html` step does string
+# surgery whose cost is not linear in page size. On one real page it consumed the whole
+# service: the loop parked inside `repair_faulty_html` while memory climbed 809MB -> 2.1GB
+# in eight seconds, on its way to an OOM. A firm's team or contact page is tens of KB;
+# 5MB of markup is a sitemap, a data dump or a malformed page, and there is nothing in it
+# this tier wants. Refusing it costs a fetch that was going to fail anyway.
+_MAX_EXTRACT_CHARS = 5_000_000
+
+# Wall-clock ceiling on one extraction, independent of size. The size guard catches the
+# page that is obviously too big; this catches the one that is small but pathological.
+_EXTRACT_TIMEOUT_S = 20.0
+
+
+async def _extract_text(html: str) -> str | None:
+    """Run trafilatura off the event loop, size-guarded and time-boxed.
+
+    Two separate failures made this necessary, both diagnosed from live stack dumps of a
+    wedged run rather than from review:
+
+    1. It ran ON the event loop. Synchronous CPU-bound parsing there stops every other
+       coroutine — the scheduler's other leads, the progress publisher, and the HTTP
+       server itself, which stopped answering /api/scheduler/live entirely. A page that
+       merely parses slowly should cost that page, not the whole service.
+    2. It had no bound. One page sent memory to 2.1GB and climbing with no way out.
+
+    A page that trips either guard is treated exactly like an unparseable one: None, and
+    the caller escalates to the headless-browser tier, which is what that tier is for."""
+    if len(html) > _MAX_EXTRACT_CHARS:
+        logger.info("skipping extraction: %d chars exceeds the %d-char ceiling",
+                    len(html), _MAX_EXTRACT_CHARS)
+        return None
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                trafilatura.extract, html, include_comments=False, include_tables=False
+            ),
+            timeout=_EXTRACT_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        # The worker thread is left to finish on its own — there is no way to cancel a
+        # thread mid-call. It holds the GIL in bursts rather than continuously, so the
+        # loop keeps running; what matters is that this coroutine is no longer waiting.
+        logger.warning("extraction exceeded %ss — treating the page as unparseable",
+                       _EXTRACT_TIMEOUT_S)
+        return None
+    except Exception:  # noqa: BLE001 — a parser crash is an unparseable page, not an error
+        logger.debug("extraction raised", exc_info=True)
+        return None
+
+
 async def free_fetch_raw(url: str) -> dict[str, Any] | None:
     """Returns {"url","content"} on success (non-trivial extracted text), or None on any
     failure (connection error, non-2xx, unparseable, too little extracted text) so
@@ -70,7 +126,7 @@ async def free_fetch_raw(url: str) -> dict[str, Any] | None:
     except httpx.HTTPError:
         return None
 
-    text = trafilatura.extract(html, include_comments=False, include_tables=False)
+    text = await _extract_text(html)
     if not text or len(text.strip()) < _MIN_CONTENT_CHARS:
         return None
     return {"url": url, "content": text.strip()}
