@@ -160,3 +160,58 @@ async def test_a_parser_crash_is_an_unparseable_page_not_an_error():
         assert await ff._extract_text("<html></html>") is None
     finally:
         ff.trafilatura.extract = real
+
+
+# ---------------------------------------------------------------------------
+# T41c — the download itself must be bounded, not just what is done with it.
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_an_oversized_body_never_reaches_memory():
+    """The guard has to sit before the body is materialised.
+
+    `resp.text` decodes the whole response; on an oversized one that IS the crash —
+    `codecs.decode -> MemoryError`, five times in one run's log, process at 2.1GB. A check
+    on the decoded string can never fire, because reaching it is what kills the process."""
+    huge = b"<html>" + b"x" * (ff._MAX_DOWNLOAD_BYTES + 1000) + b"</html>"
+    respx.get("https://huge.example").mock(return_value=httpx.Response(200, content=huge))
+
+    assert await ff._get_bounded("https://huge.example") is None
+    assert await ff.free_fetch_raw("https://huge.example") is None
+    assert await ff.fetch_raw_html("https://huge.example") is None
+
+
+@respx.mock
+async def test_a_lying_content_length_does_not_get_a_free_pass():
+    """A missing or dishonest Content-Length is exactly the case that caused the OOM, so
+    the running total over streamed chunks — not the header — is the real bound."""
+    huge = b"x" * (ff._MAX_DOWNLOAD_BYTES + 1000)
+    respx.get("https://liar.example").mock(
+        return_value=httpx.Response(200, content=huge, headers={"content-length": "10"}))
+
+    assert await ff._get_bounded("https://liar.example") is None
+
+
+@respx.mock
+async def test_an_oversized_content_length_is_refused_without_downloading():
+    """The cheap early exit: when the server is honest about a huge body, do not pull it."""
+    route = respx.get("https://declared.example").mock(
+        return_value=httpx.Response(
+            200, content=b"<html>small</html>",
+            headers={"content-length": str(ff._MAX_DOWNLOAD_BYTES + 1)}))
+
+    assert await ff._get_bounded("https://declared.example") is None
+    assert route.called
+
+
+@respx.mock
+async def test_a_normal_page_is_unaffected():
+    """The bound must not change what a real page does — this tier's whole job."""
+    body = "<html><body>" + "word " * 300 + "</body></html>"
+    respx.get("https://fine.example").mock(return_value=httpx.Response(200, html=body))
+
+    text = await ff._get_bounded("https://fine.example")
+    assert text is not None and "word" in text
+    result = await ff.free_fetch_raw("https://fine.example")
+    assert result is not None and result["url"] == "https://fine.example"

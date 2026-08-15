@@ -115,15 +115,71 @@ async def _extract_text(html: str) -> str | None:
         return None
 
 
+# Hard ceiling on how many bytes are pulled off the wire for one page.
+#
+# The guard has to sit HERE, not after the download. `resp.text` materialises the whole
+# body and decodes it into a str; on an oversized response that is where the process
+# dies:
+#
+#     free_fetch_raw (app/tools/freefetch.py) -> html = resp.text
+#       httpx/_models.py:649 in text -> decoder.decode(self.content)
+#         <frozen codecs>:322 in decode
+#     MemoryError
+#
+# — five times in one run's log, with the process at 2.1GB. A size check on the decoded
+# string can never fire, because reaching it is what kills the process. Streaming with a
+# running total bounds the cost of a hostile or broken response at _MAX_DOWNLOAD_BYTES
+# no matter what the server claims or sends.
+_MAX_DOWNLOAD_BYTES = 5_000_000
+
+
+async def _get_bounded(url: str) -> str | None:
+    """GET `url`, refusing anything over `_MAX_DOWNLOAD_BYTES`. Returns decoded text, or
+    None if the response was too large, errored, or could not be decoded.
+
+    Content-Length is honoured when present as a cheap early exit, but not trusted: a
+    missing or lying header is exactly the case that caused the OOM, so the running total
+    over the streamed chunks is the real bound."""
+    try:
+        async with _get_shared_client().stream("GET", url) as resp:
+            resp.raise_for_status()
+            declared = resp.headers.get("content-length")
+            if declared and declared.isdigit() and int(declared) > _MAX_DOWNLOAD_BYTES:
+                logger.info("refusing %s: content-length %s exceeds %d bytes",
+                            url, declared, _MAX_DOWNLOAD_BYTES)
+                return None
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in resp.aiter_bytes():
+                total += len(chunk)
+                if total > _MAX_DOWNLOAD_BYTES:
+                    # Abandon mid-stream. The context manager closes the connection, so
+                    # the remaining bytes are never pulled.
+                    logger.info("abandoning %s: body exceeded %d bytes", url, _MAX_DOWNLOAD_BYTES)
+                    return None
+                chunks.append(chunk)
+            encoding = resp.encoding or "utf-8"
+    except httpx.HTTPError:
+        return None
+    except MemoryError:
+        # Belt and braces: a body small enough to accept can still be pathological to
+        # decode. A page that cannot be read is an unparseable page, not a crash.
+        logger.warning("ran out of memory reading %s — treating it as unfetchable", url)
+        return None
+
+    try:
+        return b"".join(chunks).decode(encoding, errors="replace")
+    except (LookupError, MemoryError):
+        return None
+
+
 async def free_fetch_raw(url: str) -> dict[str, Any] | None:
     """Returns {"url","content"} on success (non-trivial extracted text), or None on any
-    failure (connection error, non-2xx, unparseable, too little extracted text) so
-    callers can fall back to a paid scrape without treating this as an error state."""
-    try:
-        resp = await _get_shared_client().get(url)
-        resp.raise_for_status()
-        html = resp.text
-    except httpx.HTTPError:
+    failure (connection error, non-2xx, oversized, unparseable, too little extracted
+    text) so callers can fall back to a paid scrape without treating this as an error
+    state."""
+    html = await _get_bounded(url)
+    if html is None:
         return None
 
     text = await _extract_text(html)
@@ -138,13 +194,12 @@ async def fetch_raw_html(url: str) -> str | None:
     through trafilatura, which strips <script> blocks (including JSON-LD) as part of
     its job. Used by wave 1's JSON-LD principal-name parsing (plan §4: "Site team pages
     often carry JSON-LD Person/Organization blocks... parse the JSON-LD before the
-    prose"). Returns None on any failure — never raises."""
-    try:
-        resp = await _get_shared_client().get(url)
-        resp.raise_for_status()
-        return resp.text
-    except httpx.HTTPError:
-        return None
+    prose"). Returns None on any failure — never raises.
+
+    Size-bounded for the same reason as `free_fetch_raw`: this reads raw HTML, so an
+    oversized body is if anything more dangerous here — there is no extraction step to
+    discard it, and the whole string is handed to the JSON-LD parser."""
+    return await _get_bounded(url)
 
 
 @logged("fetch_page_free_first")
