@@ -22,15 +22,51 @@ _HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; FO-Intelligence-Agent/1.0; +
 _MIN_CONTENT_CHARS = 200
 
 
+# One pooled client for every free fetch, instead of a fresh AsyncClient per call.
+#
+# Constructing an AsyncClient builds an SSL context, and `ssl.create_default_context()`
+# loads the entire system CA store — hundreds of certificates parsed synchronously, on
+# the event loop. One call is a few milliseconds; Layer V's V1 ring-fence makes one per
+# claim per lead, across three concurrent leads, and the loop spends all its time in
+# `ssl.py:create_default_context` instead of running coroutines.
+#
+# Diagnosed from a live stall, not from review: a scheduled run sat for ten minutes with
+# 0 leads processed, no tool calls, no log output and ~60% of a core burning. py-spy gave
+# the answer directly —
+#
+#     create_default_context (ssl.py:707)
+#     create_ssl_context (httpx/_config.py:40)
+#     __init__ (httpx/_transports/default.py:297)
+#     free_fetch_raw (app/tools/freefetch.py:30)
+#     _default_v1_fetch (app/validation.py:747)
+#
+# app/llm.py already solved exactly this for the LLM path (`_get_shared_client`) after
+# connection resets under batch concurrency; this is the same fix for the fetch path.
+# No shutdown hook: the client's lifetime is the process's, and both the CLI and the
+# scheduler service exit as a unit.
+_shared_client: httpx.AsyncClient | None = None
+
+
+def _get_shared_client() -> httpx.AsyncClient:
+    global _shared_client
+    if _shared_client is None:
+        _shared_client = httpx.AsyncClient(
+            timeout=15.0,
+            follow_redirects=True,
+            headers=_HEADERS,
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+        )
+    return _shared_client
+
+
 async def free_fetch_raw(url: str) -> dict[str, Any] | None:
     """Returns {"url","content"} on success (non-trivial extracted text), or None on any
     failure (connection error, non-2xx, unparseable, too little extracted text) so
     callers can fall back to a paid scrape without treating this as an error state."""
     try:
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=_HEADERS) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            html = resp.text
+        resp = await _get_shared_client().get(url)
+        resp.raise_for_status()
+        html = resp.text
     except httpx.HTTPError:
         return None
 
@@ -48,10 +84,9 @@ async def fetch_raw_html(url: str) -> str | None:
     often carry JSON-LD Person/Organization blocks... parse the JSON-LD before the
     prose"). Returns None on any failure — never raises."""
     try:
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=_HEADERS) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            return resp.text
+        resp = await _get_shared_client().get(url)
+        resp.raise_for_status()
+        return resp.text
     except httpx.HTTPError:
         return None
 
