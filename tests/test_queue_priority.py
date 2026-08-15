@@ -117,3 +117,31 @@ def test_breakdown_reports_empty_tiers_too(db_path):
     assert len(tiers) == len(SOURCE_CLASS_PRIORITY)
     assert tiers[0]["available"] == 1
     assert all(t["available"] == 0 for t in tiers[1:])
+
+
+def test_a_failed_lead_comes_back_for_another_attempt(db_path):
+    """A lead that failed was never actually assessed — a crash, a timeout, an outage.
+    Excluding it forever would silently shrink the pool every time something went wrong,
+    so it returns, ahead of untried work."""
+    with connection(db_path) as conn:
+        _seed(conn, "crashed", "fec_employer")
+        upsert_checkpoint(conn, "crashed", status="failed")
+        _seed(conn, "untried", "fec_employer")
+
+    with connection(db_path) as conn:
+        assert _queue(conn) == ["crashed", "untried"]
+
+
+def test_only_a_lead_that_actually_got_a_verdict_is_retired(db_path):
+    """The line between 'submitted' and 'failed': `verdict_done` means the agent reached a
+    conclusion, so re-running it would spend money to learn nothing. Every other state is
+    unfinished work."""
+    with connection(db_path) as conn:
+        for i, status in enumerate(["verdict_done", "failed", "retry", "running"]):
+            _seed(conn, f"e{i}", "fec_employer")
+            upsert_checkpoint(conn, f"e{i}", status=status)
+
+    with connection(db_path) as conn:
+        queued = set(_queue(conn))
+    assert "e0" not in queued, "a lead with a verdict must not be re-run"
+    assert {"e1", "e2", "e3"} <= queued, "failed/retry/interrupted leads must come back"

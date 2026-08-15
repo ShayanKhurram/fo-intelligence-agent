@@ -45,6 +45,7 @@ from app.config import SETTINGS
 from app.db import (
     connection,
     finish_run,
+    get_active_run,
     get_entity,
     get_resumable_leads,
     get_unstarted_entities,
@@ -435,6 +436,16 @@ async def run_scheduled_job(
     max_leads = schedule.get("max_leads")
 
     with connection(db_path) as conn:
+        # One scheduled run at a time. Two runs draw from the same queue and the same
+        # paid tools, and the second's counters overwrite the first's in every view — a
+        # fresh run starting beside a long one reads as the long one "restarting from
+        # zero", which is exactly how this was reported.
+        active = get_active_run(conn)
+        if active is not None:
+            logger.info("skipping scheduled run: %s is still active", active["run_id"])
+            return {"run_id": None, "processed": 0, "confirmed": 0, "confirmed_ids": [],
+                    "termination": "already_running", "usd_spent": 0.0,
+                    "rag": {}, "log_push": {}}
         queue = _queue(conn)
         run_id = start_run(conn, "scheduled", entity_count=len(queue), notes={
             "schedule_id": schedule.get("schedule_id"),
@@ -510,6 +521,20 @@ async def run_scheduled_job(
             # per run, and the hosted page stops being minutes stale. sync_runs never
             # raises and skips cleanly when no DSN is configured.
             sync_runs(db_path, limit=1)
+        # Publish a confirmed lead to the retrieval corpus NOW rather than at run end.
+        #
+        # Draining only at the end means a run that is killed, crashes, or simply has not
+        # finished yet leaves its confirmed leads unsearchable — measured: 28 confirmed
+        # leads sat `pending` with an empty corpus because no run had ended cleanly since
+        # the corpus was cleared. A lead is either good enough to publish or it is not;
+        # waiting for its siblings is not part of that judgement.
+        #
+        # Off the event loop: drain_queue opens Postgres and runs an embedding model, and
+        # doing that inline is exactly the class of blocking that wedged earlier runs.
+        # It never raises and skips cleanly with no DSN, so a failure here costs nothing
+        # but a delay until the next drain.
+        if result["confirmed"]:
+            await asyncio.to_thread(drain_queue, db_path)
         return result
 
     _publish(phase="starting")

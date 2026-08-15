@@ -459,3 +459,91 @@ async def test_the_hosted_mirror_is_pushed_after_the_run_is_closed(db_path, monk
     final = pushed[-1]
     assert final["status"] == "done", "the last push must carry the run's FINAL status"
     assert final["field_rows"] > 0, "the last push must happen after provenance rows exist"
+
+
+async def test_orphaned_runs_are_closed_at_startup(db_path):
+    """A run only executes inside a live process. A row still marked `running` at startup
+    belonged to a process that is gone, and leaving it makes it the newest 'active' run
+    forever: the live panel shows its frozen counters, and a fresh run beside it reads as
+    the old one restarting from zero. Three had accumulated across restarts."""
+    from app.db import get_active_run, reconcile_orphaned_runs, start_run, upsert_checkpoint
+
+    with connection(db_path) as conn:
+        _seed_leads(db_path, 1)
+        old = start_run(conn, "scheduled", entity_count=5)
+        upsert_checkpoint(conn, "e0", status="running")
+
+    with connection(db_path) as conn:
+        assert get_active_run(conn) is not None          # before: looks active
+        closed = reconcile_orphaned_runs(conn)
+
+    assert closed == 1
+    with connection(db_path) as conn:
+        assert get_active_run(conn) is None, "no run may look active after a restart"
+        assert get_run(conn, old)["status"] == "interrupted"
+        # ...and its in-flight lead is retryable rather than stuck as busy forever.
+        row = conn.execute(
+            "SELECT status FROM lead_checkpoints WHERE entity_id = 'e0'").fetchone()
+        assert row["status"] == "retry"
+
+
+async def test_a_second_scheduled_run_will_not_start_beside_a_live_one(db_path, monkeypatch):
+    """Two runs draw from the same queue and the same paid tools, and the second's
+    counters overwrite the first's in every view — which is exactly what "it restarted
+    from zero" looked like."""
+    from app.db import start_run
+
+    _seed_leads(db_path, 3)
+    with connection(db_path) as conn:
+        conn.execute("INSERT INTO decisions (entity_id, verdict, rationale) VALUES ('e0','pursue','')")
+        start_run(conn, "scheduled", entity_count=3)     # one already in flight
+
+    ran = []
+
+    async def fake_run_lead(entity_id, db_path=None):
+        ran.append(entity_id)
+        return {"cost_usd": 0.0}
+
+    monkeypatch.setattr(sched_mod, "run_lead", fake_run_lead)
+
+    result = await run_scheduled_job(
+        {"schedule_id": "s1", "name": "t", "target_confirmed": None, "max_leads": None},
+        db_path=db_path, model=object(),
+    )
+
+    assert result["termination"] == "already_running"
+    assert result["run_id"] is None
+    assert ran == [], "no lead may be processed by the refused run"
+
+
+async def test_a_confirmed_lead_is_published_without_waiting_for_the_run_to_end(db_path, monkeypatch):
+    """Draining only at run end means a run that is killed, crashes, or is simply still
+    going leaves its confirmed leads unsearchable — measured: 28 confirmed leads sat
+    pending against an empty corpus because no run had ended cleanly."""
+    drains: list[str] = []
+
+    def fake_drain(db, *, limit=25):
+        drains.append("drained")
+        return {"status": "ok", "ingested": 1, "failed": 0}
+
+    async def fake_run_lead(entity_id, db_path=None):
+        return {"cost_usd": 0.0}
+
+    async def fake_process_entity(conn, entity_id, model, *, force=False):
+        return {"entity_id": entity_id, "outcome": "ship", "calls_spent": 0, "usd_spent": 0.0}
+
+    monkeypatch.setattr(sched_mod, "drain_queue", fake_drain)
+    monkeypatch.setattr(sched_mod, "run_lead", fake_run_lead)
+    monkeypatch.setattr(sched_mod, "process_entity", fake_process_entity)
+    _seed_leads(db_path, 2)
+    with connection(db_path) as conn:
+        for eid in ("e0", "e1"):
+            conn.execute("INSERT INTO decisions (entity_id, verdict, rationale) VALUES (?, 'pursue','')", (eid,))
+
+    await run_scheduled_job(
+        {"schedule_id": "s1", "name": "t", "target_confirmed": None, "max_leads": None},
+        db_path=db_path, model=object(), chunk_size=1,
+    )
+
+    # Two confirmations during the run, plus the end-of-run drain.
+    assert len(drains) >= 3, f"expected a drain per confirmed lead, got {len(drains)}"

@@ -27,6 +27,7 @@ from pydantic import BaseModel
 from app.db import (
     connection,
     get_active_run,
+    reconcile_orphaned_runs,
     get_entity,
     get_field_provenance,
     get_recent_tool_calls,
@@ -99,6 +100,13 @@ async def _lifespan(_app: FastAPI):
     # is the only other place init_db() gets called — so without this a fresh checkout
     # 500's on page load with "no such table: entities".
     init_db()
+    # A run cannot survive the process it ran in. Anything still marked `running` at
+    # startup died with a previous process, so close it and re-queue its leads — otherwise
+    # it stays the newest "active" run forever and every later run looks like it reset.
+    with connection() as conn:
+        orphaned = reconcile_orphaned_runs(conn)
+    if orphaned:
+        logger.warning("closed %d run(s) orphaned by a previous process", orphaned)
     # T36: the scheduler runs INSIDE this service, not as a separate worker. The pipeline
     # state is a SQLite file on one disk, and a Render disk mounts to exactly one service
     # — a second process could not share it. Off by default for local/dev runs; set

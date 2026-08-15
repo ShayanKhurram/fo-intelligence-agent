@@ -699,6 +699,28 @@ def update_run_notes(conn: sqlite3.Connection, run_id: str, notes: dict[str, Any
     conn.commit()
 
 
+def reconcile_orphaned_runs(conn: sqlite3.Connection) -> int:
+    """Close any run still marked `running` at startup, and re-queue its leads.
+
+    A run only executes inside a live process. If a row still says `running` when the
+    process starts, that run's task died with the process it belonged to — it cannot be
+    resumed and it is not going to finish. Left alone the row is worse than useless: it is
+    the newest "active" run, so `get_active_run` returns it, the live panel shows its
+    frozen counters forever, and a fresh run beside it reads as the old one restarting
+    from zero. Three such rows had accumulated across service restarts.
+
+    Their in-flight leads go back to `retry` rather than staying `running`, so work that
+    was interrupted is picked up again instead of being stranded as permanently busy.
+
+    Returns the number of runs closed."""
+    closed = conn.execute(
+        "UPDATE runs SET status = 'interrupted', "
+        "ended_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE status = 'running'"
+    ).rowcount
+    conn.execute("UPDATE lead_checkpoints SET status = 'retry' WHERE status = 'running'")
+    return closed
+
+
 def get_active_run(conn: sqlite3.Connection) -> dict[str, Any] | None:
     """The most recently started run still marked `running`, or None. What the UI polls to
     decide whether to show a live panel."""
