@@ -6,6 +6,8 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+
+from app.tools.httpclient import shared_client
 from langchain_core.tools import tool
 
 from app.config import SETTINGS
@@ -35,10 +37,10 @@ async def edgar_full_text_search_raw(
         params: dict[str, Any] = {"q": query}
         if forms_filter:
             params["forms"] = forms_filter
-        async with httpx.AsyncClient(timeout=30.0, headers=_HEADERS) as client:
-            resp = await client.get(SETTINGS.tools.edgar_fulltext_url, params=params)
-            resp.raise_for_status()
-            data = resp.json()
+        client = shared_client(timeout=30.0, headers=_HEADERS)
+        resp = await client.get(SETTINGS.tools.edgar_fulltext_url, params=params)
+        resp.raise_for_status()
+        data = resp.json()
         hits = data.get("hits", {}).get("hits", [])
         results = []
         for h in hits:
@@ -90,10 +92,10 @@ async def edgar_submissions_raw(cik: str) -> dict[str, Any]:
     padded = cik.zfill(10)
     url = f"{SETTINGS.tools.edgar_submissions_url}/CIK{padded}.json"
     try:
-        async with httpx.AsyncClient(timeout=30.0, headers=_HEADERS) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            data = resp.json()
+        client = shared_client(timeout=30.0, headers=_HEADERS)
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
     except (httpx.HTTPError, ValueError) as exc:
         return {"cik": cik, "error": str(exc)}
 

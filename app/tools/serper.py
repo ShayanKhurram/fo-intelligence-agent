@@ -23,6 +23,8 @@ from __future__ import annotations
 from typing import Any, Literal
 
 import httpx
+
+from app.tools.httpclient import shared_client
 from langchain_core.tools import tool
 
 from app.config import SETTINGS
@@ -63,18 +65,18 @@ async def serper_search_raw(
         headers = {"X-API-KEY": key, "Content-Type": "application/json"}
         await SERPER_BUCKET.acquire()
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(endpoint, json=payload, headers=headers)
-                # Serper reports a spent balance as 400 "Not enough credits", NOT 429 —
-                # see app.tools.keyrotation.is_exhaustion_response. This check must come
-                # before raise_for_status() or the 400 becomes a hard failure and the
-                # remaining funded keys are never tried.
-                if is_exhaustion_response(resp.status_code, resp.text):
-                    if _SERPER_ROTATOR.rotate():
-                        continue
-                    return {"results": [], "query": query, "error": "all Serper API keys exhausted"}
-                resp.raise_for_status()
-                data = resp.json()
+            client = shared_client(timeout=30.0)
+            resp = await client.post(endpoint, json=payload, headers=headers)
+            # Serper reports a spent balance as 400 "Not enough credits", NOT 429 —
+            # see app.tools.keyrotation.is_exhaustion_response. This check must come
+            # before raise_for_status() or the 400 becomes a hard failure and the
+            # remaining funded keys are never tried.
+            if is_exhaustion_response(resp.status_code, resp.text):
+                if _SERPER_ROTATOR.rotate():
+                    continue
+                return {"results": [], "query": query, "error": "all Serper API keys exhausted"}
+            resp.raise_for_status()
+            data = resp.json()
         except httpx.HTTPError as exc:
             return {"results": [], "query": query, "error": str(exc)}
         except ValueError as exc:  # JSON decode failure

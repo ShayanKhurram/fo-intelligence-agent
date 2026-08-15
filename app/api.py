@@ -123,6 +123,12 @@ async def _lifespan(_app: FastAPI):
             with suppress(asyncio.CancelledError):
                 await task
         _SCHEDULER.update({"task": None, "stop": None, "enabled": False})
+        # Close the headless browser on the way out. Its renderer processes are its
+        # children, so leaving it running leaves them running: a service restarted a few
+        # times during a working day had accumulated 69 stray chrome processes.
+        from app.tools.crawl import close_crawler
+        with suppress(Exception):
+            await close_crawler()
 
 
 app = FastAPI(title="FO Intelligence Agent — Research Layer", lifespan=_lifespan)

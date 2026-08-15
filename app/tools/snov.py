@@ -51,6 +51,8 @@ from typing import Any
 
 import httpx
 
+from app.tools.httpclient import shared_client
+
 from app.config import SETTINGS
 from app.tools.keyrotation import is_exhaustion_response
 from app.tools.ratelimit import SNOV_BUCKET
@@ -103,10 +105,10 @@ async def _get_token(force_refresh: bool = False) -> str | None:
         }
         await SNOV_BUCKET.acquire()
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(f"{SETTINGS.tools.snov_base_url}{_TOKEN_PATH}", data=payload)
-                resp.raise_for_status()
-                data = resp.json()
+            client = shared_client(timeout=30.0)
+            resp = await client.post(f"{SETTINGS.tools.snov_base_url}{_TOKEN_PATH}", data=payload)
+            resp.raise_for_status()
+            data = resp.json()
         except (httpx.HTTPError, ValueError) as exc:
             logger.warning("Snov.io auth failed: %s", exc)
             _token, _token_expires_at = None, 0.0
@@ -138,20 +140,20 @@ async def _request(
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
         await SNOV_BUCKET.acquire()
         try:
-            async with httpx.AsyncClient(timeout=45.0) as client:
-                resp = await client.request(
-                    method, url, headers=headers, json=json_body, params=params
-                )
-                if resp.status_code == 401 and attempt == 0:
-                    refreshed = await _get_token(force_refresh=True)
-                    if refreshed is None:
-                        return {"error": "Snov.io re-authentication failed"}
-                    token = refreshed
-                    continue
-                if is_exhaustion_response(resp.status_code, resp.text):
-                    return {"error": f"Snov.io credits exhausted (HTTP {resp.status_code})"}
-                resp.raise_for_status()
-                return resp.json()
+            client = shared_client(timeout=45.0)
+            resp = await client.request(
+                method, url, headers=headers, json=json_body, params=params
+            )
+            if resp.status_code == 401 and attempt == 0:
+                refreshed = await _get_token(force_refresh=True)
+                if refreshed is None:
+                    return {"error": "Snov.io re-authentication failed"}
+                token = refreshed
+                continue
+            if is_exhaustion_response(resp.status_code, resp.text):
+                return {"error": f"Snov.io credits exhausted (HTTP {resp.status_code})"}
+            resp.raise_for_status()
+            return resp.json()
         except (httpx.HTTPError, ValueError) as exc:
             return {"error": f"{type(exc).__name__}: {exc}"}
     return {"error": "Snov.io request failed after re-authentication"}

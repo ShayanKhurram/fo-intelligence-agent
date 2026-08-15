@@ -38,6 +38,8 @@ import logging
 from typing import Any
 
 import httpx
+
+from app.tools.httpclient import shared_client
 from langchain_core.tools import tool
 
 from app.tools.cache import cached_call
@@ -154,10 +156,10 @@ async def adv_firm_search_raw(query: str, max_results: int = 5) -> dict[str, Any
     await SEC_BUCKET.acquire()  # same SEC-facing budget as EDGAR
     params = {"query": query, "start": 0, "hits": max_results}
     try:
-        async with httpx.AsyncClient(timeout=30.0, headers=_HEADERS, follow_redirects=True) as client:
-            resp = await client.get(_SEARCH_URL, params=params)
-            resp.raise_for_status()
-            data = resp.json()
+        client = shared_client(timeout=30.0, headers=_HEADERS, follow_redirects=True)
+        resp = await client.get(_SEARCH_URL, params=params)
+        resp.raise_for_status()
+        data = resp.json()
     except (httpx.HTTPError, ValueError) as exc:
         return {"results": [], "query": query, "error": f"{type(exc).__name__}: {exc}"}
 

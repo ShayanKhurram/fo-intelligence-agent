@@ -253,3 +253,69 @@ async def test_retry_keeps_first_result_when_escalation_is_no_better(monkeypatch
     _install(monkeypatch, _NoBetter())
     out = await crawl_mod.crawl_page_raw("https://x")
     assert out["content"] == "short body"
+
+
+# ---------------------------------------------------------------------------
+# T42 — the browser must not leak renderer processes for the life of the run.
+# ---------------------------------------------------------------------------
+
+
+async def test_the_browser_is_recycled_after_enough_pages(monkeypatch):
+    """Each render opens a page, and Chromium backs a page with its own process. A render
+    cancelled by the overall timeout does not reliably clean its page up, so strays
+    accumulate: 69 live chrome processes were measured after a few hours of runs, and the
+    memory pressure turned an oversized decode into a MemoryError. Closing the browser
+    reclaims them, because they are its children."""
+    import app.tools.crawl as cr
+
+    closed = []
+
+    class FakeCrawler:
+        async def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(cr, "_crawler", FakeCrawler())
+    monkeypatch.setattr(cr, "_pages_rendered", cr._MAX_PAGES_PER_BROWSER - 1)
+    monkeypatch.setattr(cr, "_inflight", 0)
+
+    await cr._note_page_rendered()
+
+    assert closed == [True], "the browser should have been recycled"
+    assert cr._crawler is None, "the next call must start a fresh browser"
+    assert cr._pages_rendered == 0
+
+
+async def test_a_busy_browser_is_not_closed_underneath_a_render(monkeypatch):
+    """Recycling is maintenance; it must never turn into a failed fetch. Up to
+    _MAX_CONCURRENT_CRAWLS renders can share the browser, so the recycle waits until none
+    are in flight."""
+    import app.tools.crawl as cr
+
+    closed = []
+
+    class FakeCrawler:
+        async def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(cr, "_crawler", FakeCrawler())
+    monkeypatch.setattr(cr, "_pages_rendered", cr._MAX_PAGES_PER_BROWSER + 10)
+    monkeypatch.setattr(cr, "_inflight", 2)          # two renders still running
+
+    await cr._note_page_rendered()
+
+    assert closed == [], "must not close a browser other renders are using"
+    assert cr._crawler is not None
+
+
+async def test_close_crawler_survives_a_browser_that_will_not_close(monkeypatch):
+    """Shutdown paths must not raise. A browser that refuses to close is still discarded,
+    so the next call starts cleanly rather than reusing a broken one."""
+    import app.tools.crawl as cr
+
+    class StubbornCrawler:
+        async def close(self):
+            raise RuntimeError("browser is wedged")
+
+    monkeypatch.setattr(cr, "_crawler", StubbornCrawler())
+    await cr.close_crawler()          # must not raise
+    assert cr._crawler is None

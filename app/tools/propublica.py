@@ -7,6 +7,8 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+
+from app.tools.httpclient import shared_client
 from langchain_core.tools import tool
 
 from app.config import SETTINGS
@@ -17,10 +19,10 @@ async def nonprofit_search_raw(query: str) -> dict[str, Any]:
     """Returns {"results": [{"ein","name","city","state","ntee_code"}], "query"}."""
     url = f"{SETTINGS.tools.propublica_base_url}/search.json"
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get(url, params={"q": query})
-            resp.raise_for_status()
-            data = resp.json()
+        client = shared_client(timeout=30.0)
+        resp = await client.get(url, params={"q": query})
+        resp.raise_for_status()
+        data = resp.json()
     except (httpx.HTTPError, ValueError) as exc:
         return {"results": [], "query": query, "error": str(exc)}
 
@@ -42,10 +44,10 @@ async def nonprofit_detail_raw(ein: int | str) -> dict[str, Any]:
     """Org detail incl. officer names, when disclosed. Returns {"error": str} on failure."""
     url = f"{SETTINGS.tools.propublica_base_url}/organizations/{ein}.json"
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            data = resp.json()
+        client = shared_client(timeout=30.0)
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
     except (httpx.HTTPError, ValueError) as exc:
         return {"ein": ein, "error": str(exc)}
 

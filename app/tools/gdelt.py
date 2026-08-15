@@ -12,6 +12,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
+
+from app.tools.httpclient import shared_client
 from langchain_core.tools import tool
 
 from app.config import SETTINGS
@@ -44,17 +46,17 @@ async def news_search_raw(
     for attempt in range(_MAX_ATTEMPTS):
         await GDELT_BUCKET.acquire()
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.get(SETTINGS.tools.gdelt_base_url, params=params)
-                if resp.status_code == 429:
-                    last_error = "429 Too Many Requests"
-                    if attempt < _MAX_ATTEMPTS - 1:
-                        await asyncio.sleep(1.5 * (attempt + 1))
-                        continue
-                    break
-                resp.raise_for_status()
-                data = resp.json()
+            client = shared_client(timeout=30.0)
+            resp = await client.get(SETTINGS.tools.gdelt_base_url, params=params)
+            if resp.status_code == 429:
+                last_error = "429 Too Many Requests"
+                if attempt < _MAX_ATTEMPTS - 1:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
                 break
+            resp.raise_for_status()
+            data = resp.json()
+            break
         except (httpx.HTTPError, ValueError) as exc:
             last_error = str(exc)
             break

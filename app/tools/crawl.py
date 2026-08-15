@@ -58,6 +58,27 @@ _crawler: Any = None
 _crawler_lock = asyncio.Lock()
 _crawler_failed: str | None = None
 
+# Pages rendered by the current browser, and how many it is allowed before being replaced.
+#
+# The crawler is a singleton and is not restarted per page, which is right — starting a
+# browser is expensive. But each `arun()` opens a page (and Chromium backs a page with its
+# own renderer process), and when `asyncio.wait_for` cancels a slow `arun()` that page's
+# cleanup does not necessarily run. Each cancelled render can therefore strand a renderer
+# process for the lifetime of the browser.
+#
+# Measured, not theorised: after a few hours of scheduled runs this machine had **69 live
+# chrome processes** and the Python process was under enough memory pressure that an
+# oversized page decode tipped into MemoryError rather than merely being slow.
+#
+# Recycling the browser every `_MAX_PAGES_PER_BROWSER` renders reaps whatever leaked,
+# because closing the browser takes its children with it. The number is a trade: low
+# enough that strays cannot accumulate for hours, high enough that the ~2s browser start
+# is amortised over many pages.
+_pages_rendered = 0
+_MAX_PAGES_PER_BROWSER = 50
+# Renders currently in flight; a browser is only recycled when this is zero.
+_inflight = 0
+
 
 class _QuietLogger:
     """Silent stand-in for Crawl4AI's `AsyncLogger`.
@@ -131,6 +152,21 @@ async def _get_crawler() -> Any:
         return _crawler
 
 
+async def _note_page_rendered() -> None:
+    """Count a render and recycle the browser once it has done enough of them.
+
+    Only recycles when nothing is in flight. Closing a browser that another coroutine is
+    still rendering through would turn a maintenance action into a failed fetch — and up
+    to `_MAX_CONCURRENT_CRAWLS` renders can be running at once. Deferring costs nothing:
+    the next render past the threshold with a quiet browser does the recycling instead."""
+    global _pages_rendered
+    _pages_rendered += 1
+    if _pages_rendered >= _MAX_PAGES_PER_BROWSER and _inflight == 0:
+        logger.info("recycling the browser after %d pages to reclaim stray renderers",
+                    _pages_rendered)
+        await close_crawler()
+
+
 def _extract_text(result: Any) -> str:
     """Pull the best available text off a CrawlResult.
 
@@ -174,10 +210,20 @@ async def crawl_page_raw(url: str) -> dict[str, Any]:
             verbose=False,
             log_console=False,
         )
+        global _inflight
         async with _CRAWL_SEMAPHORE:
-            return await asyncio.wait_for(
-                crawler.arun(url, config=run_config), timeout=_OVERALL_TIMEOUT_S
-            )
+            _inflight += 1
+            try:
+                return await asyncio.wait_for(
+                    crawler.arun(url, config=run_config), timeout=_OVERALL_TIMEOUT_S
+                )
+            finally:
+                # In a `finally` so a TIMED-OUT render is counted too. Those are the ones
+                # that leak: wait_for cancels `arun` mid-flight and the page's cleanup does
+                # not necessarily run, stranding a renderer process. Counting only the
+                # successes would let exactly the leaking case escape the recycle policy.
+                _inflight -= 1
+                await _note_page_rendered()
 
     def _unwrap(res: Any) -> Any:
         # arun() may hand back a container wrapping the single result depending on version.
@@ -232,10 +278,13 @@ async def fetch_page(url: str) -> dict[str, Any]:
 async def close_crawler() -> None:
     """Shut the shared browser down. Batch CLI processes exit on their own so this is not
     required, but tests and long-lived hosts should call it to avoid leaking Chromium."""
-    global _crawler
+    global _crawler, _pages_rendered
     if _crawler is not None:
         try:
             await _crawler.close()
         except Exception as exc:  # noqa: BLE001 — teardown must never raise
             logger.debug("crawler close failed: %s", exc)
         _crawler = None
+    # Reset unconditionally: the counter belongs to the browser, and a new one starts
+    # fresh. Leaving it high would make the very next render try to recycle again.
+    _pages_rendered = 0
