@@ -413,3 +413,45 @@ async def test_progress_names_the_target_so_a_bar_can_be_drawn(db_path, monkeypa
         db_path=db_path, model=object(), chunk_size=1,
     )
     assert captured and captured[0].get("target_confirmed") == 2
+
+
+async def test_the_hosted_mirror_is_pushed_after_the_run_is_closed(db_path, monkeypatch):
+    """The push must happen AFTER finish_run and after the provenance rows are written.
+
+    Originally it ran before both, so the hosted view received the run while it was still
+    'running' with zero provenance rows — and nothing pushed again afterwards, leaving
+    every completed run displayed as permanently in-flight with 0 leads. Observed on the
+    live site before this was fixed."""
+    pushed: list[dict] = []
+
+    def fake_sync(db, *, limit=50):
+        # Snapshot what the mirror would have seen at push time.
+        with connection(db) as conn:
+            row = conn.execute(
+                "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1").fetchone()
+            fp = conn.execute("SELECT COUNT(*) AS n FROM field_provenance").fetchone()["n"]
+        pushed.append({"status": row["status"], "field_rows": fp})
+        return {"status": "ok", "runs": 1, "fields": fp}
+
+    async def fake_run_lead(entity_id, db_path=None):
+        return {"cost_usd": 0.0}
+
+    async def fake_process_entity(conn, entity_id, model, *, force=False):
+        return {"entity_id": entity_id, "outcome": "ship", "calls_spent": 0, "usd_spent": 0.0}
+
+    monkeypatch.setattr(sched_mod, "sync_runs", fake_sync)
+    monkeypatch.setattr(sched_mod, "run_lead", fake_run_lead)
+    monkeypatch.setattr(sched_mod, "process_entity", fake_process_entity)
+    _seed_leads(db_path, 1)
+    with connection(db_path) as conn:
+        conn.execute("INSERT INTO decisions (entity_id, verdict, rationale) VALUES ('e0','pursue','')")
+
+    await run_scheduled_job(
+        {"schedule_id": "s1", "name": "t", "target_confirmed": None, "max_leads": None},
+        db_path=db_path, model=object(),
+    )
+
+    assert pushed, "the hosted mirror was never pushed"
+    final = pushed[-1]
+    assert final["status"] == "done", "the last push must carry the run's FINAL status"
+    assert final["field_rows"] > 0, "the last push must happen after provenance rows exist"

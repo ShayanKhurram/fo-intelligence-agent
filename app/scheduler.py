@@ -430,10 +430,6 @@ async def run_scheduled_job(
                 "termination": termination, "usd_spent": total_cost, "error": str(exc)[:300]}
 
     rag = drain_queue(db_path)
-    # T37: mirror this run's log to Postgres so the hosted (Vercel) view shows it. Same
-    # contract as the RAG drain — a `skipped`/`error` summary, never an exception, and
-    # the local SQLite log stays the source of truth either way.
-    log_push = sync_runs(db_path, limit=5)
 
     # The provenance log for what this run produced, under this run's id — so the Log tab
     # can go run -> leads -> field logs with no extra plumbing (PLAN.md T35.5).
@@ -456,7 +452,6 @@ async def run_scheduled_job(
                 "usd_spent": total_cost,
                 "termination": termination,
                 "rag": rag,
-                "log_push": log_push,
             })
             doc = build_run_log(conn, run_id, [(r["entity_id"], r["outcome"] or r["verdict"] or "processed")
                                                for r in processed])
@@ -480,6 +475,13 @@ async def run_scheduled_job(
                 "confirmed": len(confirmed_ids), "termination": termination,
                 "usd_spent": total_cost, "rag": rag, "provenance_emission": "failed",
             })
+
+    # Mirror to the hosted view LAST — after finish_run has stamped the final status and
+    # after the field_provenance rows exist. Pushing earlier (as this did originally) sent
+    # the run while it was still 'running' with zero provenance rows, so the hosted page
+    # showed every completed run as permanently in-flight with 0 leads: the final state
+    # was never pushed because nothing pushed again after it.
+    log_push = sync_runs(db_path, limit=2)
 
     return {"run_id": run_id, "processed": len(processed), "confirmed": len(confirmed_ids),
             "confirmed_ids": confirmed_ids, "termination": termination,
