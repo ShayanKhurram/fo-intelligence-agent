@@ -649,6 +649,12 @@
       <p class="err-msg" id="sched-err" hidden></p>
     </div>
 
+    <div class="sched-panel">
+      <h2>Lead queue — draw order</h2>
+      <p class="sched-status" id="queue-summary">loading…</p>
+      <div class="sched-list" id="queue-tiers"></div>
+    </div>
+
     <!-- live panel: only shown while a run is actually in flight -->
     <div class="sched-panel" id="live-panel" hidden>
       <h2>Running now</h2>
@@ -934,10 +940,34 @@
     tabBtnLog.setAttribute('aria-selected', String(isLog));
     tabRun.hidden = isLog;
     tabLog.hidden = !isLog;
-    if (isLog && !logLoaded) { logLoaded = true; refreshScheduler(); refreshRuns(); }
+    if (isLog && !logLoaded) { logLoaded = true; refreshScheduler(); refreshRuns(); refreshQueue(); }
     // Poll for live progress only while the Log tab is open — no point querying every
     // 3s behind a hidden tab.
     if (isLog) startLivePolling(); else stopLivePolling();
+  }
+
+  // ---- lead queue, in draw order ----
+  const queueSummary = document.getElementById('queue-summary');
+  const queueTiers = document.getElementById('queue-tiers');
+
+  async function refreshQueue() {
+    try {
+      const d = await fetch('/api/scheduler/queue').then(r => r.json());
+      queueSummary.textContent =
+        d.queue_size + ' lead(s) queued · ' + d.already_submitted +
+        ' already submitted (never re-picked)';
+      queueTiers.innerHTML = (d.tiers || []).map(t => {
+        // An empty tier means its connector has not been run yet — worth showing, not hiding.
+        const dim = t.available === 0 ? ' style="opacity:.45"' : '';
+        return '<div class="sched-row"' + dim + '>' +
+          '<span class="nm">' + (t.rank === null ? '—' : t.rank) + '</span>' +
+          '<span class="spec">' + esc((t.source_classes || []).join(', ')) + '</span>' +
+          '<span class="spacer"></span>' +
+          '<span class="spec">' + t.available + ' available</span></div>';
+      }).join('');
+    } catch (e) {
+      queueSummary.textContent = 'queue unavailable';
+    }
   }
 
   // ---- live run progress ----

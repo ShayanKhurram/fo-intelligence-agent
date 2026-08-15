@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import app.scheduler as sched_mod
-from app.db import connection, get_run, upsert_entity
+from app.db import add_entity_source, connection, get_run, upsert_entity
 from app.scheduler import (
     compute_next_run,
     create_schedule,
@@ -29,10 +29,14 @@ NOW = datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc)
 
 
 def _seed_leads(db_path: str, n: int) -> list[str]:
+    """Seed leads WITH a discovery source class. T39's queue draws by source class and
+    excludes anything with none — which is right, because a real lead always arrives from
+    a connector. `fec_employer` is tier 1, so seeded leads are queued in insertion order."""
     ids = [f"e{i}" for i in range(n)]
     with connection(db_path) as conn:
         for eid in ids:
             upsert_entity(conn, eid, f"Firm {eid}")
+            add_entity_source(conn, eid, "fec_employer", {})
     return ids
 
 

@@ -42,6 +42,7 @@ from app.rag_sync import drain_queue, queue_counts
 from app.runner import run_batch
 from app.scheduler import (
     create_schedule,
+    queue_breakdown,
     delete_schedule,
     get_schedule,
     list_schedules,
@@ -514,6 +515,22 @@ def scheduler_status() -> dict:
         "next_due": upcoming[0] if upcoming else None,
         "rag_queue": rag,
     }
+
+
+@app.get("/api/scheduler/queue")
+def scheduler_queue() -> dict:
+    """What the next scheduled run will work on, and in what order (T39).
+
+    Answers the question you actually have before firing a run: which source tier is up,
+    how many leads are left in it, and how many are excluded. Every tier is reported
+    including empty ones — an empty tier means its connector has not been run yet, which
+    is a fact worth seeing rather than a silent zero."""
+    with connection() as conn:
+        tiers = queue_breakdown(conn)
+        total = sum(t["available"] for t in tiers)
+        submitted = conn.execute("SELECT COUNT(*) AS n FROM lead_checkpoints").fetchone()["n"]
+    return {"schema_version": 1, "queue_size": total, "already_submitted": submitted,
+            "tiers": tiers}
 
 
 @app.get("/api/scheduler/live")

@@ -14,7 +14,7 @@ import app.api as api_mod
 import app.db as db_mod
 import app.scheduler as sched_mod
 from app.config import Settings
-from app.db import connection, init_db, upsert_entity
+from app.db import add_entity_source, connection, init_db, upsert_entity
 from app.rag_sync import enqueue_entity
 
 
@@ -139,6 +139,7 @@ async def test_a_scheduled_run_shows_up_in_the_log_tab_endpoints(client, monkeyp
     monkeypatch.setattr(sched_mod, "process_entity", fake_process_entity)
     with connection(client.db_path) as conn:
         upsert_entity(conn, "e0", "Acme FO")
+        add_entity_source(conn, "e0", "fec_employer", {})
         conn.execute("INSERT INTO decisions (entity_id, verdict, rationale) VALUES ('e0','pursue','')")
 
     result = await sched_mod.run_scheduled_job(

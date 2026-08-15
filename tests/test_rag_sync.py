@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import app.rag_sync as rag_mod
 import app.scheduler as sched_mod
-from app.db import connection, upsert_entity
+from app.db import add_entity_source, connection, upsert_entity
 from app.rag_sync import (
     MAX_ATTEMPTS,
     drain_queue,
@@ -220,6 +220,7 @@ async def test_a_lead_that_confirms_during_a_scheduled_run_is_queued_automatical
     with connection(db_path) as conn:
         for eid in ("e0", "e1"):
             upsert_entity(conn, eid, f"Firm {eid}")
+            add_entity_source(conn, eid, "fec_employer", {})
             conn.execute("INSERT INTO decisions (entity_id, verdict, rationale) VALUES (?, 'pursue', '')", (eid,))
 
     result = await run_scheduled_job(

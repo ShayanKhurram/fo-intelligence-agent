@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -218,19 +219,138 @@ def due_schedules(conn: sqlite3.Connection, *, now: datetime | None = None) -> l
 # ---------------------------------------------------------------------------
 
 
+# T39 — the order leads are drawn from, by discovery source class. The user's standing
+# instruction (2026-08-15), highest priority first:
+#
+#   FEC cycles 2024/2022/2020 -> ADV Part 2A brochures -> EDGAR connector
+#   -> triaged offers_services rows -> c6_serp -> c5_conferences -> 13D/G
+#
+# Each tier is exhausted before the next is touched, so a run with a small
+# `target_confirmed` spends its budget on the best source available rather than on
+# whatever the database happened to return first.
+#
+# The right-hand strings are `entity_sources.source_class` values. Several tiers have no
+# rows yet — their connectors have not been run — and that is deliberately not an error:
+# a tier with no leads is skipped and the next one supplies the queue, so this list keeps
+# working as those connectors land without further code changes.
+SOURCE_CLASS_PRIORITY: tuple[tuple[str, ...], ...] = (
+    ("fec_employer",),                       # 1. FEC cycles 2024/2022/2020
+    ("adv_brochure", "adv_name", "adv_web"),  # 2. ADV Part 2A brochures
+    ("edgar_entity", "edgar_filing"),         # 3. EDGAR connector
+    ("offers_services",),                     # 4. the triaged offers_services rows
+    ("c6_serp", "serp_directory"),            # 5. c6_serp
+    ("c5_conferences", "conference_sighting"),  # 6. c5_conferences
+    ("schedule_13dg", "13dg_filing"),         # 7. 13D/G
+)
+
+# Source classes NOT in the priority list are excluded from scheduled runs rather than
+# appended at the end. `13f_filing` is the one that matters: it accounts for the large
+# majority of unstarted rows, it is absent from the user's ordered list, and the project's
+# own discovery spec is explicit that "Nothing from edgar_13f enters the queue" — a 13F
+# filer is an institutional investment manager, which is not evidence of a family office.
+# Set FOIA_SCHEDULER_STRICT_SOURCES=0 to append the unlisted classes last instead of
+# dropping them.
+def _priority_rank(classes: set[str]) -> int | None:
+    """The best (lowest) tier any of an entity's source classes falls into, or None when
+    it belongs to no listed tier. An entity carrying several classes is ranked by its
+    strongest — a lead corroborated by both FEC and ADV is a FEC lead for ordering."""
+    best: int | None = None
+    for rank, tier in enumerate(SOURCE_CLASS_PRIORITY):
+        if classes & set(tier):
+            best = rank if best is None else min(best, rank)
+    return best
+
+
 def _queue(conn: sqlite3.Connection) -> list[str]:
-    """Leads available to a scheduled run: anything never started, plus anything an
-    interrupted run left resumable. De-duplicated, resumable first (finish what was
-    started before starting more)."""
+    """Leads available to a scheduled run, in source-class priority order (T39).
+
+    Two rules, in this order:
+
+    1. **Never re-elect a lead already submitted.** Anything with a `lead_checkpoints`
+       row has been handed to the agent before and is excluded — that ledger is the
+       record of what has been submitted. The one exception is a lead an interrupted run
+       left `running`/`failed`/`retry`: that is unfinished work, not a re-election, and it
+       goes first so a crash does not strand it forever.
+    2. **Then priority order**, per SOURCE_CLASS_PRIORITY. Within a tier, insertion order
+       (`entities.created_at`) is preserved, so a tier is worked front to back.
+    """
     unstarted = get_unstarted_entities(conn)
     resumable = [e for e in get_resumable_leads(conn) if e not in unstarted]
+
+    classes_by_entity: dict[str, set[str]] = {}
+    for row in conn.execute(
+        "SELECT entity_id, source_class FROM entity_sources"
+    ).fetchall():
+        classes_by_entity.setdefault(row["entity_id"], set()).add(row["source_class"])
+
+    # created_at gives a stable within-tier order; entity_id breaks ties so the queue is
+    # identical across runs on identical data.
+    order_index = {
+        row["entity_id"]: i
+        for i, row in enumerate(
+            conn.execute("SELECT entity_id FROM entities ORDER BY created_at, entity_id").fetchall()
+        )
+    }
+
+    strict = os.environ.get("FOIA_SCHEDULER_STRICT_SOURCES", "1").strip() not in ("0", "false", "no", "off")
+    unlisted_rank = len(SOURCE_CLASS_PRIORITY)
+
+    def _sortable(entity_id: str) -> tuple[int, int] | None:
+        rank = _priority_rank(classes_by_entity.get(entity_id, set()))
+        if rank is None:
+            if strict:
+                return None
+            rank = unlisted_rank
+        return (rank, order_index.get(entity_id, 1 << 30))
+
+    ranked: list[tuple[tuple[int, int], str]] = []
+    for eid in unstarted:
+        key = _sortable(eid)
+        if key is not None:
+            ranked.append((key, eid))
+    ranked.sort()
+
+    # Interrupted work is finished before new work is started — but it is subject to the
+    # SAME source policy. A lead left 'running' by a crashed run months ago, in a class
+    # that is no longer wanted, is not work worth resuming: it has already been submitted
+    # once, and the standing instruction is that a submitted lead is not elected again.
+    # Filtering it here is what keeps "resume" from quietly re-admitting an excluded tier
+    # (measured: 26 stale 13f_filing leads would otherwise have led the very next run).
+    resumable_ranked = sorted(
+        ((key, eid) for eid, key in ((e, _sortable(e)) for e in resumable) if key is not None)
+    )
+
     seen: set[str] = set()
     ordered: list[str] = []
-    for eid in resumable + unstarted:
+    for eid in [e for _k, e in resumable_ranked] + [e for _k, e in ranked]:
         if eid not in seen:
             seen.add(eid)
             ordered.append(eid)
     return ordered
+
+
+def queue_breakdown(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """The queue as tiers, for the UI and for answering "what will the next run work on".
+    Reports every tier including empty ones — a tier with no leads is a fact worth showing
+    (its connector has not been run yet), not something to hide."""
+    queue = _queue(conn)
+    classes_by_entity: dict[str, set[str]] = {}
+    for row in conn.execute("SELECT entity_id, source_class FROM entity_sources").fetchall():
+        classes_by_entity.setdefault(row["entity_id"], set()).add(row["source_class"])
+    counts: dict[int, int] = {}
+    for eid in queue:
+        rank = _priority_rank(classes_by_entity.get(eid, set()))
+        counts[rank if rank is not None else len(SOURCE_CLASS_PRIORITY)] = (
+            counts.get(rank if rank is not None else len(SOURCE_CLASS_PRIORITY), 0) + 1
+        )
+    out = [
+        {"rank": i + 1, "source_classes": list(tier), "available": counts.get(i, 0)}
+        for i, tier in enumerate(SOURCE_CLASS_PRIORITY)
+    ]
+    if counts.get(len(SOURCE_CLASS_PRIORITY)):
+        out.append({"rank": None, "source_classes": ["(unlisted)"],
+                    "available": counts[len(SOURCE_CLASS_PRIORITY)]})
+    return out
 
 
 async def _process_one(
