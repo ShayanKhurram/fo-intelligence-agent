@@ -340,3 +340,76 @@ async def test_tick_fires_due_schedules_and_stamps_next_run(db_path, monkeypatch
     fired.clear()
     await tick(db_path=db_path, now=NOW)
     assert fired == []
+
+
+async def test_progress_is_published_while_the_run_is_still_going(db_path, monkeypatch):
+    """T38 — a run must report what it is doing WHILE it does it.
+
+    Before this, a run was invisible until it finished: the row said 'running' and
+    nothing else. The counters are written onto the run row after each lead, so any
+    reader on a separate connection (the API, the UI) sees them live."""
+    from app.db import get_active_run
+    ids = _seed_leads(db_path, 4)
+    seen: list[dict] = []
+
+    async def fake_run_lead(entity_id, db_path=None):
+        # Snapshot what an outside reader would see mid-run.
+        with connection(db_path) as conn:
+            active = get_active_run(conn)
+        seen.append((active or {}).get("notes", {}))
+        return {"cost_usd": 0.01}
+
+    async def fake_process_entity(conn, entity_id, model, *, force=False):
+        return {"entity_id": entity_id, "outcome": "ship", "calls_spent": 1, "usd_spent": 0.02}
+
+    monkeypatch.setattr(sched_mod, "run_lead", fake_run_lead)
+    monkeypatch.setattr(sched_mod, "process_entity", fake_process_entity)
+    with connection(db_path) as conn:
+        for eid in ids:
+            conn.execute("INSERT INTO decisions (entity_id, verdict, rationale) VALUES (?, 'pursue', '')", (eid,))
+
+    result = await run_scheduled_job(
+        {"schedule_id": "s1", "name": "t", "target_confirmed": None, "max_leads": None},
+        db_path=db_path, model=object(), chunk_size=1,
+    )
+
+    assert result["processed"] == 4
+    # The run was visible as 'running' throughout, with counters that climbed.
+    assert len(seen) == 4
+    assert seen[0].get("phase") in ("starting", "researching")
+    processed_seen = [s.get("processed", 0) for s in seen]
+    assert processed_seen == sorted(processed_seen), "counters must not go backwards"
+    assert processed_seen[-1] > processed_seen[0], "counters must actually advance mid-run"
+    # The lead being worked on is named while it is in flight.
+    assert any(s.get("in_flight") for s in seen)
+    # ...and once finished, no run is active any more.
+    with connection(db_path) as conn:
+        assert get_active_run(conn) is None
+
+
+async def test_progress_names_the_target_so_a_bar_can_be_drawn(db_path, monkeypatch):
+    """`target_confirmed` rides along in the progress notes; without it the UI has no
+    finish line to draw and deliberately shows none."""
+    from app.db import get_active_run
+    _seed_leads(db_path, 2)
+    captured: list[dict] = []
+
+    async def fake_run_lead(entity_id, db_path=None):
+        with connection(db_path) as conn:
+            captured.append((get_active_run(conn) or {}).get("notes", {}))
+        return {"cost_usd": 0.0}
+
+    async def fake_process_entity(conn, entity_id, model, *, force=False):
+        return {"entity_id": entity_id, "outcome": "ship", "calls_spent": 0, "usd_spent": 0.0}
+
+    monkeypatch.setattr(sched_mod, "run_lead", fake_run_lead)
+    monkeypatch.setattr(sched_mod, "process_entity", fake_process_entity)
+    with connection(db_path) as conn:
+        for eid in ("e0", "e1"):
+            conn.execute("INSERT INTO decisions (entity_id, verdict, rationale) VALUES (?, 'pursue', '')", (eid,))
+
+    await run_scheduled_job(
+        {"schedule_id": "s1", "name": "t", "target_confirmed": 2, "max_leads": None},
+        db_path=db_path, model=object(), chunk_size=1,
+    )
+    assert captured and captured[0].get("target_confirmed") == 2

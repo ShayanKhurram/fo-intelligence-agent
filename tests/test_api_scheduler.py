@@ -163,3 +163,50 @@ async def test_a_scheduled_run_shows_up_in_the_log_tab_endpoints(client, monkeyp
     # Every record explains itself: a value with a `how`, or a blank with a reason.
     for rec in prov["records"]:
         assert rec["value"] is not None or rec["blank_reason"] is not None
+
+
+async def test_live_endpoint_reports_idle_and_then_a_running_job(client):
+    """T38 — /api/scheduler/live is what the UI polls to show 'what is it doing now'."""
+    from app.db import connection as _conn, start_run, write_tool_call, update_run_notes
+
+    r = await client.get("/api/scheduler/live")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["schema_version"] == 1
+    # Nothing running: an explicit false, not an empty object the UI has to guess at.
+    assert body["active"] is False and body["run"] is None
+
+    with _conn(client.db_path) as conn:
+        run_id = start_run(conn, "scheduled", entity_count=20)
+        update_run_notes(conn, run_id, {
+            "phase": "researching", "processed": 3, "confirmed": 2,
+            "target_confirmed": 5, "queue_size": 20, "usd_spent": 0.06,
+            "in_flight": ["ACME FAMILY OFFICE"],
+        })
+        write_tool_call(conn, run_id=run_id, entity_id="e1", tool="serper_search_raw",
+                        args="{}", ok=1, cache_hit=0, result_summary="5 results")
+
+    r = await client.get("/api/scheduler/live")
+    body = r.json()
+    assert body["active"] is True
+    assert body["run"]["run_id"] == run_id
+    p = body["progress"]
+    assert p["processed"] == 3 and p["confirmed"] == 2
+    assert p["in_flight"] == ["ACME FAMILY OFFICE"]
+    assert p["target_fraction"] == 2 / 5
+    # The "status of fetching": the actual external calls, newest first.
+    assert body["recent_tool_calls"][0]["tool"] == "serper_search_raw"
+    assert body["recent_tool_calls"][0]["result_summary"] == "5 results"
+
+
+async def test_live_target_fraction_is_none_without_a_target(client):
+    """No target means the run goes until the queue empties. A percentage there would
+    invent a finish line, so the UI is told None and draws no bar."""
+    from app.db import connection as _conn, start_run, update_run_notes
+
+    with _conn(client.db_path) as conn:
+        run_id = start_run(conn, "scheduled", entity_count=5)
+        update_run_notes(conn, run_id, {"phase": "researching", "processed": 1,
+                                        "confirmed": 1, "target_confirmed": None})
+    body = (await client.get("/api/scheduler/live")).json()
+    assert body["progress"]["target_fraction"] is None

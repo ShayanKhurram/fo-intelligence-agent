@@ -25,8 +25,10 @@ from pydantic import BaseModel
 
 from app.db import (
     connection,
+    get_active_run,
     get_entity,
     get_field_provenance,
+    get_recent_tool_calls,
     get_lead_trace,
     get_run,
     init_db,
@@ -511,6 +513,43 @@ def scheduler_status() -> dict:
         "schedule_count": len(schedules),
         "next_due": upcoming[0] if upcoming else None,
         "rag_queue": rag,
+    }
+
+
+@app.get("/api/scheduler/live")
+def scheduler_live() -> dict:
+    """What the agent is doing right now (T38).
+
+    `{"active": false}` when nothing is running. While a run is in flight, returns its
+    live counters — processed, confirmed, how far to the target — the leads currently
+    being researched, and the most recent tool calls, which is the "status of fetching":
+    the actual external requests being made, newest first."""
+    with connection() as conn:
+        run = get_active_run(conn)
+        if run is None:
+            return {"schema_version": 1, "active": False, "run": None,
+                    "progress": {}, "recent_tool_calls": []}
+        calls = get_recent_tool_calls(conn, run["run_id"], limit=8)
+    notes = run.get("notes") or {}
+    target = notes.get("target_confirmed")
+    confirmed = notes.get("confirmed") or 0
+    return {
+        "schema_version": 1,
+        "active": True,
+        "run": {k: run[k] for k in ("run_id", "kind", "status", "entity_count", "started_at")},
+        "progress": {
+            **notes,
+            # Fraction of the goal, when a goal was set. Without a target the run goes
+            # until the queue empties, and a percentage would be meaningless rather than
+            # merely unknown — so it is None, not 0.
+            "target_fraction": (min(1.0, confirmed / target) if target else None),
+        },
+        "recent_tool_calls": [
+            {"tool": c["tool"], "entity_id": c["entity_id"], "ok": c["ok"],
+             "cache_hit": c["cache_hit"], "result_summary": c["result_summary"],
+             "called_at": c["called_at"], "duration_ms": c["duration_ms"]}
+            for c in calls
+        ],
     }
 
 

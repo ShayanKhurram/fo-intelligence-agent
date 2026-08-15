@@ -683,6 +683,53 @@ def finish_run(
     conn.execute(f"UPDATE runs SET {', '.join(sets)} WHERE run_id = ?", params)
 
 
+def update_run_notes(conn: sqlite3.Connection, run_id: str, notes: dict[str, Any]) -> None:
+    """Replace a RUNNING run's notes without closing it (T38).
+
+    `finish_run` is the only other writer of `notes`, and it stamps `ended_at` — so it
+    cannot be used to publish progress mid-run without making a live run look finished.
+    This is how a run reports what it is doing while it does it: the counters and the
+    lead currently in flight are written here after every lead completes, and any reader
+    (the API, the UI, the hosted mirror) sees them by reading the ordinary run row.
+
+    Committed immediately: the point of progress is that someone else can see it, and a
+    write sitting in this connection's uncommitted transaction is invisible to the
+    separate connection an HTTP request opens."""
+    conn.execute("UPDATE runs SET notes = ? WHERE run_id = ?", (json.dumps(notes), run_id))
+    conn.commit()
+
+
+def get_active_run(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    """The most recently started run still marked `running`, or None. What the UI polls to
+    decide whether to show a live panel."""
+    row = conn.execute(
+        "SELECT * FROM runs WHERE status = 'running' ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return None
+    d = dict(row)
+    d["notes"] = json.loads(d["notes"])
+    return d
+
+
+def get_recent_tool_calls(conn: sqlite3.Connection, run_id: str, limit: int = 10) -> list[dict[str, Any]]:
+    """The newest tool calls made during one run, across every entity — "what is it
+    fetching right now". `get_tool_calls` is scoped to a single entity, which is the wrong
+    shape for a live view of a run that processes several leads concurrently."""
+    rows = conn.execute(
+        "SELECT * FROM tool_calls WHERE run_id = ? ORDER BY called_at DESC, id DESC LIMIT ?",
+        (run_id, limit),
+    ).fetchall()
+    out = []
+    for row in rows:
+        d = dict(row)
+        d["args"] = json.loads(d["args"])
+        d["ok"] = bool(d["ok"])
+        d["cache_hit"] = bool(d["cache_hit"])
+        out.append(d)
+    return out
+
+
 def get_run(conn: sqlite3.Connection, run_id: str) -> dict[str, Any] | None:
     row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
     if row is None:

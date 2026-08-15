@@ -257,19 +257,70 @@ function RunRow({ run }: { run: Run }) {
   );
 }
 
+function LiveBanner({ run }: { run: Run }) {
+  const n = (run.notes ?? {}) as Record<string, unknown>;
+  const target = n.target_confirmed as number | null;
+  const confirmed = (n.confirmed as number) ?? 0;
+  const inFlight = (n.in_flight as string[]) ?? [];
+  const pct = target ? Math.min(100, Math.round((confirmed / target) * 100)) : null;
+  return (
+    <div className="mb-5 rounded-[var(--r-md)] border border-[var(--live)] bg-[var(--bg-glass-hi)] p-4">
+      <div className="mono mb-2 flex flex-wrap items-center gap-3 text-xs">
+        <span className="inline-flex items-center gap-1.5 text-[var(--live)]">
+          <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-[var(--live)]" />
+          RUNNING NOW
+        </span>
+        <span className="text-[var(--text-mid)]">{(n.schedule_name as string) ?? run.kind}</span>
+      </div>
+      <div className="mono flex flex-wrap gap-4 text-sm text-[var(--text-hi)]">
+        <span>{(n.processed as number) ?? 0} processed</span>
+        <span>
+          {confirmed}
+          {target ? `/${target}` : ""} confirmed
+        </span>
+        <span>{(n.failed as number) ?? 0} failed</span>
+        <span>${((n.usd_spent as number) ?? 0).toFixed(4)}</span>
+      </div>
+      {/* A bar only means something against a target; without one the run goes until the
+          queue empties and a filling bar would invent a finish line. */}
+      {pct !== null && (
+        <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-[var(--bg-base)]">
+          <div className="h-full bg-[var(--confirmed)] transition-all" style={{ width: `${pct}%` }} />
+        </div>
+      )}
+      <p className="mono mt-2 text-[11px] text-[var(--text-low)]">
+        {inFlight.length ? `researching: ${inFlight.join(" · ")}` : "between leads…"}
+      </p>
+    </div>
+  );
+}
+
 export default function LogPage() {
   const [runs, setRuns] = useState<Run[] | null>(null);
   const [notSynced, setNotSynced] = useState(false);
 
   useEffect(() => {
-    fetch("/api/log/runs")
-      .then((r) => r.json())
-      .then((d) => {
-        setRuns(d.runs ?? []);
-        setNotSynced(Boolean(d.not_synced_yet));
-      })
-      .catch(() => setRuns([]));
+    let cancelled = false;
+    const load = () =>
+      fetch("/api/log/runs")
+        .then((r) => r.json())
+        .then((d) => {
+          if (cancelled) return;
+          setRuns(d.runs ?? []);
+          setNotSynced(Boolean(d.not_synced_yet));
+        })
+        .catch(() => !cancelled && setRuns([]));
+    load();
+    // Poll while a run is in flight so the banner tracks it. The agent pushes progress
+    // once per completed lead, and a lead takes minutes — 15s is well inside that.
+    const t = setInterval(load, 15000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
   }, []);
+
+  const liveRun = (runs ?? []).find((r) => r.status === "running");
 
   return (
     <div className="mx-auto flex min-h-screen w-full max-w-5xl flex-col px-4 sm:px-6">
@@ -294,6 +345,8 @@ export default function LogPage() {
           obtained — the tool call behind it, the source it came from, the values that lost, and
           for a blank cell, why it is blank.
         </p>
+
+        {liveRun && <LiveBanner run={liveRun} />}
 
         {runs === null ? (
           <p className="text-sm text-[var(--text-low)]">loading…</p>

@@ -44,10 +44,12 @@ from app.config import SETTINGS
 from app.db import (
     connection,
     finish_run,
+    get_entity,
     get_resumable_leads,
     get_unstarted_entities,
     init_db,
     start_run,
+    update_run_notes,
     upsert_checkpoint,
 )
 from app.enrichment import process_entity
@@ -55,6 +57,7 @@ from app.graph import run_lead
 from app.llm import get_model
 from app.log_sync import sync_runs
 from app.rag_sync import drain_queue, enqueue_entity, is_confirmed
+from app.toollog import tool_log_context
 
 logger = logging.getLogger(__name__)
 
@@ -230,17 +233,27 @@ def _queue(conn: sqlite3.Connection) -> list[str]:
     return ordered
 
 
-async def _process_one(entity_id: str, model: Any, db_path: str) -> dict[str, Any]:
+async def _process_one(
+    entity_id: str, model: Any, db_path: str, run_id: str | None = None
+) -> dict[str, Any]:
     """One lead, all the way through: Layer 1, then enrichment when the verdict warrants
     it. Returns {"entity_id", "verdict", "outcome", "confirmed", "cost_usd", "error"}.
     Never raises — one bad lead must not end a scheduled run (plan §7's rule for the
-    batch runner, which applies at least as strongly to an unattended one)."""
+    batch runner, which applies at least as strongly to an unattended one).
+
+    The tool-log context is bound around the WHOLE lead, Layer 1 included. Enrichment
+    binds its own (app/enrichment._process_entities_concurrently), but Layer 1's research
+    lanes — which are the long, expensive part and the bulk of the external fetching —
+    ran unattributed, so a live view of "what is it fetching" stayed empty for minutes
+    while the agent was in fact hitting Serper and reading pages. Nesting is safe: the
+    inner enrichment context simply replaces this one for its duration and restores it."""
     result: dict[str, Any] = {"entity_id": entity_id, "verdict": None, "outcome": None,
                               "confirmed": False, "cost_usd": 0.0, "error": None}
     try:
         with connection(db_path) as conn:
             upsert_checkpoint(conn, entity_id, status="running")
-        state = await run_lead(entity_id, db_path=db_path)
+        with tool_log_context(entity_id, run_id=run_id, wave="layer1", db_path=db_path):
+            state = await run_lead(entity_id, db_path=db_path)
         result["cost_usd"] = state.get("cost_usd", 0.0) or 0.0
         verdict = None
         with connection(db_path) as conn:
@@ -315,6 +328,71 @@ async def run_scheduled_job(
     total_cost = 0.0
     termination = "leads_exhausted"
     index = 0
+
+    in_flight: dict[str, str] = {}   # entity_id -> canonical_name, for "what is it on now"
+    progress_lock = asyncio.Lock()
+
+    def _progress_notes(**extra: Any) -> dict[str, Any]:
+        return {
+            "schedule_id": schedule.get("schedule_id"),
+            "schedule_name": schedule.get("name"),
+            "target_confirmed": target,
+            "max_leads": max_leads,
+            "queue_size": len(queue),
+            "processed": len(processed),
+            "confirmed": len(confirmed_ids),
+            "failed": sum(1 for r in processed if r["error"]),
+            "usd_spent": round(total_cost, 4),
+            "in_flight": list(in_flight.values()),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            **extra,
+        }
+
+    def _publish(**extra: Any) -> None:
+        """Write live counters onto the run row. Best-effort: a progress write must never
+        be able to interrupt the run it is reporting on."""
+        try:
+            with connection(db_path) as conn:
+                update_run_notes(conn, run_id, _progress_notes(**extra))
+        except Exception:  # noqa: BLE001
+            logger.debug("scheduled run %s: progress publish failed", run_id, exc_info=True)
+
+    async def _tracked(entity_id: str) -> dict[str, Any]:
+        """Run one lead, publishing progress as it starts and as it finishes — so the UI
+        can name the lead currently being worked on rather than only the tally."""
+        async with progress_lock:
+            with connection(db_path) as conn:
+                ent = get_entity(conn, entity_id)
+            in_flight[entity_id] = (ent or {}).get("canonical_name") or entity_id
+            _publish(phase="researching")
+        try:
+            result = await _process_one(entity_id, model, db_path, run_id)
+        finally:
+            async with progress_lock:
+                in_flight.pop(entity_id, None)
+        async with progress_lock:
+            processed.append(result)
+            nonlocal total_cost
+            total_cost += result["cost_usd"]
+            if result["confirmed"]:
+                confirmed_ids.append(result["entity_id"])
+                with connection(db_path) as conn:
+                    enqueue_entity(conn, result["entity_id"], run_id=run_id)
+            _publish(phase="researching", last_lead={
+                "entity_id": result["entity_id"],
+                "verdict": result["verdict"],
+                "outcome": result["outcome"],
+                "confirmed": result["confirmed"],
+                "error": result["error"],
+            })
+            # Mirror progress to the hosted view, once per completed lead rather than on
+            # every publish: a lead takes minutes, so this is a handful of remote writes
+            # per run, and the hosted page stops being minutes stale. sync_runs never
+            # raises and skips cleanly when no DSN is configured.
+            sync_runs(db_path, limit=1)
+        return result
+
+    _publish(phase="starting")
     try:
         while index < len(queue):
             if target is not None and len(confirmed_ids) >= target:
@@ -329,16 +407,10 @@ async def run_scheduled_job(
             take = max(1, min(chunk_size, *remaining_caps))
             chunk = queue[index:index + take]
             index += take
-            results = await asyncio.gather(
-                *(_process_one(eid, model, db_path) for eid in chunk)
-            )
-            for r in results:
-                processed.append(r)
-                total_cost += r["cost_usd"]
-                if r["confirmed"]:
-                    confirmed_ids.append(r["entity_id"])
-                    with connection(db_path) as conn:
-                        enqueue_entity(conn, r["entity_id"], run_id=run_id)
+            # _tracked accumulates into processed/confirmed_ids and publishes progress as
+            # each lead starts and finishes, so the counters are live rather than landing
+            # in a lump once the whole chunk returns.
+            await asyncio.gather(*(_tracked(eid) for eid in chunk))
         else:
             # Loop fell off the end without breaking: the queue is exhausted. Re-check
             # the target so a run whose LAST chunk hit the target reports why it really

@@ -493,6 +493,32 @@
   .mini-btn:hover { border-color: var(--accent); color: var(--accent-text); }
   .mini-btn.danger:hover { border-color: var(--reject); color: var(--reject); }
 
+  /* ---- live run progress ---- */
+  .live-bar {
+    height: 6px;
+    border-radius: 3px;
+    background: var(--paper);
+    border: 1px solid var(--line);
+    overflow: hidden;
+    margin: 0.9rem 0 0.6rem;
+  }
+  .live-bar-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--pursue);
+    transition: width 0.4s ease;
+  }
+  .live-call {
+    font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.74rem;
+    color: var(--text-dim);
+    padding: 0.2rem 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .live-call:last-child { border-bottom: none; }
+  .live-call .tool { color: var(--accent-text); }
+  .live-call .bad { color: var(--reject); }
+
   /* ---- run log drill-down: run -> leads -> field logs ---- */
   .log-section { font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace; }
   .run-row summary, .loglead summary {
@@ -621,6 +647,15 @@
         <button class="mini-btn" id="s-create">Add schedule</button>
       </div>
       <p class="err-msg" id="sched-err" hidden></p>
+    </div>
+
+    <!-- live panel: only shown while a run is actually in flight -->
+    <div class="sched-panel" id="live-panel" hidden>
+      <h2>Running now</h2>
+      <div class="summary-bar" id="live-stats"></div>
+      <div class="live-bar" id="live-bar-wrap" hidden><div class="live-bar-fill" id="live-bar"></div></div>
+      <p class="sched-status" id="live-current"></p>
+      <div class="sched-list" id="live-calls"></div>
     </div>
 
     <div class="log-section">
@@ -900,6 +935,71 @@
     tabRun.hidden = isLog;
     tabLog.hidden = !isLog;
     if (isLog && !logLoaded) { logLoaded = true; refreshScheduler(); refreshRuns(); }
+    // Poll for live progress only while the Log tab is open — no point querying every
+    // 3s behind a hidden tab.
+    if (isLog) startLivePolling(); else stopLivePolling();
+  }
+
+  // ---- live run progress ----
+  const livePanel = document.getElementById('live-panel');
+  const liveStats = document.getElementById('live-stats');
+  const liveBarWrap = document.getElementById('live-bar-wrap');
+  const liveBar = document.getElementById('live-bar');
+  const liveCurrent = document.getElementById('live-current');
+  const liveCalls = document.getElementById('live-calls');
+  let liveTimer = null;
+  let wasActive = false;
+
+  function startLivePolling() {
+    if (liveTimer) return;
+    pollLive();
+    liveTimer = setInterval(pollLive, 3000);
+  }
+  function stopLivePolling() {
+    if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+  }
+
+  async function pollLive() {
+    let d;
+    try { d = await fetch('/api/scheduler/live').then(r => r.json()); }
+    catch (e) { return; }
+    if (!d.active) {
+      livePanel.hidden = true;
+      // A run that has just finished should appear in the list without a manual reload.
+      if (wasActive) { wasActive = false; refreshRuns(); refreshScheduler(); }
+      return;
+    }
+    wasActive = true;
+    livePanel.hidden = false;
+    const p = d.progress || {};
+    const target = p.target_confirmed;
+    liveStats.innerHTML =
+      '<div class="stat"><span class="n">' + (p.processed || 0) + '</span><span class="l">Processed</span></div>' +
+      '<div class="stat"><span class="n">' + (p.confirmed || 0) + (target ? '/' + target : '') +
+        '</span><span class="l">Confirmed</span></div>' +
+      '<div class="stat"><span class="n">' + (p.failed || 0) + '</span><span class="l">Failed</span></div>' +
+      '<div class="stat"><span class="n">' + fmtCost(p.usd_spent || 0) + '</span><span class="l">Spent</span></div>' +
+      '<div class="stat"><span class="n">' + (p.queue_size || 0) + '</span><span class="l">In queue</span></div>';
+    // A progress bar only means something against a target. Without one the run goes
+    // until the queue empties, so showing a filling bar would invent a finish line.
+    if (d.progress && d.progress.target_fraction !== null && d.progress.target_fraction !== undefined) {
+      liveBarWrap.hidden = false;
+      liveBar.style.width = Math.round(d.progress.target_fraction * 100) + '%';
+    } else {
+      liveBarWrap.hidden = true;
+    }
+    const inFlight = p.in_flight || [];
+    liveCurrent.textContent = inFlight.length
+      ? 'researching: ' + inFlight.join(' · ')
+      : (p.phase === 'starting' ? 'starting…' : 'between leads…');
+    const calls = d.recent_tool_calls || [];
+    liveCalls.innerHTML = calls.length
+      ? calls.map(c =>
+          '<div class="live-call"><span class="tool">' + esc(c.tool) + '</span> → ' +
+          (c.ok ? esc(c.result_summary || '') : '<span class="bad">' + esc(c.result_summary || 'failed') + '</span>') +
+          (c.cache_hit ? ' [cached]' : '') +
+          (c.duration_ms != null ? ' · ' + c.duration_ms + 'ms' : '') + '</div>').join('')
+      : '<div class="live-call">no tool calls recorded yet</div>';
   }
   tabBtnRun.addEventListener('click', () => selectTab('run'));
   tabBtnLog.addEventListener('click', () => selectTab('log'));
