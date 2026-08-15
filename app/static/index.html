@@ -1083,15 +1083,23 @@
           '<span class="nm">' + esc(s.name) + '</span>' +
           '<span class="spec">' + esc(scheduleSpec(s)) + ' · ' + esc(stopRule(s)) + '</span>' +
           '<span class="pill ' + (s.enabled ? 'pursue' : 'queued') + '">' + (s.enabled ? 'enabled' : 'paused') + '</span>' +
-          '<span class="spec">next ' + esc(fmtWhen(s.next_run_at)) + '</span>' +
+          '<span class="spec">next ' + esc(fmtWhen(s.next_run_at)) + ' · ' + esc(untilText(s.next_run_at)) + '</span>' +
           '<span class="spacer"></span>' +
           '<button class="mini-btn" data-act="run">Run now</button>' +
           '<button class="mini-btn" data-act="toggle">' + (s.enabled ? 'Pause' : 'Enable') + '</button>' +
           '<button class="mini-btn danger" data-act="del">Delete</button>';
         row.querySelector('[data-act="run"]').addEventListener('click', async () => {
-          await fetch('/api/schedules/' + s.schedule_id + '/run-now', { method: 'POST' });
-          schedStatus.textContent = 'run started for "' + s.name + '" — refresh the runs list in a moment';
-          setTimeout(refreshRuns, 1500);
+          try {
+            const rr = await fetch('/api/schedules/' + s.schedule_id + '/run-now', { method: 'POST' });
+            if (!rr.ok) throw new Error('HTTP ' + rr.status);
+            schedStatus.textContent = 'run started for "' + s.name + '" — live progress appears below within a few seconds';
+            startLivePolling();
+            setTimeout(refreshRuns, 2000);
+          } catch (e) {
+            schedErr.hidden = false;
+            schedErr.style.color = '';
+            schedErr.textContent = 'could not start the run: ' + e;
+          }
         });
         row.querySelector('[data-act="toggle"]').addEventListener('click', async () => {
           await fetch('/api/schedules/' + s.schedule_id, {
@@ -1122,18 +1130,48 @@
       target_confirmed: parseInt(document.getElementById('s-target').value, 10) || null,
       max_leads: parseInt(document.getElementById('s-max').value, 10) || null,
     };
-    const r = await fetch('/api/schedules', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-    });
+    // Every failure mode has to be visible. Without the try/catch a fetch rejection —
+    // the service restarting, most commonly — threw inside the handler and the click
+    // simply did nothing at all, with no message anywhere. "I scheduled and nothing
+    // happened" was exactly that.
+    let r;
+    try {
+      r = await fetch('/api/schedules', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+    } catch (e) {
+      schedErr.hidden = false;
+      schedErr.textContent = 'could not reach the service — is it running? (' + e + ')';
+      return;
+    }
     if (!r.ok) {
       const d = await r.json().catch(() => ({}));
       schedErr.hidden = false;
       schedErr.textContent = d.detail || ('could not create schedule (' + r.status + ')');
       return;
     }
+    const created = (await r.json()).schedule;
     document.getElementById('s-name').value = '';
+    // A schedule does not run when you create it — it runs at its next window. Saying so
+    // is the difference between "nothing happened" and "it is waiting until 03:00".
+    schedErr.hidden = false;
+    schedErr.style.color = 'var(--pursue)';
+    schedErr.textContent =
+      'Created "' + created.name + '". It will next run ' + fmtWhen(created.next_run_at) +
+      ' (' + untilText(created.next_run_at) + '). Use “Run now” to start immediately.';
     refreshScheduler();
   });
+
+  function untilText(iso) {
+    if (!iso) return 'not scheduled';
+    const ms = new Date(iso) - new Date();
+    if (isNaN(ms)) return '';
+    if (ms <= 0) return 'due now';
+    const mins = Math.round(ms / 60000);
+    if (mins < 60) return 'in ' + mins + ' min';
+    const hrs = Math.floor(mins / 60);
+    return 'in ' + hrs + 'h ' + (mins % 60) + 'm';
+  }
 
   async function refreshRuns() {
     try {
