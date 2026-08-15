@@ -640,7 +640,7 @@
             <option value="interval">Every N minutes</option>
           </select>
         </label>
-        <label id="s-time-wrap">Time (UTC)<input type="time" id="s-time" value="03:00"></label>
+        <label id="s-time-wrap">Time (<span id="s-tz">local</span>)<input type="time" id="s-time" value="03:00"></label>
         <label id="s-interval-wrap" hidden>Minutes<input type="number" id="s-interval" min="1" value="60"></label>
         <label>Stop at N confirmed<input type="number" id="s-target" min="1" placeholder="10"></label>
         <label>Max leads<input type="number" id="s-max" min="1" placeholder="50"></label>
@@ -1041,6 +1041,31 @@
     document.getElementById('s-interval-wrap').hidden = daily;
   });
 
+  // The schedule form takes LOCAL time and stores UTC. It used to be labelled "UTC" and
+  // taken literally, so a user at UTC+5 who typed 13:00 got a schedule that ran at 18:00
+  // their time — the field asked for a timezone nobody thinks in. People mean their own
+  // clock; the conversion belongs in the code, not in the user's head.
+  //
+  // Converted against TODAY's date, so a zone with DST resolves by current offset. A
+  // schedule created just before a DST change can therefore shift by an hour; that is a
+  // known, bounded limitation and a far smaller error than the five-hour one it replaces.
+  function localToUtcHHMM(hhmm) {
+    const parts = String(hhmm || '').split(':');
+    const d = new Date();
+    d.setHours(parseInt(parts[0], 10) || 0, parseInt(parts[1], 10) || 0, 0, 0);
+    return String(d.getUTCHours()).padStart(2, '0') + ':' + String(d.getUTCMinutes()).padStart(2, '0');
+  }
+  function utcToLocalHHMM(hhmm) {
+    const parts = String(hhmm || '').split(':');
+    const d = new Date();
+    d.setUTCHours(parseInt(parts[0], 10) || 0, parseInt(parts[1], 10) || 0, 0, 0);
+    return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  }
+  try {
+    document.getElementById('s-tz').textContent =
+      Intl.DateTimeFormat().resolvedOptions().timeZone || 'local';
+  } catch (e) { /* label stays "local" */ }
+
   function fmtWhen(iso) {
     if (!iso) return '—';
     const d = new Date(iso);
@@ -1048,9 +1073,10 @@
     return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
   }
   function scheduleSpec(s) {
-    return s.kind === 'interval'
-      ? 'every ' + s.interval_minutes + ' min'
-      : 'daily at ' + (s.time_utc || '??:??') + ' UTC';
+    if (s.kind === 'interval') return 'every ' + s.interval_minutes + ' min';
+    // Local first, because that is the clock the user set it by; UTC in brackets so the
+    // stored value is still visible.
+    return 'daily at ' + utcToLocalHHMM(s.time_utc) + ' (' + (s.time_utc || '??:??') + ' UTC)';
   }
   function stopRule(s) {
     const bits = [];
@@ -1125,7 +1151,7 @@
     const body = {
       name: document.getElementById('s-name').value || 'schedule',
       kind: kind,
-      time_utc: kind === 'daily' ? document.getElementById('s-time').value : null,
+      time_utc: kind === 'daily' ? localToUtcHHMM(document.getElementById('s-time').value) : null,
       interval_minutes: kind === 'interval' ? parseInt(document.getElementById('s-interval').value, 10) : null,
       target_confirmed: parseInt(document.getElementById('s-target').value, 10) || null,
       max_leads: parseInt(document.getElementById('s-max').value, 10) || null,
