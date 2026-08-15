@@ -41,6 +41,7 @@ from app.log_sync import sync_runs
 from app.rag_sync import drain_queue, queue_counts
 from app.runner import run_batch
 from app.scheduler import (
+    _queue as scheduler_queue_order,
     create_schedule,
     queue_breakdown,
     delete_schedule,
@@ -122,10 +123,21 @@ def _iso_now() -> str:
 
 
 def _resolve_order() -> list[str]:
-    """Ingest (idempotent) and return the ordered entity_id list. Safe to call every
-    request — `ingest_discovery_file` upserts, so a warm DB is a no-op read."""
+    """The leads a manual run may draw, in the SAME order and under the same rules as a
+    scheduled one (T39): source-class priority, and never a lead already submitted.
+
+    This used to return the raw discovery-file order, which meant the Run tab and the
+    scheduler disagreed about what a lead queue is. The consequence was visible rather
+    than theoretical: starting a 100-lead run drew 100 leads that had all been processed
+    before — every one of them `13f_filing`, the class the priority policy excludes — and
+    the status view then reported their PRIOR verdicts as this run's progress, opening at
+    "83/100 processed" before any work had been done.
+
+    Ingest still runs first (idempotent upsert) so newly-added discovery rows become
+    entities before the queue is computed."""
     with connection() as conn:
-        return ingest_discovery_file(conn, DISCOVERY_JSONL_PATH)
+        ingest_discovery_file(conn, DISCOVERY_JSONL_PATH)
+        return scheduler_queue_order(conn)
 
 
 async def _track_run(run_id: str, entity_ids: list[str]) -> None:
@@ -159,6 +171,9 @@ async def _track_run(run_id: str, entity_ids: list[str]) -> None:
 
 @app.get("/api/leads/available")
 def leads_available() -> dict:
+    """How many leads the Start button can actually draw, and the first few by name.
+    Reports the real queue — priority-ordered and excluding anything already submitted —
+    so the count on the page matches what a run would do."""
     order = _resolve_order()
     sample_names: list[str] = []
     with connection() as conn:

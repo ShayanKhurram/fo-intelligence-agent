@@ -211,3 +211,39 @@ async def test_live_target_fraction_is_none_without_a_target(client):
                                         "confirmed": 1, "target_confirmed": None})
     body = (await client.get("/api/scheduler/live")).json()
     assert body["progress"]["target_fraction"] is None
+
+
+async def test_manual_run_never_redraws_an_already_submitted_lead(client, monkeypatch):
+    """T39 — the Run tab draws from the SAME queue as the scheduler.
+
+    It used to return the raw discovery-file order, so pressing Start on 100 leads drew
+    100 leads that had all been processed before, and the status view reported their prior
+    verdicts as this run's progress — the page opened at "83/100 processed" before any
+    work had happened. Reported from the live UI."""
+    import app.api as api_mod
+    from app.db import add_entity_source, upsert_checkpoint
+
+    # Ingest is a no-op here: the entities are seeded directly.
+    monkeypatch.setattr(api_mod, "ingest_discovery_file", lambda conn, path: [])
+
+    with connection(client.db_path) as conn:
+        # Already submitted — must never be drawn again.
+        upsert_entity(conn, "old", "OLD FIRM")
+        add_entity_source(conn, "old", "fec_employer", {})
+        upsert_checkpoint(conn, "old", status="verdict_done")
+        # Excluded class — must never be drawn.
+        upsert_entity(conn, "hedge", "HEDGE FUND")
+        add_entity_source(conn, "hedge", "13f_filing", {})
+        # The one genuinely available lead.
+        upsert_entity(conn, "fresh", "FRESH FAMILY OFFICE")
+        add_entity_source(conn, "fresh", "fec_employer", {})
+
+    body = (await client.get("/api/leads/available")).json()
+    assert body["total"] == 1, "the count on the page must match what a run would draw"
+    assert body["sample_names"] == ["FRESH FAMILY OFFICE"]
+
+    r = await client.post("/api/run", json={"count": 100})
+    assert r.status_code == 200
+    drawn = r.json()["entity_ids"]
+    assert drawn == ["fresh"]
+    assert "old" not in drawn and "hedge" not in drawn
