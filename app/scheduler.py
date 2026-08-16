@@ -34,11 +34,13 @@ restart mid-window does not lose or double-fire a schedule.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from app.config import SETTINGS
@@ -53,11 +55,14 @@ from app.db import (
     start_run,
     update_run_notes,
     upsert_checkpoint,
+    write_field_provenance,
 )
+from app.dataset import _atomic_write_json
 from app.enrichment import process_entity
 from app.graph import run_lead
 from app.llm import get_model
 from app.log_sync import sync_runs
+from app.provenance_log import build_run_log
 from app.rag_sync import drain_queue, enqueue_entity, is_confirmed
 from app.toollog import tool_log_context
 
@@ -354,6 +359,51 @@ def queue_breakdown(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Provenance emission (T40)
+# ---------------------------------------------------------------------------
+
+
+def _provenance_rows_from_doc(doc: dict[str, Any], run_id: str) -> list[dict[str, Any]]:
+    """The row dicts ``write_field_provenance`` expects, built from a ``build_run_log``
+    document. ONE helper used by both the per-lead and the end-of-run emission, so the
+    row shape (keys, JSON-encoded `record`, sourced `how` fields) cannot drift between
+    the two emission points."""
+    rows: list[dict[str, Any]] = []
+    for lead in doc["leads"]:
+        for rec in lead["fields"]:
+            rows.append({
+                "run_id": run_id,
+                "entity_id": lead["entity_id"],
+                "field": rec["field"],
+                "value": rec["value"],
+                "status": rec["status"],
+                "shipped": rec["shipped"],
+                "source_class": (rec["how"] or {}).get("source_class"),
+                "extraction_method": (rec["how"] or {}).get("extraction_method"),
+                "record": json.dumps(rec, ensure_ascii=False, default=str),
+            })
+    return rows
+
+
+def _emit_run_provenance(
+    db_path: str, run_id: str, entries: list[tuple[str, str]]
+) -> dict[str, Any] | None:
+    """Best-effort provenance emission for a list of ``(entity_id, outcome)`` tuples.
+    Writes the field_provenance rows (upserting over any per-lead rows already there)
+    and returns the built document so the caller can also write the JSON file. Returns
+    None on failure. Never raises — a log write must not be able to fail a lead or a
+    run, the same way ``_publish`` is wrapped."""
+    try:
+        with connection(db_path) as conn:
+            doc = build_run_log(conn, run_id, entries)
+            write_field_provenance(conn, _provenance_rows_from_doc(doc, run_id))
+        return doc
+    except Exception:  # noqa: BLE001
+        logger.debug("scheduled run %s: provenance emission failed", run_id, exc_info=True)
+        return None
+
+
 async def _process_one(
     entity_id: str, model: Any, db_path: str, run_id: str | None = None
 ) -> dict[str, Any]:
@@ -521,6 +571,19 @@ async def run_scheduled_job(
             # per run, and the hosted page stops being minutes stale. sync_runs never
             # raises and skips cleanly when no DSN is configured.
             sync_runs(db_path, limit=1)
+        # T40(a) — emit this lead's provenance rows NOW, not only at run end. A run that
+        # is interrupted, killed or errors before completion otherwise leaves no per-field
+        # log at all (measured live: 9 of 10 runs have zero provenance rows because they
+        # never reached the clean-completion block). Re-writing is safe — field_provenance
+        # carries UNIQUE(run_id, entity_id, field) and write_field_provenance upserts on
+        # it — so the end-of-run reconciling pass overwrites these in place rather than
+        # duplicating. Skip a lead that returned a retry: nothing was assessed, so there
+        # is nothing to log. Best-effort, like every emission path.
+        if not (result["error"] or "").startswith("retry:"):
+            _emit_run_provenance(
+                db_path, run_id,
+                [(result["entity_id"], result["outcome"] or result["verdict"] or "processed")],
+            )
         # Publish a confirmed lead to the retrieval corpus NOW rather than at run end.
         #
         # Draining only at the end means a run that is killed, crashes, or simply has not
@@ -565,6 +628,21 @@ async def run_scheduled_job(
     except Exception as exc:  # noqa: BLE001
         logger.exception("scheduled run %s failed", run_id)
         termination = "error"
+        # T40(b) — emit whatever the run produced before it died, so an interrupted or
+        # errored run still leaves a per-field log for the leads it did finish. Skip
+        # retries (nothing was assessed). Best-effort, like every emission path: a log
+        # write must not be able to fail the run twice.
+        _doc = _emit_run_provenance(db_path, run_id, [
+            (r["entity_id"], r["outcome"] or r["verdict"] or "processed")
+            for r in processed if not (r["error"] or "").startswith("retry:")
+        ])
+        if _doc is not None:
+            try:
+                _atomic_write_json(
+                    Path(db_path).parent / "runs" / run_id / "field_provenance.json", _doc)
+            except Exception:  # noqa: BLE001
+                logger.debug("scheduled run %s: provenance json write failed",
+                             run_id, exc_info=True)
         with connection(db_path) as conn:
             finish_run(conn, run_id, status="failed", notes={
                 "schedule_id": schedule.get("schedule_id"),
@@ -577,14 +655,11 @@ async def run_scheduled_job(
     rag = drain_queue(db_path)
 
     # The provenance log for what this run produced, under this run's id — so the Log tab
-    # can go run -> leads -> field logs with no extra plumbing (PLAN.md T35.5).
+    # can go run -> leads -> field logs with no extra plumbing (PLAN.md T35.5). This is
+    # the reconciling pass (T40(c)): per-lead rows were already written as each lead
+    # finished, and the upsert below overwrites them in place with the final snapshot.
+    # It also writes data/runs/<run_id>/field_provenance.json.
     try:
-        from app.db import write_field_provenance
-        from app.provenance_log import build_run_log
-        from app.dataset import _atomic_write_json
-        import json as _json
-        from pathlib import Path as _Path
-
         with connection(db_path) as conn:
             finish_run(conn, run_id, status="done", notes={
                 "schedule_id": schedule.get("schedule_id"),
@@ -600,18 +675,8 @@ async def run_scheduled_job(
             })
             doc = build_run_log(conn, run_id, [(r["entity_id"], r["outcome"] or r["verdict"] or "processed")
                                                for r in processed])
-            rows = []
-            for lead in doc["leads"]:
-                for rec in lead["fields"]:
-                    rows.append({
-                        "run_id": run_id, "entity_id": lead["entity_id"], "field": rec["field"],
-                        "value": rec["value"], "status": rec["status"], "shipped": rec["shipped"],
-                        "source_class": (rec["how"] or {}).get("source_class"),
-                        "extraction_method": (rec["how"] or {}).get("extraction_method"),
-                        "record": _json.dumps(rec, ensure_ascii=False, default=str),
-                    })
-            write_field_provenance(conn, rows)
-        _atomic_write_json(_Path(db_path).parent / "runs" / run_id / "field_provenance.json", doc)
+            write_field_provenance(conn, _provenance_rows_from_doc(doc, run_id))
+        _atomic_write_json(Path(db_path).parent / "runs" / run_id / "field_provenance.json", doc)
     except Exception:  # noqa: BLE001 — the leads are the deliverable, the log is its record
         logger.error("scheduled run %s: provenance emission failed", run_id, exc_info=True)
         with connection(db_path) as conn:

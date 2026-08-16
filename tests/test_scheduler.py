@@ -547,3 +547,173 @@ async def test_a_confirmed_lead_is_published_without_waiting_for_the_run_to_end(
 
     # Two confirmations during the run, plus the end-of-run drain.
     assert len(drains) >= 3, f"expected a drain per confirmed lead, got {len(drains)}"
+
+
+# ---------------------------------------------------------------------------
+# T40 — provenance emitted as leads finish, not only when the run does
+# ---------------------------------------------------------------------------
+
+
+async def test_errored_run_emits_provenance_for_leads_it_finished(db_path, monkeypatch):
+    """T40(b) — the run-level except path. When a run raises mid-run, the except handler
+    emits provenance for every lead in `processed` before finishing the run `failed`, so
+    an ERRORED run still leaves a per-field log for the leads it did finish.
+
+    Note this is the except-handler path, not the per-lead emission (T40(a)): an exception
+    raised here propagates to the run-level except, which emits for everything in
+    `processed`. The per-lead path is what saves the log when a process is KILLED (no
+    except handler runs then) and is covered by its own test below.
+    """
+    from app.db import get_field_provenance
+    ids = _seed_leads(db_path, 3)
+    _stub_agent(monkeypatch, outcomes={eid: "ship" for eid in ids})
+    with connection(db_path) as conn:
+        for eid in ids:
+            conn.execute(
+                "INSERT INTO decisions (entity_id, verdict, rationale) VALUES (?, 'pursue', '')",
+                (eid,))
+
+    sync_calls = {"n": 0}
+
+    def boom_sync(db, *, limit=50):
+        sync_calls["n"] += 1
+        # The 3rd per-lead sync (lead 3 finishing) raises, mid-_tracked, AFTER leads 1
+        # and 2 have already completed and emitted their own provenance. This is the
+        # run-level except path, not a single lead failing (a single lead raising is
+        # absorbed by _process_one and never ends the run).
+        if sync_calls["n"] == 3:
+            raise RuntimeError("interrupted mid-run")
+        return {"status": "ok", "runs": 0, "fields": 0}
+
+    monkeypatch.setattr(sched_mod, "sync_runs", boom_sync)
+
+    result = await run_scheduled_job(
+        {"schedule_id": "s1", "name": "t", "target_confirmed": None, "max_leads": None},
+        db_path=db_path, model=object(), chunk_size=1,
+    )
+    assert result["termination"] == "error"
+    with connection(db_path) as conn:
+        rows = get_field_provenance(conn, run_id=result["run_id"])
+    eids = {r["entity_id"] for r in rows}
+    assert {"e0", "e1"} <= eids, "the 2 completed leads must have provenance rows"
+
+
+async def test_per_lead_provenance_exists_while_the_next_lead_is_still_in_flight(
+    db_path, monkeypatch
+):
+    """T40(a) in isolation — the per-lead emission inside `_tracked`, independent of the
+    end-of-run reconciling pass AND independent of the run-level except handler.
+
+    This is the only thing that saves the log when a run is KILLED (a service restart,
+    SIGKILL): no except handler runs then, and the clean-completion block never runs
+    either. So we prove that lead 1's rows already exist WHILE lead 2 is still being
+    processed — mid-run, before the run ends and before any except handler could run.
+
+    Discrimination: chunk_size=1 makes the leads strictly sequential, so when e1's
+    enrichment runs, e0 has already passed through `_tracked`'s per-lead emission. If
+    that emission is deleted, e0 has zero rows at this snapshot and the test fails.
+    """
+    from app.db import get_field_provenance
+    ids = _seed_leads(db_path, 2)
+    # _stub_agent wires fake_run_lead (Layer 1) and writes nothing else we need; we
+    # override process_entity below so the e1 branch can snapshot mid-run state.
+    _stub_agent(monkeypatch, outcomes={eid: "ship" for eid in ids})
+    with connection(db_path) as conn:
+        for eid in ids:
+            conn.execute(
+                "INSERT INTO decisions (entity_id, verdict, rationale) "
+                "VALUES (?, 'pursue', '')",
+                (eid,))
+
+    seen: dict = {}
+    real_conn = connection
+
+    async def fake_process_entity(conn, entity_id, model, *, force=False):
+        if entity_id == "e1":
+            # e1 is being processed -> e0 has already finished and passed through
+            # _tracked's per-lead emission. Snapshot whether e0's provenance rows exist
+            # NOW, mid-run, on a SEPARATE connection (the outside-reader view).
+            with real_conn(db_path) as c:
+                running = c.execute(
+                    "SELECT run_id FROM runs WHERE status='running' "
+                    "ORDER BY started_at DESC LIMIT 1"
+                ).fetchone()
+                if running is not None:
+                    seen["run_id"] = running["run_id"]
+                    seen["e0_rows_while_e1_in_flight"] = len(
+                        get_field_provenance(c, run_id=running["run_id"], entity_id="e0"))
+        return {"entity_id": entity_id, "outcome": "ship",
+                "calls_spent": 0, "usd_spent": 0.0}
+
+    monkeypatch.setattr(sched_mod, "process_entity", fake_process_entity)
+
+    result = await run_scheduled_job(
+        {"schedule_id": "s1", "name": "t", "target_confirmed": None, "max_leads": None},
+        db_path=db_path, model=object(), chunk_size=1,
+    )
+    assert result["termination"] != "error", "the run must finish cleanly for this test"
+    assert seen.get("run_id") == result["run_id"], (
+        "could not capture the running run_id mid-run")
+    assert seen.get("e0_rows_while_e1_in_flight", 0) > 0, (
+        "e0's provenance must be emitted by _tracked BEFORE e1 is processed — "
+        "this is the only emission that survives a KILLED process (no except "
+        "handler runs on SIGKILL/service restart)")
+
+
+async def test_writing_a_leads_provenance_twice_is_an_upsert_not_a_duplicate(db_path, monkeypatch):
+    """T40(d) — re-writing the same lead's provenance is an upsert, not a duplicate.
+    field_provenance carries UNIQUE(run_id, entity_id, field) and write_field_provenance
+    upserts on it, so the per-lead emission and the end-of-run reconciling pass produce
+    one row per field, not two."""
+    from app.db import get_field_provenance
+    _seed_leads(db_path, 1)
+    _stub_agent(monkeypatch, outcomes={"e0": "ship"})
+    with connection(db_path) as conn:
+        conn.execute(
+            "INSERT INTO decisions (entity_id, verdict, rationale) VALUES ('e0', 'pursue', '')")
+
+    result = await run_scheduled_job(
+        {"schedule_id": "s1", "name": "t", "target_confirmed": None, "max_leads": None},
+        db_path=db_path, model=object(),
+    )
+    with connection(db_path) as conn:
+        after_first = len(get_field_provenance(conn, run_id=result["run_id"]))
+    assert after_first > 0
+
+    # Re-emit the same lead's provenance via the same path the per-lead emission uses.
+    sched_mod._emit_run_provenance(db_path, result["run_id"], [("e0", "ship")])
+    with connection(db_path) as conn:
+        after_second = len(get_field_provenance(conn, run_id=result["run_id"]))
+    assert after_second == after_first, "re-emitting must upsert, not duplicate"
+
+
+async def test_clean_run_provenance_shape_is_unchanged(db_path, monkeypatch):
+    """T40(c) — a clean run's reconciling pass must produce the same provenance as
+    before the per-lead emission was added: same entity set, same row keys, same JSON
+    `record` blob. The per-lead upsert must not change what a clean run leaves behind."""
+    from app.db import get_field_provenance
+    _seed_leads(db_path, 2)
+    _stub_agent(monkeypatch, outcomes={eid: "ship" for eid in ("e0", "e1")})
+    with connection(db_path) as conn:
+        for eid in ("e0", "e1"):
+            conn.execute(
+                "INSERT INTO decisions (entity_id, verdict, rationale) VALUES (?, 'pursue', '')",
+                (eid,))
+
+    result = await run_scheduled_job(
+        {"schedule_id": "s1", "name": "t", "target_confirmed": None, "max_leads": None},
+        db_path=db_path, model=object(),
+    )
+    with connection(db_path) as conn:
+        rows = get_field_provenance(conn, run_id=result["run_id"])
+    assert rows, "a clean run must still emit provenance"
+    assert {r["entity_id"] for r in rows} == {"e0", "e1"}
+    expected_keys = {"run_id", "entity_id", "field", "value", "status", "shipped",
+                     "source_class", "extraction_method", "record"}
+    for r in rows:
+        assert expected_keys <= set(r.keys()), f"row missing keys: {sorted(r.keys())}"
+        assert r["run_id"] == result["run_id"]
+        # `record` is the full JSON blob of the field record, parsed back to a dict.
+        rec = r["record"]
+        assert isinstance(rec, dict)
+        assert "field" in rec and "value" in rec and "how" in rec
