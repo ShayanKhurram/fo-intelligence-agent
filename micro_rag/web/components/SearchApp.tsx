@@ -259,6 +259,13 @@ export function SearchApp() {
         </div>
         <div className="flex items-center gap-2">
           {/* T37 — the agent's run log, mirrored here from the machine that runs it. */}
+          {/* T42.5 — the First Approach Plan route. */}
+          <a
+            href="/plan"
+            className="mono rounded-[var(--r-sm)] border border-[var(--edge)] px-3 py-1.5 text-xs text-[var(--text-mid)] hover:text-[var(--text-hi)]"
+          >
+            Plan
+          </a>
           <a
             href="/log"
             className="mono rounded-[var(--r-sm)] border border-[var(--edge)] px-3 py-1.5 text-xs text-[var(--text-mid)] hover:text-[var(--text-hi)]"

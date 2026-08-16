@@ -12,6 +12,8 @@ export type QueryResponse = {
 // this union is the source of truth both the route (producer) and SearchApp (consumer)
 // import, so the two ends can't drift out of sync on shape.
 import type { ParsedFilters } from "./query-understanding";
+import type { RankedCandidate } from "./plan-rank";
+import type { Excluded } from "./plan-retrieval";
 
 export type FilterChip = { key: string; label: string };
 
@@ -36,6 +38,12 @@ export type QueryStreamEvent =
   | { type: "records"; records: RecordRow[]; candidateCount: number }
   | { type: "token"; text: string; kind: "claim" | "neutral" }
   | { type: "claim_verified"; claim: ClaimVerifiedPayload }
+  // T42.4 — the First Approach Plan payload. `rows` is the ranked shortlist, emitted
+  // from the structured T42.2 scores and never passed through the model; the approach
+  // notes are generated separately and stream afterward as `token`/`claim_verified`
+  // events. `excluded` is the rejected-with-reason appendix — the honesty half of the
+  // deliverable, not an appendix to hide.
+  | { type: "plan"; rows: RankedCandidate[]; excluded: Excluded[]; candidateCount: number; sweptTotal: number; sweptConsidered: number; truncated: boolean }
   | {
       type: "done";
       records: string[];

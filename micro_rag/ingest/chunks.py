@@ -44,8 +44,29 @@ def _identity_chunk(record: dict[str, Any]) -> str:
 
 def _mandate_chunk(record: dict[str, Any]) -> str:
     parts = [f"{record['entity_name']}'s investing mandate."]
-    if record.get("mandates"):
-        parts.append(f"Focus areas: {_fmt(record['mandates'])}.")
+    mandates = record.get("mandates")
+    if mandates:
+        # `mandates` carries the investing thesis prose (a one-element list from the
+        # agent path) or legacy tag strings (from the CSV importer). Branch on the
+        # list length — never split prose on commas to decide which case this is.
+        if isinstance(mandates, list) and len(mandates) > 1:
+            # The CSV tag path: restore the "Focus areas:" label, a lexical anchor
+            # `lexicalRank`'s `plainto_tsquery` can hit, and terminate with a period.
+            parts.append(f"Focus areas: {_fmt(mandates)}.")
+        else:
+            # Thesis prose: emit it bare, but ensure the sentence still terminates —
+            # every other sentence in every chunk builder ends in a period.
+            prose = _fmt(mandates)
+            if not prose.endswith((".", "!", "?")):
+                prose = prose + "."
+            parts.append(prose)
+    for field, label in (
+        ("sector_focus", "Sector focus"),
+        ("stage_focus", "Stage focus"),
+        ("geography_focus", "Geography focus"),
+    ):
+        if record.get(field):
+            parts.append(f"{label}: {_fmt(record[field])}.")
     if record.get("fit_tags"):
         parts.append(f"Fit tags: {_fmt(record['fit_tags'])}.")
     if record.get("check_size_min") or record.get("check_size_max"):
@@ -68,11 +89,19 @@ def _people_chunk(record: dict[str, Any]) -> str:
 
 
 def _activity_chunk(record: dict[str, Any]) -> str:
-    if not record.get("activity_status") and not record.get("most_recent_signal_date"):
-        return f"No recent activity signal has been confirmed for {record['entity_name']}."
+    has_material = False
     parts = [f"{record['entity_name']} activity."]
+    if record.get("recent_investments"):
+        parts.append(f"Recent investments: {_fmt(record['recent_investments'])}.")
+        has_material = True
+    if record.get("recent_news"):
+        parts.append(f"Recent news: {_fmt(record['recent_news'])}.")
+        has_material = True
     if record.get("most_recent_signal_date"):
         parts.append(f"Most recent dated signal: {record['most_recent_signal_date']}.")
+        has_material = True
+    if not has_material:
+        return f"No recent activity signal has been confirmed for {record['entity_name']}."
     return " ".join(parts)
 
 

@@ -55,9 +55,29 @@ def _parse_check_size_range(raw: Any) -> tuple[int | None, int | None]:
     return _to_number(parts[0]), _to_number(parts[1])
 
 
+_G1Q4_UNSETTLED = ("could_not_verify", "removed_failed_validation", "contradicted", "superseded")
+
+
 def _type_final(claims_by_field: dict[str, dict[str, Any]], claims: list[dict[str, Any]]) -> str:
-    g1q4 = next((c for c in claims if c.get("question_id") == "G1.Q4"), None)
-    if g1q4 is None or g1q4["status"] in ("could_not_verify", "removed_failed_validation", "contradicted"):
+    """SFO/MFO from the G1.Q4 claim, LAST settled write wins.
+
+    This used to take `next(...)` — the FIRST G1.Q4 claim — while `get_claims` orders by
+    `created_at` ascending. So the oldest claim always won, and an entity whose type was
+    later determined kept projecting as `type_unconfirmed` forever: the original
+    "could not be determined" claim outranked every subsequent verdict. Found live
+    2026-08-16, when a type pass wrote 142 verdicts and the projection ignored all of them.
+
+    Last-write-wins is also what every other single-valued field here already does (see
+    `_settled_value` and the by-field resolution feeding it), so `next()` was the odd one
+    out rather than a deliberate choice. Unsettled claims are skipped rather than being
+    allowed to mask an earlier real answer.
+    """
+    g1q4 = next(
+        (c for c in reversed(claims)
+         if c.get("question_id") == "G1.Q4" and c.get("status") not in _G1Q4_UNSETTLED),
+        None,
+    )
+    if g1q4 is None:
         return "type_unconfirmed"
     ans = str(g1q4["answer"]).upper()
     if "MFO" in ans:
@@ -113,7 +133,13 @@ def build_record(entity_id: str, canonical_name: str, outcome: str, claims: list
     invents a value the pipeline didn't already produce."""
     by_field = _latest_by_field(claims)
 
-    mandates_raw = _settled_value(by_field, "investing_mandates")
+    # The enrichment pipeline emits `investing_thesis` (app/enrichment.py); the CSV
+    # importer emits `investing_mandates`. Read the agent-path field first and fall back
+    # to the legacy name so both paths keep working. A thesis is prose, not a tag list —
+    # it is NOT split on commas; the one-element wrapping below preserves the sentence.
+    mandates_raw = _settled_value(by_field, "investing_thesis")
+    if mandates_raw is None:
+        mandates_raw = _settled_value(by_field, "investing_mandates")
     fit_tags_raw = _settled_value(by_field, "fit_tags")
     check_min, check_max = _parse_check_size_range(_settled_value(by_field, "check_size_range"))
     overlap_raw = _settled_value(by_field, "public_list_overlap")
@@ -135,6 +161,8 @@ def build_record(entity_id: str, canonical_name: str, outcome: str, claims: list
         "principal_title": _settled_value(by_field, "principal_title"),
         "principal_email": _settled_value(by_field, "principal_email"),
         "principal_email_status": _settled_status(by_field, "principal_email"),
+        "firm_email": _settled_value(by_field, "firm_email"),
+        "firm_email_status": _settled_status(by_field, "firm_email"),
         "principal_phone": _settled_value(by_field, "principal_phone"),
         "principal_phone_status": _settled_status(by_field, "principal_phone"),
         "most_recent_signal_date": _most_recent_signal_date(claims),
@@ -149,4 +177,12 @@ def build_record(entity_id: str, canonical_name: str, outcome: str, claims: list
         "public_list_overlap": overlap_raw if isinstance(overlap_raw, list) else ([overlap_raw] if overlap_raw else []),
         "record_confidence": _record_confidence(claims),
         "outcome": outcome,
+        # Provenance-sourced material the chunks need but that has no `records` column
+        # home. Consumed by chunks.py's mandate/activity facets; no schema change required
+        # because these never become SQL columns.
+        "sector_focus": _settled_value(by_field, "sector_focus"),
+        "stage_focus": _settled_value(by_field, "stage_focus"),
+        "geography_focus": _settled_value(by_field, "geography_focus"),
+        "recent_investments": _settled_value(by_field, "recent_investments"),
+        "recent_news": _settled_value(by_field, "recent_news"),
     }

@@ -18,7 +18,7 @@ export type ParsedFilters = {
 export type QueryUnderstanding = {
   filters: ParsedFilters;
   semantic: string;
-  intent: "search" | "lookup" | "aggregate" | "out_of_scope";
+  intent: "search" | "lookup" | "aggregate" | "out_of_scope" | "plan";
 };
 
 /** Turns a parsed filter set into removable UI chips (ui_plan.md §6 "Filter chips" —
@@ -129,9 +129,14 @@ export async function understandQuery(query: string): Promise<QueryUnderstanding
   const q = query.toLowerCase();
   const filters: ParsedFilters = {};
 
-  // entity type
-  if (/\b(sfo|single[- ]family office)\b/.test(q)) filters.entity_type = "SFO";
-  else if (/\b(mfo|multi[- ]family office)\b/.test(q)) filters.entity_type = "MFO";
+  // entity type. The trailing `s?` (and `offices?`) matches the plurals "SFOs" / "MFOs" /
+  // "single family offices" — the old `\b(sfo|...)\b` needed a word boundary after `sfo`,
+  // which "sfos" has none of, so every plural type query parsed with no entity_type filter
+  // at all. Bare "family office" is deliberately NOT matched: the phrase appears in nearly
+  // every query in this domain and would set entity_type on almost everything. The SFO /
+  // MFO distinction stays explicit, and SFO-before-MFO precedence is unchanged.
+  if (/\b(sfos?|single[- ]family offices?)\b/i.test(q)) filters.entity_type = "SFO";
+  else if (/\b(mfos?|multi[- ]family offices?)\b/i.test(q)) filters.entity_type = "MFO";
 
   // state
   const state = detectState(query);
