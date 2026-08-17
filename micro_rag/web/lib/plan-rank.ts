@@ -104,7 +104,7 @@ const NON_STATEMENT_MARKERS = [
   "No named decision-maker has been confirmed",
 ];
 
-function isNonStatement(content: string | null | undefined): boolean {
+export function isNonStatement(content: string | null | undefined): boolean {
   if (!content) return false;
   return NON_STATEMENT_MARKERS.some((m) => content.includes(m));
 }

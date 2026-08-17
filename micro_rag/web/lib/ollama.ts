@@ -1,18 +1,25 @@
 // Ollama Cloud client — this project's existing LLM provider (app/llm.py's
-// OllamaCloudChatModel, same OpenAI-compatible endpoint). Used here for query
-// understanding (filter parsing), generation (with mandatory claim tags), and rerank.
-// Embeddings are NOT handled here — see lib/embeddings.ts (Ollama Cloud has no
+// OllamaCloudChatModel, same OpenAI-compatible endpoint). Used here ONLY for answer
+// generation (with mandatory [record_id:field] claim tags). Query understanding is
+// deterministic (lib/query-understanding.ts imports no model) and there is no rerank
+// caller. Embeddings are NOT handled here — see lib/embeddings.ts (Ollama Cloud has no
 // embedding-capable model; local ONNX model used instead, see PROJECT_LOG.md).
 
 const OLLAMA_BASE_URL = "https://ollama.com/v1/chat/completions";
 
-// gemma4:31b, NOT gpt-oss — gpt-oss is a reasoning model that emits hidden chain-of-thought
-// before every answer, so even a one-word reply took 15-20s on Ollama Cloud. gemma4 is a
-// plain instruction model (~10s/call, the floor on this backend) and is more than enough for
-// filter parsing and grounded summarization. Overridable via env for A/B testing.
+// Tier -> model id. "cheapest" and "mid" stay on gemma4:31b (a non-reasoning instruction
+// model, ~10s/call — the latency floor on this backend) as the rollback path: if glm-5.2
+// ever misbehaves, set OLLAMA_MODEL_STRONGEST to fall back, or point generation back at
+// "cheapest"/"mid". "strongest" is glm-5.2 by direction (app/llm.py's
+// OLLAMA_TIER_MODEL_MAP uses the same id for its strongest tier). glm-5.2 IS a reasoning
+// model, but its chain-of-thought is emitted in a SIBLING `reasoning` field (verified
+// by probing the live endpoint — see lib/ollama.test.ts), never in `content`, so reading
+// only `content`/`delta.content` below excludes it by construction; no inline stripping is
+// needed. Overridable via env for A/B testing.
 const TIER_MODEL: Record<string, string> = {
   cheapest: process.env.OLLAMA_MODEL_CHEAPEST || "gemma4:31b",
   mid: process.env.OLLAMA_MODEL_MID || "gemma4:31b",
+  strongest: process.env.OLLAMA_MODEL_STRONGEST || "glm-5.2",
 };
 
 export type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
@@ -21,7 +28,10 @@ const MAX_ATTEMPTS = 5;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-export async function ollamaChat(messages: ChatMessage[], tier: "cheapest" | "mid" = "cheapest"): Promise<string> {
+export async function ollamaChat(
+  messages: ChatMessage[],
+  tier: "cheapest" | "mid" | "strongest" = "cheapest"
+): Promise<string> {
   const apiKey = process.env.OLLAMA_API_KEY;
   if (!apiKey) {
     throw new Error("OLLAMA_API_KEY not set");
@@ -48,6 +58,9 @@ export async function ollamaChat(messages: ChatMessage[], tier: "cheapest" | "mi
     });
     if (resp.ok) {
       const data = await resp.json();
+      // glm-5.2 emits its chain-of-thought in `message.reasoning` (a sibling field, NOT
+      // inline in `content`) — reading only `content` returns final-answer text. Verified
+      // against the live endpoint; pinned by lib/ollama.test.ts.
       return data.choices?.[0]?.message?.content ?? "";
     }
     lastText = await resp.text();
@@ -71,7 +84,7 @@ export async function ollamaChat(messages: ChatMessage[], tier: "cheapest" | "mi
  * other generation failure today). */
 export async function* ollamaChatStream(
   messages: ChatMessage[],
-  tier: "cheapest" | "mid" = "cheapest"
+  tier: "cheapest" | "mid" | "strongest" = "cheapest"
 ): AsyncGenerator<string> {
   const apiKey = process.env.OLLAMA_API_KEY;
   if (!apiKey) {
@@ -126,6 +139,11 @@ export async function* ollamaChatStream(
       } catch {
         continue; // a malformed/partial JSON chunk — skip rather than crash the whole stream
       }
+      // glm-5.2 streams its chain-of-thought in a sibling `delta.reasoning` field with
+      // `delta.content` == "" during the reasoning phase; once reasoning ends, `reasoning`
+      // stops appearing and `content` carries answer deltas. Reading only `content` (and
+      // skipping empty deltas) therefore yields final-answer deltas only — no reasoning
+      // ever reaches the SSE route. Pinned by lib/ollama.test.ts.
       const delta = parsed.choices?.[0]?.delta?.content;
       if (delta) yield delta;
     }

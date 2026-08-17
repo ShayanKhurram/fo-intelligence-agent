@@ -66,16 +66,20 @@ invent record_ids or field names.`;
 
 export async function generateAnswer(query: string, chunks: RetrievedChunk[], facts: RecordFacts): Promise<string> {
   const userPrompt = buildGenerationPrompt(query, chunks, facts);
-  // Uses the "cheapest" (gpt-oss:20b) tier, not "mid" (gpt-oss:120b): this is grounded
-  // summarization over facts we already retrieved and hand the model verbatim, plus mechanical
-  // [record:field] tagging — not open reasoning. The 120B model made each query take 20-30s+
-  // of generation; 20b is far faster and Gate 2 (entailment) still catches any tagging slip.
+  // Generation runs on the "strongest" tier (glm-5.2) at the user's direction — see T48.
+  // glm-5.2 is a reasoning model, but its chain-of-thought is emitted in a sibling
+  // `reasoning` field, never in `content` (verified by probing the live endpoint;
+  // see lib/ollama.test.ts), so reading only `content` excludes it by construction. The
+  // /api/query route caps the whole request at maxDuration = 60 (Vercel Hobby ceiling —
+  // one embedding + one generation pass); glm-5.2's reasoning phase still has to fit
+  // inside that. Rollback: set OLLAMA_MODEL_STRONGEST (or point this call at "cheapest"/
+  // "mid", both still on gemma4:31b) to drop back to a non-reasoning model.
   return ollamaChat(
     [
       { role: "system", content: GENERATION_SYSTEM },
       { role: "user", content: userPrompt },
     ],
-    "cheapest"
+    "strongest"
   );
 }
 
@@ -89,7 +93,7 @@ export function generateAnswerStream(query: string, chunks: RetrievedChunk[], fa
       { role: "system", content: GENERATION_SYSTEM },
       { role: "user", content: userPrompt },
     ],
-    "cheapest"
+    "strongest"
   );
 }
 

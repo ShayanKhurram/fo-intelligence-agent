@@ -36,6 +36,10 @@ export type QueryShape = "count" | "one" | "many";
 export type QueryUnderstanding = {
   filters: ParsedFilters;
   semantic: string;
+  // T49.2 — the query's TOPIC, with scaffolding and filter-captured terms removed. Empty
+  // means the question is purely structural and carries no topic of its own. Retrieval ranks
+  // on this when present; `semantic` (the full question) remains the fallback.
+  thesis: string;
   top_n: number;
   asOf: string | null;
   shape: QueryShape;
@@ -101,6 +105,74 @@ const STATE_NAMES: Record<string, string> = {
   texas:"TX",utah:"UT",vermont:"VT",virginia:"VA",washington:"WA","west virginia":"WV",
   wisconsin:"WI",wyoming:"WY","washington dc":"DC","district of columbia":"DC",
 };
+
+// T49.2 — words stripped from a query to leave its TOPIC, for the embedding + lexical halves
+// of retrieval.
+//
+// Why: `semantic` is the whole raw question, and the measurement in PROJECT_LOG.md shows that
+// wrecks both signals. Embedding "Which family offices invest in climate?" puts the topic at
+// roughly one content word in six, and the rest ("family offices invest") is scaffolding shared
+// with every chunk ("<name>'s investing mandate. ..."), so all topical queries collapse into one
+// band — the same hub record was closest for climate, real estate AND biotech alike. The lexical
+// half fares worse: plainto_tsquery ANDs its terms, so that question becomes
+// 'famili & offic & invest & climat' and matches almost nothing.
+//
+// Two classes are removed: question scaffolding (interrogatives, verbs, articles) and DOMAIN
+// scaffolding — words present in nearly every record and therefore carrying no discriminating
+// signal here ("family", "office", "capital", "wealth", "investment"). Entity-specific words
+// survive, which is what keeps name lookups working: "Who is Kapor Family Office?" -> "kapor".
+const THESIS_SCAFFOLDING = new Set([
+  // interrogatives / verbs / function words
+  "which", "what", "who", "whom", "whose", "where", "when", "why", "how",
+  "is", "are", "was", "were", "be", "been", "am", "do", "does", "did", "has", "have", "had",
+  "can", "could", "should", "would", "will", "shall", "may", "might",
+  "the", "a", "an", "of", "in", "on", "for", "to", "with", "at", "by", "from", "as", "and", "or",
+  "that", "this", "those", "these", "there", "any", "all", "some", "me", "my", "i", "us", "our",
+  "you", "your", "it", "its", "about", "into", "out", "up", "down", "please",
+  "tell", "show", "find", "list", "give", "get", "want", "need", "looking", "look", "search",
+  "help", "know", "see", "name", "names",
+  // domain scaffolding — in nearly every record, so it discriminates nothing
+  "family", "families", "office", "offices", "firm", "firms", "group", "groups",
+  "invest", "invests", "invested", "investing", "investment", "investments",
+  "investor", "investors", "fund", "funds", "capital", "wealth", "advisor", "advisors",
+  "advisory", "management", "managers", "manager", "partners", "holdings", "llc", "inc",
+  "ltd", "lp", "co", "companies", "company",
+  // structural phrasing — the SQL filters already handle these
+  "based", "located", "location", "headquartered", "hq", "headquarters", "over", "under",
+  "above", "below", "more", "less", "than", "top", "best", "biggest", "largest", "smallest",
+  "having", "aum", "assets", "under", "record", "records", "dataset",
+]);
+
+/** The topical remainder of a query: the question with scaffolding and any term the structured
+ * filters already captured removed. Empty means the question carries NO topic of its own — it is
+ * purely structural ("which family offices are based in Texas?"), and relevance is established by
+ * the SQL filter rather than by similarity. Callers must treat empty as "no topical requirement"
+ * rather than as a thesis, or a structural query would be judged against an empty string. */
+export function topicalResidual(query: string, filters: ParsedFilters): string {
+  let q = ` ${query.toLowerCase().replace(/[^\p{L}\p{N}\s%$.-]/gu, " ")} `;
+
+  // Drop the state the hq_state filter already captured — multi-word names ("west virginia")
+  // before single tokens, and the two-letter code too.
+  if (filters.hq_state) {
+    for (const [name, code] of Object.entries(STATE_NAMES)) {
+      if (code === filters.hq_state) q = q.replace(new RegExp(`\\b${name}\\b`, "g"), " ");
+    }
+    q = q.replace(new RegExp(`\\b${filters.hq_state.toLowerCase()}\\b`, "g"), " ");
+  }
+  // Entity-type words the entity_type filter already captured.
+  if (filters.entity_type) {
+    q = q.replace(/\b(single|multi)[\s-]?family\b/g, " ").replace(/\b(sfo|mfo)\b/g, " ");
+  }
+
+  return q
+    .split(/\s+/)
+    .filter(Boolean)
+    // Bare numbers / money amounts belong to the AUM filter, not the topic.
+    .filter((t) => !/^\$?[\d.,]+(m|b|k|mm|bn|million|billion)?$/.test(t))
+    .filter((t) => !THESIS_SCAFFOLDING.has(t))
+    .join(" ")
+    .trim();
+}
 
 // Mandate / sector keywords the dataset actually uses. A hit adds a mandate filter term;
 // matching is done against the record's `mandates` text[] with the `&&` overlap operator,
@@ -206,11 +278,14 @@ export async function understandQuery(query: string, asOf?: string): Promise<Que
   // intent — shape-derived alias so the existing query route switches unchanged.
   const intent: QueryUnderstanding["intent"] = shape === "count" ? "aggregate" : "search";
 
-  // semantic residual = the whole query (embedding the full text is fine; filter words add
-  // little noise at this corpus size, and keeping them preserves recall for lexical rank).
+  // `semantic` stays the whole query — it is what the UI echoes and what the LLM judge reads.
+  // `thesis` is the topical residual retrieval actually ranks on (T49.2): embedding the full
+  // question buried the topic under scaffolding shared with every chunk, and ANDing the full
+  // question in plainto_tsquery matched almost nothing.
   return {
     filters,
     semantic: query,
+    thesis: topicalResidual(query, filters),
     top_n: clampTopN(parseTopN(query)),
     asOf: asOf ?? null,
     shape,

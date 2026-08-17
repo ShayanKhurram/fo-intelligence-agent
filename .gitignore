@@ -56,3 +56,6 @@ supabase/
 Thumbs.db
 .idea/
 .vscode/
+
+.vercel
+.env*

@@ -7,18 +7,22 @@ import { loadRecordFacts, generateAnswerStream, verifyEntailment, checkSentence,
 import { loadRecordRows } from "@/lib/records";
 import { noMatchMessage, entailmentDiscardedMessage, timeoutMessage } from "@/lib/failures";
 import { sseResponse, type Emit } from "@/lib/sse";
+import { judgeRelevance } from "@/lib/relevance-judge";
 
 // T44.3 — `/api/query` is the only endpoint. The separate `/api/plan` mode is gone; the
 // answer shape (`count` / `one` / `many`) follows the question's grammatical form, and the
 // unified retrieval core (`selectCandidates`) feeds every shape. The SSE contract and
 // stage ids are unchanged so the client keeps working: the `plan` event still carries the
-// ranked rows + excluded appendix, emitted BEFORE any model call so the ranked table is
-// never influenced by generation.
+// ranked rows + excluded appendix, scored entirely before any model call so the ranked table
+// is never authored by generation. T49.3 narrows that rule rather than breaking it: the
+// relevance judge runs before the `plan` event but may only SUBTRACT rows it identifies as
+// irrelevant — it cannot reorder, rescore, or add, and it fails open. See step 4b.
 
 // Cold start downloads the ONNX embedding model (~23MB quantized) and inits onnxruntime
 // before the first inference; that plus the LLM stream can exceed the default limit. 60s
-// is the Hobby-tier ceiling. Budget: one embedding (inside selectCandidates) + one
-// generation pass.
+// is the Hobby-tier ceiling. Budget: one embedding (inside selectCandidates) + the T49.3
+// relevance-judge call (cheapest tier, classification only) + one generation pass. The judge
+// is why the cheap tier matters there: generation alone already spends ~25-30s of this.
 export const maxDuration = 60;
 
 async function logQuery(entry: Record<string, unknown>) {
@@ -117,20 +121,46 @@ async function runQuery(query: string, overrideFilters: ParsedFilters | undefine
     return;
   }
 
-  const candidateCount = totalRows - select.excluded.length;
-  const shortlistIds = select.ranked.map((r) => r.record_id);
+  // 4b. T49.3 — LLM relevance judge over the ranked shortlist.
+  //
+  // This AMENDS the invariant stated below, deliberately. The rule was "the ranked table is
+  // emitted before any model call, so a model that cannot invent the order cannot flatter the
+  // list". That rule exists to stop a model reordering or inflating results, and it still
+  // holds: the judge cannot reorder, cannot rescore, and cannot add. It may only remove rows
+  // it positively identifies as irrelevant, and `judgeRelevance` fails OPEN on every error or
+  // unparseable reply. What it buys is the one thing embedding distance provably cannot do on
+  // this corpus — read "Geography focus: Subscribers only." and see that it does not answer a
+  // question about climate (see MAX_EVIDENCE_DISTANCE in lib/candidates.ts for the
+  // measurements that rule out doing this with a threshold).
+  emit({ type: "stage", id: "matching", label: "Matching mandate and activity", status: "active" });
+  // A purely structural question ("based in Texas?") has no topic to be relevant TO — the SQL
+  // filter already established relevance, and the judge's own rules tell it to keep every row.
+  // Skipping the call there is free correctness AND removes ~10s from the budget: measured
+  // worst case for this route is ~50s against maxDuration = 60, so a call that cannot change
+  // the answer is one worth not making.
+  const judged = understanding.thesis
+    ? await judgeRelevance(query, select.ranked)
+    : { keep: new Set(select.ranked.map((r) => r.record_id)), dropped: [], applied: false };
+  const rankedRows = select.ranked.filter((r) => judged.keep.has(r.record_id));
+  // Judged-out rows join the excluded appendix, same convention as the structural sweep and
+  // the T49 relevance gate — a dropped record is always reported, never silently vanished.
+  const excludedRows = [
+    ...select.excluded,
+    ...judged.dropped.map((d) => ({ ...d, reason: "does not answer the question asked" })),
+  ];
+  const candidateCount = totalRows - excludedRows.length;
+  const shortlistIds = rankedRows.map((r) => r.record_id);
 
   // 5. Load confirmed facts (Gate 3 — loadRecordFacts never hands the model an unsettled
-  // field) and full record rows for the rail. The ranked table (plan event) is emitted
-  // from the structured scores BEFORE any model call — a model that cannot invent the
-  // order cannot flatter the list.
-  emit({ type: "stage", id: "matching", label: "Matching mandate and activity", status: "active" });
+  // field) and full record rows for the rail. The ranked table (plan event) still carries the
+  // structured scores, computed before any model call — the judge subtracts from that table,
+  // it never authors it.
   const [facts, recordRows] = await Promise.all([loadRecordFacts(shortlistIds), loadRecordRows(shortlistIds)]);
   emit({ type: "records", records: recordRows, candidateCount });
   emit({
     type: "plan",
-    rows: select.ranked,
-    excluded: select.excluded,
+    rows: rankedRows,
+    excluded: excludedRows,
     candidateCount,
     sweptTotal: select.sweptTotal,
     sweptConsidered: select.sweptConsidered,
@@ -144,7 +174,7 @@ async function runQuery(query: string, overrideFilters: ParsedFilters | undefine
   emit({ type: "stage", id: "checking", label: "Checking evidence", status: "active" });
 
   const isMany = understanding.shape === "many";
-  const narrationRows = isMany ? select.ranked : select.ranked.slice(0, 1);
+  const narrationRows = isMany ? rankedRows : rankedRows.slice(0, 1);
   const narrationIds = narrationRows.map((r) => r.record_id);
 
   if (narrationIds.length === 0) {
