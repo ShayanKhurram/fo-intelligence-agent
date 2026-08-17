@@ -1,11 +1,22 @@
 // Query understanding — micro_rag_plan.md §4.1, heuristic edition. Converts a
-// natural-language question into a structured filter + semantic residual + intent WITHOUT
-// an LLM call. The LLM version cost ~10-15s on Ollama Cloud (its per-call floor); since the
-// dataset's filter surface is small and regular (entity_type, US state, an AUM range, a set
-// of mandate keywords), a deterministic parser covers the vast majority of real queries at
-// ~0ms and leaves generation as the only LLM round-trip. Trade-off: subtle out_of_scope /
-// lookup classification is lost — those fall back to "search", where the retrieval floor
-// (gate1) and no-match messaging already handle irrelevant queries gracefully.
+// natural-language question into a structured filter + semantic residual + answer shape
+// WITHOUT an LLM call. The LLM version cost ~10-15s on Ollama Cloud (its per-call floor);
+// since the dataset's filter surface is small and regular (entity_type, US state, an AUM
+// range, a set of mandate keywords), a deterministic parser covers the vast majority of
+// real queries at ~0ms and leaves generation as the only LLM round-trip.
+//
+// T44.1 — this is now the ONE parser. `top_n` / `asOf` / `shape` were folded in from the
+// deleted `lib/plan-spec.ts` parser. `shape` is derived from question FORM only (a count,
+// a single-entity lookup, or a ranked list), never from how the ask is WORDED — the prior
+// `isPlanRequest` trigger-phrase list classified 1 of 14 natural phrasings and is gone.
+// When the form is ambiguous the answer is `many`, because the wide path is a superset: it
+// costs a little latency and never costs correctness. `intent` is retained as a
+// shape-derived alias (`count` → `aggregate`, else `search`) so the existing query route
+// keeps working unchanged.
+
+export const DEFAULT_TOP_N = 10;
+export const MIN_TOP_N = 1;
+export const MAX_TOP_N = 25;
 
 export type ParsedFilters = {
   entity_type?: "SFO" | "MFO";
@@ -15,10 +26,22 @@ export type ParsedFilters = {
   mandates_any?: string[];
 };
 
+// The answer shape — what the route builds from the retrieval result. Form-only:
+//   count — a counting question (the existing aggregate regex).
+//   one   — names a single entity, or "who is / what is / tell me about X".
+//   many  — everything else. THE DEFAULT. Ambiguous → many, because escalating to the
+//           wide path costs a little latency and never costs correctness.
+export type QueryShape = "count" | "one" | "many";
+
 export type QueryUnderstanding = {
   filters: ParsedFilters;
   semantic: string;
-  intent: "search" | "lookup" | "aggregate" | "out_of_scope" | "plan";
+  top_n: number;
+  asOf: string | null;
+  shape: QueryShape;
+  // Shape-derived alias kept so app/api/query/route.ts switches unchanged:
+  // `count` → "aggregate", `one`/`many` → "search". The `"plan"` member is gone (T44.1).
+  intent: "search" | "lookup" | "aggregate" | "out_of_scope";
 };
 
 /** Turns a parsed filter set into removable UI chips (ui_plan.md §6 "Filter chips" —
@@ -125,7 +148,34 @@ function detectState(q: string): string | undefined {
   return undefined;
 }
 
-export async function understandQuery(query: string): Promise<QueryUnderstanding> {
+/** Parses a "top N" / "first N" / "best N" / "leading N" request out of the query, or
+ * returns `undefined` when no count is named. Clamping to [1, 25] happens in `clampTopN`. */
+function parseTopN(query: string): number | undefined {
+  const m = query.match(/\b(?:top|first|best|leading)\s+(\d{1,3})\b/i);
+  return m ? parseInt(m[1], 10) : undefined;
+}
+
+function clampTopN(n: number | undefined): number {
+  if (n == null || Number.isNaN(n)) return DEFAULT_TOP_N;
+  return Math.max(MIN_TOP_N, Math.min(MAX_TOP_N, n));
+}
+
+// A counting question. This is the existing aggregate regex, unchanged — it was never the
+// defect. (The defect was classifying *phrasing* for the plan intent; "how many" is form.)
+const COUNT_RE = /\b(how many|how much|what (?:fraction|percentage|share|proportion)|number of|count of|total (?:number|count))\b/;
+
+// A single-entity question form: "who is X", "what is X", "tell me about X". Note "who are"
+// / "what are" do NOT match — those name a plural set and stay `many`. Form-only, not
+// phrasing: there is no list of entity names or raise words here.
+const ONE_RE = /\b(?:who is|what is|tell me about)\b/i;
+
+function detectShape(q: string): QueryShape {
+  if (COUNT_RE.test(q)) return "count";
+  if (ONE_RE.test(q)) return "one";
+  return "many";
+}
+
+export async function understandQuery(query: string, asOf?: string): Promise<QueryUnderstanding> {
   const q = query.toLowerCase();
   const filters: ParsedFilters = {};
 
@@ -151,13 +201,19 @@ export async function understandQuery(query: string): Promise<QueryUnderstanding
   const mandates = MANDATE_KEYWORDS.filter((k) => new RegExp(`\\b${k.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")}\\b`, "i").test(q));
   if (mandates.length) filters.mandates_any = [...new Set(mandates)];
 
-  // intent: aggregate if it's a counting/comparison question
-  const intent: QueryUnderstanding["intent"] =
-    /\b(how many|how much|what (?:fraction|percentage|share|proportion)|number of|count of|total (?:number|count))\b/.test(q)
-      ? "aggregate"
-      : "search";
+  // shape — question form only (count / one / many). `many` is the default.
+  const shape: QueryShape = detectShape(q);
+  // intent — shape-derived alias so the existing query route switches unchanged.
+  const intent: QueryUnderstanding["intent"] = shape === "count" ? "aggregate" : "search";
 
   // semantic residual = the whole query (embedding the full text is fine; filter words add
   // little noise at this corpus size, and keeping them preserves recall for lexical rank).
-  return { filters, semantic: query, intent };
+  return {
+    filters,
+    semantic: query,
+    top_n: clampTopN(parseTopN(query)),
+    asOf: asOf ?? null,
+    shape,
+    intent,
+  };
 }

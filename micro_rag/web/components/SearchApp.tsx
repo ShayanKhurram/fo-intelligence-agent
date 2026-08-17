@@ -1,7 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useReducer, useRef, useState } from "react";
 import type { ClaimVerifiedPayload, FilterChip, QueryStreamEvent, RecordRow } from "@/lib/types";
+import type { RankedCandidate } from "@/lib/plan-rank";
+import type { Excluded } from "@/lib/plan-retrieval";
 import type { ParsedFilters } from "@/lib/query-understanding";
 import { removeFilterKey } from "@/lib/query-understanding";
 import { StageStrip, type StageState } from "./StageStrip";
@@ -11,8 +13,7 @@ import { ClaimPill } from "./ClaimPill";
 import { InputBar } from "./InputBar";
 import { EvidenceDrawer } from "./EvidenceDrawer";
 import { EvidenceTab } from "./EvidenceTab";
-import { RecordsTable } from "./RecordsTable";
-import { ShareIcon } from "./icons";
+import { ChevronIcon, ShareIcon } from "./icons";
 
 // ui_plan.md §7.2 precedent: placeholders until verified against the live deployed
 // system (build-order step 12). Kept from the prior design — same discipline applies.
@@ -38,6 +39,13 @@ type State = {
   candidateCount: number | null;
   segments: AnswerSegment[];
   claims: ClaimVerifiedPayload[];
+  // T44.4 — the ranked table (records tab) + excluded appendix come from the `plan`
+  // event. Rows render in server order and are never re-sorted client-side.
+  planRows: RankedCandidate[];
+  excluded: Excluded[];
+  sweptTotal: number | null;
+  sweptConsidered: number | null;
+  truncated: boolean;
   loading: boolean;
   declined: boolean;
   discarded: boolean;
@@ -58,6 +66,11 @@ const INITIAL_STATE: State = {
   candidateCount: null,
   segments: [],
   claims: [],
+  planRows: [],
+  excluded: [],
+  sweptTotal: null,
+  sweptConsidered: null,
+  truncated: false,
   loading: false,
   declined: false,
   discarded: false,
@@ -102,6 +115,18 @@ function reducer(state: State, action: Action): State {
       return { ...state, filterChips: e.filters, activeFilters: e.parsedFilters };
     case "records":
       return { ...state, records: e.records, recordsLoading: false, candidateCount: e.candidateCount };
+    case "plan":
+      // The ranked table + excluded appendix. Rows are kept in the server's order —
+      // the order IS the product; re-sorting client-side would let the UI flatter the list.
+      return {
+        ...state,
+        planRows: e.rows,
+        excluded: e.excluded,
+        candidateCount: e.candidateCount,
+        sweptTotal: e.sweptTotal,
+        sweptConsidered: e.sweptConsidered,
+        truncated: e.truncated,
+      };
     case "token":
       return { ...state, segments: [...state.segments, { text: e.text, kind: e.kind }] };
     case "claim_verified": {
@@ -141,6 +166,7 @@ export function SearchApp() {
   const [activeTab, setActiveTab] = useState<Tab>("answer");
   const [evidence, setEvidence] = useState<{ recordId: string; field?: string | null } | null>(null);
   const [railFocusIndex, setRailFocusIndex] = useState(-1);
+  const [excludedOpen, setExcludedOpen] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
 
@@ -185,6 +211,7 @@ export function SearchApp() {
     if (!q.trim()) return;
     setActiveTab("answer");
     setRailFocusIndex(-1);
+    setExcludedOpen(false);
     setQuery("");
     runQuery(q, {});
   }
@@ -259,13 +286,6 @@ export function SearchApp() {
         </div>
         <div className="flex items-center gap-2">
           {/* T37 — the agent's run log, mirrored here from the machine that runs it. */}
-          {/* T42.5 — the First Approach Plan route. */}
-          <a
-            href="/plan"
-            className="mono rounded-[var(--r-sm)] border border-[var(--edge)] px-3 py-1.5 text-xs text-[var(--text-mid)] hover:text-[var(--text-hi)]"
-          >
-            Plan
-          </a>
           <a
             href="/log"
             className="mono rounded-[var(--r-sm)] border border-[var(--edge)] px-3 py-1.5 text-xs text-[var(--text-mid)] hover:text-[var(--text-hi)]"
@@ -369,7 +389,97 @@ export function SearchApp() {
                 </>
               )}
 
-              {activeTab === "records" && <RecordsTable records={state.records} onOpen={openEvidence} />}
+              {activeTab === "records" && (
+                <div className="space-y-4">
+                  {/* T44.4 — the ranked table. Server order is the product; never re-sorted. */}
+                  {state.truncated && state.sweptTotal != null && state.sweptConsidered != null && (
+                    <div className="rounded-[var(--r-md)] border border-[var(--partial)]/40 bg-[var(--bg-glass)] px-4 py-3 text-sm text-[var(--text-mid)]">
+                      Ranked {state.sweptConsidered.toLocaleString()} of {state.sweptTotal.toLocaleString()} matching records — the sweep capped at the most the ranker could compare, so the rest were not considered.
+                    </div>
+                  )}
+                  {state.planRows.length === 0 ? (
+                    <p className="mt-8 text-center text-sm text-[var(--text-mid)]">No ranked records yet — ask a question first.</p>
+                  ) : (
+                    <div className="glass overflow-x-auto">
+                      <table className="w-full min-w-[720px] text-sm">
+                        <thead>
+                          <tr className="mono border-b border-[var(--edge)] text-left text-[10px] uppercase tracking-wider text-[var(--text-low)]">
+                            <th className="px-3 py-2 font-normal">#</th>
+                            <th className="px-3 py-2 font-normal">Office</th>
+                            <th className="px-3 py-2 text-right font-normal">Score</th>
+                            <th className="px-3 py-2 text-right font-normal">Fit</th>
+                            <th className="px-3 py-2 text-right font-normal">Reach</th>
+                            <th className="px-3 py-2 text-right font-normal">Recency</th>
+                            <th className="px-3 py-2 text-right font-normal">Trust</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {state.planRows.map((r, i) => (
+                            <Fragment key={r.record_id}>
+                              <tr
+                                onClick={() => openEvidence(r.record_id)}
+                                className="cursor-pointer border-b border-[var(--edge-soft)] hover:bg-[var(--bg-glass-hi)]"
+                              >
+                                <td className="mono px-3 py-2 text-[var(--text-low)]">{i + 1}</td>
+                                <td className="px-3 py-2 text-[var(--text-hi)]">{r.entity_name}</td>
+                                <td className="mono px-3 py-2 text-right tabular-nums text-[var(--text-hi)]">{r.score.toFixed(2)}</td>
+                                <td className="mono px-3 py-2 text-right tabular-nums text-[var(--text-mid)]">{r.scores.fit.toFixed(2)}</td>
+                                <td className="mono px-3 py-2 text-right tabular-nums text-[var(--text-mid)]">{r.scores.reach.toFixed(2)}</td>
+                                <td className="mono px-3 py-2 text-right tabular-nums text-[var(--text-mid)]">{r.scores.recency.toFixed(2)}</td>
+                                <td className="mono px-3 py-2 text-right tabular-nums text-[var(--text-mid)]">{r.scores.trust.toFixed(2)}</td>
+                              </tr>
+                              <tr className="border-b border-[var(--edge)]">
+                                <td colSpan={7} className="px-3 pb-3 pt-0">
+                                  {r.why.length > 0 && (
+                                    <ul className="mono list-disc pl-5 text-[11px] text-[var(--text-low)]">
+                                      {r.why.map((w, j) => <li key={j}>{w}</li>)}
+                                    </ul>
+                                  )}
+                                  {r.gaps.length > 0 && (
+                                    <div className="mt-1 flex flex-wrap gap-1.5">
+                                      {r.gaps.map((g, j) => (
+                                        <span key={j} className="mono rounded-[var(--r-pill)] border border-[var(--edge)] px-2 py-0.5 text-[10px] text-[var(--text-low)]">gap: {g}</span>
+                                      ))}
+                                    </div>
+                                  )}
+                                </td>
+                              </tr>
+                            </Fragment>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+
+                  {/* The excluded appendix — collapsed by default, labelled with the
+                      count. The honesty half of the deliverable, not hidden behind more. */}
+                  {state.excluded.length > 0 && (
+                    <div className="rounded-[var(--r-md)] border border-[var(--edge)] bg-[var(--bg-glass)]">
+                      <button
+                        onClick={() => setExcludedOpen((v) => !v)}
+                        className="flex w-full items-center justify-between px-4 py-3 text-left text-sm text-[var(--text-mid)] hover:text-[var(--text-hi)]"
+                        aria-expanded={excludedOpen}
+                      >
+                        <span><span className="mono text-[var(--text-hi)]">{state.excluded.length}</span> office{state.excluded.length === 1 ? "" : "s"} excluded</span>
+                        <ChevronIcon open={excludedOpen} />
+                      </button>
+                      {excludedOpen && (
+                        <ul className="border-t border-[var(--edge)] px-4 py-2">
+                          {state.excluded.map((x) => (
+                            <li key={x.record_id} className="border-b border-[var(--edge-soft)] py-2 last:border-0">
+                              <div className="flex flex-wrap items-baseline gap-2">
+                                <span className="text-[var(--text-hi)]">{x.entity_name}</span>
+                                <span className="mono text-[11px] text-[var(--text-low)]">{x.record_id}</span>
+                              </div>
+                              <p className="mono mt-0.5 text-[11px] text-[var(--text-low)]">{x.reason}</p>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
               {activeTab === "evidence" && <EvidenceTab claims={state.claims} entityNames={entityNames} />}
             </div>
 

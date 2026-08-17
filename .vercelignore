@@ -1,0 +1,43 @@
+# The Vercel project's Root Directory is `micro_rag/web`, but that path is resolved
+# relative to whatever the CLI uploads — so `vercel deploy` must be run from the REPO
+# ROOT (running it inside micro_rag/web makes Vercel look for micro_rag/web/micro_rag/web
+# and fail). Uploading from the root means everything outside the web app has to be
+# excluded here.
+#
+# Without this file the CLI does NOT fall back to .gitignore in a useful way: a deploy
+# from the root uploaded 1.6 GB and died on "File size limit exceeded (100 MB)", because
+# data/ carries the 420 MB pipeline SQLite database. Measured 2026-08-17:
+#   data/                       1,606 MB   <- the whole failed upload
+#   micro_rag/web/node_modules    699 MB
+#   micro_rag/web/.next           135 MB
+#   .venv/                         12 MB
+#
+# Note that once this file exists it REPLACES the .gitignore fallback entirely, so
+# node_modules and .next must be listed explicitly rather than assumed.
+
+# The pipeline's own state and outputs — never needed to build the web app, and the
+# single largest thing in the repo.
+/data
+
+# Local toolchains and agent/session state.
+/.venv
+/.git
+/.pi-sessions
+
+# Vendored Python scraper — pipeline-side only.
+/vendor
+
+# Dependencies and build output are produced by Vercel's own build, not shipped to it.
+/node_modules
+/micro_rag/web/node_modules
+/micro_rag/web/.next
+
+# Databases and archives should never be uploaded regardless of location.
+*.db
+*.sqlite
+*.zip
+
+# Local logs and transcripts.
+*.log
+/2026-*.txt
+/dataset_chat.txt

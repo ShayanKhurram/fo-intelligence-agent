@@ -1,17 +1,24 @@
 import { NextRequest } from "next/server";
 import { getPool } from "@/lib/db";
 import { understandQuery, filtersToChips, type ParsedFilters } from "@/lib/query-understanding";
-import { hybridRetrieve } from "@/lib/retrieval";
+import { selectCandidates } from "@/lib/candidates";
 import { runAggregate } from "@/lib/aggregate";
-import { gate1, loadRecordFacts, generateAnswerStream, verifyEntailment, checkSentence, splitSentences, normalizeTagPosition } from "@/lib/grounding";
+import { loadRecordFacts, generateAnswerStream, verifyEntailment, checkSentence, splitSentences, normalizeTagPosition } from "@/lib/grounding";
 import { loadRecordRows } from "@/lib/records";
-import { noMatchMessage, retrievalFloorMessage, outOfScopeMessage, entailmentDiscardedMessage, timeoutMessage } from "@/lib/failures";
+import { noMatchMessage, entailmentDiscardedMessage, timeoutMessage } from "@/lib/failures";
 import { sseResponse, type Emit } from "@/lib/sse";
 
-// Cold start downloads the ONNX embedding model from the HF hub (~23MB quantized) and inits
-// onnxruntime before the first inference; that plus the LLM stream can exceed the default
-// limit. 60s is the Hobby-tier ceiling. Once an instance is warm the model is cached in /tmp
-// and requests are fast.
+// T44.3 — `/api/query` is the only endpoint. The separate `/api/plan` mode is gone; the
+// answer shape (`count` / `one` / `many`) follows the question's grammatical form, and the
+// unified retrieval core (`selectCandidates`) feeds every shape. The SSE contract and
+// stage ids are unchanged so the client keeps working: the `plan` event still carries the
+// ranked rows + excluded appendix, emitted BEFORE any model call so the ranked table is
+// never influenced by generation.
+
+// Cold start downloads the ONNX embedding model (~23MB quantized) and inits onnxruntime
+// before the first inference; that plus the LLM stream can exceed the default limit. 60s
+// is the Hobby-tier ceiling. Budget: one embedding (inside selectCandidates) + one
+// generation pass.
 export const maxDuration = 60;
 
 async function logQuery(entry: Record<string, unknown>) {
@@ -51,93 +58,164 @@ export async function POST(req: NextRequest) {
       await runQuery(query, overrideFilters, emit);
     } catch (e) {
       console.error("query failed", e);
-      await logQuery({ query_text: query, final_answer: timeoutMessage() });
+      await logQuery({ query_text: query, intent: "many", final_answer: timeoutMessage() });
       emit({ type: "done", records: [], relaxedFilters: [], error: true, finalAnswerFallback: timeoutMessage() });
     }
   });
 }
 
 async function runQuery(query: string, overrideFilters: ParsedFilters | undefined, emit: Emit) {
+  // asOf is the route's own "today" — the one place a wall-clock read belongs. The ranker
+  // (plan-rank.ts) is forbidden `new Date()` precisely so it stays deterministic and testable.
+  const asOf = new Date().toISOString().slice(0, 10);
+
   emit({ type: "stage", id: "understanding", label: "Reading your question", status: "active" });
-
+  const parsed = await understandQuery(query, asOf);
   // A filter-chip removal resubmits with the caller's already-parsed filters (minus the
-  // dropped one) rather than re-running the heuristic parser against raw text — dropping
-  // "over $200M" from the text is fragile; dropping the structured key it produced isn't.
-  const understanding = overrideFilters
-    ? { filters: overrideFilters, semantic: query, intent: "search" as const }
-    : await understandQuery(query);
-
+  // dropped one) rather than re-parsing raw text. shape / top_n / asOf still come from the
+  // query parse; only the filters are overridden.
+  const understanding = { ...parsed, filters: overrideFilters ?? parsed.filters };
   const chips = filtersToChips(understanding.filters);
   emit({ type: "filters", filters: chips, parsedFilters: understanding.filters });
   emit({ type: "stage", id: "understanding", label: "Reading your question", status: "done" });
 
-  if (understanding.intent === "out_of_scope") {
-    await logQuery({ query_text: query, intent: understanding.intent, gate1_decision: "decline_out_of_scope" });
-    emit({ type: "done", records: [], relaxedFilters: [], declined: true, finalAnswerFallback: outOfScopeMessage() });
-    return;
-  }
-
-  if (understanding.intent === "aggregate") {
+  // 2. shape === "count" → the existing aggregate short-circuit, unchanged.
+  if (understanding.shape === "count") {
     emit({ type: "stage", id: "filtering", label: "Counting matching records", status: "active" });
     const { count, filterDescription } = await runAggregate(understanding.filters);
     const answer = `${count} record(s) match: ${filterDescription}.`;
     emit({ type: "stage", id: "filtering", label: "Counting matching records", status: "done" });
     await logQuery({
-      query_text: query, intent: understanding.intent, parsed_filters: understanding.filters,
+      query_text: query, intent: understanding.shape, parsed_filters: understanding.filters,
       final_answer: answer, gate1_decision: "proceed",
     });
     emit({ type: "done", records: [], relaxedFilters: [], count, finalAnswerFallback: answer });
     return;
   }
 
+  // 3. selectCandidates — the unified retrieval core (sweep + semantic + lexical fused +
+  // rank). It relaxes one core filter at a time when the sweep matches nothing and reports
+  // the trail; the route just consumes the result.
   emit({ type: "stage", id: "filtering", label: "Filtering the dataset", status: "active" });
-  let lastCandidateCount = 0;
-  const retrieval = await hybridRetrieve(understanding.semantic, understanding.filters, (count) => {
-    lastCandidateCount = count;
-    emit({ type: "stage", id: "filtering", label: "Filtering the dataset", status: "active", detail: `${count} candidate record(s)` });
-  });
-  const decision = gate1(retrieval.topScore, retrieval.chunks.length, false);
+  const select = await selectCandidates(understanding);
+  const totalRows = select.sweptConsidered;
+  // A plan that silently ignored most of the corpus is exactly the kind of quiet dishonesty
+  // this project's gates exist to prevent — so when the cap binds, the filtering stage says so.
+  const filteringDetail = select.truncated
+    ? `ranked ${select.sweptConsidered.toLocaleString()} of ${select.sweptTotal.toLocaleString()} matching records`
+    : `${totalRows} candidate record(s)`;
+  emit({ type: "stage", id: "filtering", label: "Filtering the dataset", status: "done", detail: filteringDetail });
 
-  if (decision !== "proceed") {
-    emit({ type: "stage", id: "filtering", label: "Filtering the dataset", status: "done" });
-    const answer =
-      decision === "decline_zero_results"
-        ? noMatchMessage(retrieval.relaxedFilters, retrieval.candidateCount)
-        : retrievalFloorMessage();
+  // 4. Gate 1 — zero rows decline with the relaxation trail, as /api/plan did.
+  if (totalRows === 0) {
+    const answer = noMatchMessage(select.relaxedFilters, 0);
     await logQuery({
-      query_text: query, intent: understanding.intent, parsed_filters: understanding.filters,
-      relaxed_filters: retrieval.relaxedFilters, top_score: retrieval.topScore, gate1_decision: decision,
-      final_answer: answer,
+      query_text: query, intent: understanding.shape, parsed_filters: understanding.filters,
+      relaxed_filters: select.relaxedFilters, gate1_decision: "decline_zero_results", final_answer: answer,
     });
-    emit({
-      type: "done", records: [], relaxedFilters: retrieval.relaxedFilters,
-      declined: decision === "decline_low_score", finalAnswerFallback: answer,
-    });
+    emit({ type: "done", records: [], relaxedFilters: select.relaxedFilters, declined: true, finalAnswerFallback: answer });
     return;
   }
-  emit({ type: "stage", id: "filtering", label: "Filtering the dataset", status: "done", detail: `${lastCandidateCount} candidate record(s)` });
 
+  const candidateCount = totalRows - select.excluded.length;
+  const shortlistIds = select.ranked.map((r) => r.record_id);
+
+  // 5. Load confirmed facts (Gate 3 — loadRecordFacts never hands the model an unsettled
+  // field) and full record rows for the rail. The ranked table (plan event) is emitted
+  // from the structured scores BEFORE any model call — a model that cannot invent the
+  // order cannot flatter the list.
   emit({ type: "stage", id: "matching", label: "Matching mandate and activity", status: "active" });
-  const recordIds = [...new Set(retrieval.chunks.map((c) => c.record_id))];
-  const [facts, recordRows] = await Promise.all([loadRecordFacts(recordIds), loadRecordRows(recordIds)]);
-  emit({ type: "records", records: recordRows, candidateCount: retrieval.candidateCount });
+  const [facts, recordRows] = await Promise.all([loadRecordFacts(shortlistIds), loadRecordRows(shortlistIds)]);
+  emit({ type: "records", records: recordRows, candidateCount });
+  emit({
+    type: "plan",
+    rows: select.ranked,
+    excluded: select.excluded,
+    candidateCount,
+    sweptTotal: select.sweptTotal,
+    sweptConsidered: select.sweptConsidered,
+    truncated: select.truncated,
+  });
   emit({ type: "stage", id: "matching", label: "Matching mandate and activity", status: "done" });
 
+  // 6. One generation pass.
+  //   shape "one"  → narrate the top-ranked record only, the way a lookup always answered.
+  //   shape "many" → per-office approach notes over the shortlist.
   emit({ type: "stage", id: "checking", label: "Checking evidence", status: "active" });
 
-  // Stream the answer, revealing it sentence-by-sentence rather than raw model token by
-  // token: Gate 2 (entailment) must clear a sentence before it's ever shown, so text is
-  // never displayed transiently only to be yanked back later. Because the check here is
-  // a mechanical tag lookup (not an LLM call), the reveal-then-verify gap is imperceptible
-  // in practice — this is what ui_plan.md §5 describes as "the sentence streams plain, and
-  // its pill scales in only once that sentence has cleared the gate."
+  const isMany = understanding.shape === "many";
+  const narrationRows = isMany ? select.ranked : select.ranked.slice(0, 1);
+  const narrationIds = narrationRows.map((r) => r.record_id);
+
+  if (narrationIds.length === 0) {
+    // Rows matched but none survived into a shortlist (all excluded, or no evidence to
+    // cite). The excluded appendix is the honest deliverable here; no generation call.
+    emit({ type: "stage", id: "checking", label: "Checking evidence", status: "done" });
+    await logQuery({
+      query_text: query, intent: understanding.shape, parsed_filters: understanding.filters,
+      relaxed_filters: select.relaxedFilters, retrieved_record_ids: shortlistIds,
+      gate1_decision: "proceed", final_answer: "",
+    });
+    emit({ type: "done", records: shortlistIds, relaxedFilters: select.relaxedFilters });
+    return;
+  }
+
+  // genChunks: the evidence chunks the model is allowed to see. One per shortlisted
+  // office (the best mandate/activity/why_now chunk) — same shape the plan route used.
+  const genChunks = narrationRows
+    .filter((r) => r.evidenceChunk)
+    .map((r) => ({
+      chunk_id: r.record_id + "::" + r.evidenceChunk!.facet,
+      record_id: r.record_id,
+      facet: r.evidenceChunk!.facet,
+      content: r.evidenceChunk!.content,
+      entity_name: r.entity_name,
+    }));
+
+  // The generation prompt. For "one" the question itself is the prompt (a lookup answer,
+  // grounded by the system prompt's [record_id:field] rule); for "many" it is the
+  // per-office approach-note instruction the plan route used.
+  // The user's question IS the prompt. This previously hardcoded "write a concise
+  // first-approach note for each family office listed above" for every `many` query and
+  // appended the real question as a trailing hint — so every answer came back as the same
+  // roster of "I noticed <background>. I'd love to connect with <principal_name>",
+  // whatever had been asked. That instruction was correct on the old /api/plan route,
+  // which only ever produced outreach plans; carrying it into the route that answers
+  // everything is what made every answer look identical.
+  //
+  // Deliberately NOT solved by classifying whether the ask is an outreach request — that
+  // is the phrasing-detector mistake that scored 1 of 14. Ask the question, supply the
+  // records, and let the answer take the shape the question calls for.
+  const noteQuery = isMany
+    ? `${query}\n\n(Several records are provided above. Answer using the ones that actually bear on the question.)`
+    : understanding.semantic;
+
+  // 7. Stream the answer, revealing it sentence-by-sentence: Gate 2 (entailment) must
+  // clear a sentence before it's ever shown, so text is never displayed transiently only
+  // to be yanked back. The check is a mechanical tag lookup, so the reveal-then-verify
+  // gap is imperceptible. This is the existing UX and it works — kept unchanged.
   let rawAnswer = "";
   let finalizedCount = 0;
 
   const finalizeUpTo = (limit: number) => {
     const normalized = normalizeTagPosition(rawAnswer);
     const sentences = splitSentences(normalized);
-    while (finalizedCount < Math.min(limit, sentences.length)) {
+    // If the last (still-growing) segment is a half-streamed [record:field] tag — a "["
+    // with no closing "]" yet — the sentence BEFORE it is the one whose tag is still
+    // arriving, and normalizeTagPosition has NOT yet pulled that tag back across the
+    // preceding period (its rewrite needs the complete "[...]"). splitSentences therefore
+    // split at that period, leaving the second-to-last segment tagless. Finalizing it now
+    // would lock it in as "invalid" and advance finalizedCount past it; when "]" lands and
+    // the boundary rewrites, the now-complete tagged sentence sits at an index we have
+    // already passed and is lost. Defer it (finalize one fewer) until the tag closes.
+    let effective = limit;
+    if (
+      sentences.length >= 2 &&
+      sentences[sentences.length - 1].lastIndexOf("[") > sentences[sentences.length - 1].lastIndexOf("]")
+    ) {
+      effective = Math.min(effective, sentences.length - 2);
+    }
+    while (finalizedCount < Math.min(effective, sentences.length)) {
       const sentence = sentences[finalizedCount];
       const check = checkSentence(sentence, facts);
       if (check.kind === "claim") {
@@ -149,38 +227,37 @@ async function runQuery(query: string, overrideFilters: ParsedFilters | undefine
       } else if (check.kind === "neutral") {
         emit({ type: "token", text: check.display, kind: "neutral" });
       }
-      // "invalid" sentences are the whole point of Gate 2: never shown, silently dropped —
-      // exactly what the non-streaming verifyEntailment() has always done.
+      // "invalid" sentences are the whole point of Gate 2: never shown, silently dropped.
       finalizedCount++;
     }
   };
 
-  for await (const delta of generateAnswerStream(understanding.semantic, retrieval.chunks, facts)) {
+  for await (const delta of generateAnswerStream(noteQuery, genChunks, facts)) {
     rawAnswer += delta;
     const sentenceCount = splitSentences(normalizeTagPosition(rawAnswer)).length;
     // Defer the LAST split segment: it may still be growing (its trailing [record:field]
     // tag, which the model emits AFTER the sentence text, might not have streamed in yet).
     finalizeUpTo(sentenceCount - 1);
   }
-  // Stream is done — the last segment can no longer grow, finalize everything left.
   finalizeUpTo(Number.MAX_SAFE_INTEGER);
 
   const entailment = verifyEntailment(rawAnswer, facts);
 
+  // 8. Log with intent set from shape.
   await logQuery({
-    query_text: query, intent: understanding.intent, parsed_filters: understanding.filters,
-    relaxed_filters: retrieval.relaxedFilters, retrieved_record_ids: recordIds, top_score: retrieval.topScore,
-    gate1_decision: decision, raw_answer: rawAnswer, stripped_sentences: entailment.strippedSentences,
-    stripped_fraction: entailment.strippedFraction, gate2_decision: entailment.decision,
+    query_text: query, intent: understanding.shape, parsed_filters: understanding.filters,
+    relaxed_filters: select.relaxedFilters, retrieved_record_ids: shortlistIds,
+    gate1_decision: "proceed", raw_answer: rawAnswer,
+    stripped_sentences: entailment.strippedSentences, stripped_fraction: entailment.strippedFraction,
+    gate2_decision: entailment.decision,
     final_answer: entailment.decision === "proceed" ? entailment.finalAnswer : entailmentDiscardedMessage(),
   });
 
   if (entailment.decision === "discard_over_threshold") {
     // The whole-answer safety net fired after individual sentences had already streamed —
-    // rare (>30% of claim sentences failed), but when it happens the already-shown answer
-    // text/pills are not trustworthy as a set and must be retracted, not left standing.
+    // rare, but the already-shown text/pills are not trustworthy as a set and retract.
     emit({
-      type: "done", records: recordIds, relaxedFilters: retrieval.relaxedFilters,
+      type: "done", records: shortlistIds, relaxedFilters: select.relaxedFilters,
       strippedFraction: entailment.strippedFraction, discarded: true, finalAnswerFallback: entailmentDiscardedMessage(),
     });
     return;
@@ -188,7 +265,7 @@ async function runQuery(query: string, overrideFilters: ParsedFilters | undefine
 
   emit({ type: "stage", id: "checking", label: "Checking evidence", status: "done" });
   emit({
-    type: "done", records: recordIds, relaxedFilters: retrieval.relaxedFilters,
+    type: "done", records: shortlistIds, relaxedFilters: select.relaxedFilters,
     strippedFraction: entailment.strippedFraction,
   });
 }

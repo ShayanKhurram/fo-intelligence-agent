@@ -18,11 +18,19 @@ export const WEIGHTS = { fit: 0.35, reach: 0.30, recency: 0.20, trust: 0.15 } as
 export type EvidenceChunk = { facet: string; content: string };
 
 export type PlanCandidate = RecordRow & {
-  // Precomputed by T42.3's best-evidence sweep — cosine distance of the best evidence
-  // chunk to the spec thesis. Lower is better. null when no evidence chunk was found;
-  // that is scored, not crashed on.
+  // Precomputed cosine distance of the best evidence chunk to the spec thesis. Lower
+  // is better. null when no evidence chunk was found; that is scored, not crashed on.
+  // The unified core (lib/candidates.ts) supplies `fitRank` and `fitScore` uses that in
+  // preference; `evidenceDistance` is the fallback path kept so the ranker's own tests
+  // (which exercise the distance->similarity mapping directly) stay meaningful.
   evidenceDistance: number | null;
   evidenceChunk: EvidenceChunk | null;
+  // T44.2 — the fused semantic+lexical reciprocal-rank signal over the candidate set,
+  // normalized to [0,1] (top record = 1.0). Higher is better. When present, `fitScore`
+  // uses this INSTEAD of the raw cosine distance: the unified core fuses BOTH signals,
+  // so a single distance would lose exact-name (lexical) retrieval. null/absent falls
+  // back to `evidenceDistance` for backward compat.
+  fitRank?: number | null;
   // `principal_linkedin` is provenance-sourced and not on every RecordRow, so it is
   // optional here. When present it slots into the reach ladder between phone and a
   // bare name; when absent the ladder just skips that rung.
@@ -79,19 +87,68 @@ function toDayNumber(iso: string | null | undefined): number | null {
 
 // --- sub-scores ---------------------------------------------------------------
 
+// Chunk text that ASSERTS THE ABSENCE of information. `micro_rag/ingest/chunks.py`
+// emits these verbatim when a record has nothing to say for a facet, and 371 of 506
+// mandate chunks are currently one of them.
+//
+// They must never score as fit. A sentence like "No investing thesis or mandate details
+// have been confirmed for this record" sits roughly equidistant from every query, so
+// cosine similarity hands it a comfortable mid-range score for anything asked — which is
+// how records with no thesis at all (CHS FAMILY OFFICE, FAMILY OFFICE RESEARCH) held
+// top-10 places for real estate, fintech, climate AND biotech simultaneously. A
+// non-statement is evidence of absence; it cannot be evidence of fit.
+const NON_STATEMENT_MARKERS = [
+  "No investing thesis or mandate details have been confirmed",
+  "No recent activity signal has been confirmed",
+  "No specific why-now trigger has been confirmed",
+  "No named decision-maker has been confirmed",
+];
+
+function isNonStatement(content: string | null | undefined): boolean {
+  if (!content) return false;
+  return NON_STATEMENT_MARKERS.some((m) => content.includes(m));
+}
+
 function fitScore(c: PlanCandidate, spec: PlanSpec): { score: number; why: string[]; gaps: string[] } {
   const why: string[] = [];
   const gaps: string[] = [];
 
+  // Best-evidence selection picks the single closest chunk across mandate/activity/why_now.
+  // If the closest thing this record has is a non-statement, it has nothing to match on —
+  // score it zero and say why, rather than letting boilerplate similarity stand in for fit.
+  if (isNonStatement(c.evidenceChunk?.content)) {
+    return { score: 0, why: [], gaps: ["no investing thesis on file"] };
+  }
+
   // Evidence distance → similarity in [0,1]. Cosine distance ranges [0,2]; map linearly
   // so 0 distance = 1.0 and 2 = 0. Clamp for safety.
-  let distScore: number;
-  if (c.evidenceDistance == null) {
-    distScore = 0;
-    gaps.push("no evidence chunk for the thesis");
+  let fitSignal: number;
+  if (c.fitRank != null) {
+    // `fitRank` is RRF normalized so the best record scores 1.0 — a measure of POSITION,
+    // not of closeness. On its own it guarantees every query a 1.0 "best match" even when
+    // nothing in the corpus is remotely relevant, which is why four unrelated theses kept
+    // returning high fit scores for an overlapping set of offices.
+    //
+    // Blend it with absolute cosine similarity so a record has to be both well-ranked AND
+    // genuinely near the thesis. When the whole candidate set is far from the ask, the
+    // scores stay low together and the ordering stops looking confident about a bad set.
+    // Weighted toward the absolute term because that is the half that can say "nothing here
+    // fits"; the rank term keeps the lexical/name signal's contribution to the ordering.
+    const rankPart = Math.max(0, Math.min(1, c.fitRank));
+    const simPart = c.evidenceDistance != null ? Math.max(0, Math.min(1, 1 - c.evidenceDistance / 2)) : 0;
+    fitSignal = c.evidenceDistance != null ? 0.4 * rankPart + 0.6 * simPart : rankPart;
+    const facet = c.evidenceChunk?.facet ?? "no facet";
+    why.push(
+      c.evidenceDistance != null
+        ? `evidence rank ${rankPart.toFixed(2)} x similarity ${simPart.toFixed(2)} (${facet})`
+        : `fused evidence rank ${rankPart.toFixed(3)} (${facet})`,
+    );
+  } else if (c.evidenceDistance != null) {
+    fitSignal = Math.max(0, Math.min(1, 1 - c.evidenceDistance / 2));
+    why.push("evidence distance " + c.evidenceDistance.toFixed(3) + " (" + (c.evidenceChunk?.facet ?? "no facet") + ")");
   } else {
-    distScore = Math.max(0, Math.min(1, 1 - c.evidenceDistance / 2));
-    why.push(`evidence distance ${c.evidenceDistance.toFixed(3)} (${c.evidenceChunk?.facet ?? "no facet"})`);
+    fitSignal = 0;
+    gaps.push("no evidence chunk for the thesis");
   }
 
   // fit_tags overlap with the spec's mandate keywords. Fraction of spec tags the
@@ -105,7 +162,7 @@ function fitScore(c: PlanCandidate, spec: PlanSpec): { score: number; why: strin
     if (hit > 0) why.push(`matches ${hit} of ${specTags.length} spec mandate tag${hit === 1 ? "" : "s"}`);
   }
 
-  const score = 0.75 * distScore + 0.25 * tagsScore;
+  const score = 0.75 * fitSignal + 0.25 * tagsScore;
   return { score, why, gaps };
 }
 
@@ -209,27 +266,67 @@ function trustScore(c: PlanCandidate): { score: number; why: string[]; gaps: str
 
 // --- main ---------------------------------------------------------------------
 
+// A sub-score that is identical for every candidate carries no ordering information, but
+// with a static weight it still consumes its share of the composite — acting as a constant
+// offset that compresses whatever DOES vary into a narrower band.
+//
+// Measured on the live 506-record corpus: `reach` is ~1.0 for everyone with an email,
+// `trust` is 0.48 for nearly everyone (single_source_only x ship_with_caveats), and
+// `recency` is 0.00 for nearly everyone (57 of 506 carry a signal date). That is 65% of
+// the weight held constant, leaving `fit` to move the ranking inside a 0.35-wide band —
+// which is why four unrelated theses (real estate / fintech / climate / biotech) returned
+// 6 of the same 10 offices. The ranking was answering "who is contactable", not "who fits".
+//
+// So: drop the flat sub-scores and renormalize over the ones that actually vary. With
+// fewer than two candidates, or when nothing varies at all, fall back to the static
+// weights — there is no ordering to inform in either case.
+export const VARIANCE_EPSILON = 1e-9;
+
+export function effectiveWeights(all: SubScores[]): Record<keyof SubScores, number> {
+  const keys: (keyof SubScores)[] = ["fit", "reach", "recency", "trust"];
+  if (all.length < 2) return { ...WEIGHTS };
+
+  const varying = keys.filter((k) => {
+    let min = Infinity;
+    let max = -Infinity;
+    for (const s of all) {
+      if (s[k] < min) min = s[k];
+      if (s[k] > max) max = s[k];
+    }
+    return max - min > VARIANCE_EPSILON;
+  });
+  if (varying.length === 0) return { ...WEIGHTS };
+
+  const total = varying.reduce((sum, k) => sum + WEIGHTS[k], 0);
+  const out: Record<keyof SubScores, number> = { fit: 0, reach: 0, recency: 0, trust: 0 };
+  for (const k of varying) out[k] = WEIGHTS[k] / total;
+  return out;
+}
+
 export function rankCandidates(candidates: PlanCandidate[], spec: PlanSpec): RankedCandidate[] {
-  const ranked: RankedCandidate[] = candidates.map((c) => {
+  // Two passes: sub-scores are per-candidate, but the weighting depends on how they vary
+  // across the whole set, so the composite cannot be computed until every candidate is scored.
+  const scored = candidates.map((c) => {
     const fit = fitScore(c, spec);
     const reach = reachScore(c);
     const recency = recencyScore(c, spec);
     const trust = trustScore(c);
-
-    const scores: SubScores = {
-      fit: fit.score,
-      reach: reach.score,
-      recency: recency.score,
-      trust: trust.score,
+    return {
+      c,
+      scores: { fit: fit.score, reach: reach.score, recency: recency.score, trust: trust.score } as SubScores,
+      why: [...fit.why, ...reach.why, ...recency.why, ...trust.why],
+      gaps: [...fit.gaps, ...reach.gaps, ...recency.gaps, ...trust.gaps],
     };
-    const score =
-      WEIGHTS.fit * scores.fit +
-      WEIGHTS.reach * scores.reach +
-      WEIGHTS.recency * scores.recency +
-      WEIGHTS.trust * scores.trust;
+  });
 
-    const why = [...fit.why, ...reach.why, ...recency.why, ...trust.why];
-    const gaps = [...fit.gaps, ...reach.gaps, ...recency.gaps, ...trust.gaps];
+  const weights = effectiveWeights(scored.map((s) => s.scores));
+
+  const ranked: RankedCandidate[] = scored.map(({ c, scores, why, gaps }) => {
+    const score =
+      weights.fit * scores.fit +
+      weights.reach * scores.reach +
+      weights.recency * scores.recency +
+      weights.trust * scores.trust;
 
     return {
       record_id: c.record_id,

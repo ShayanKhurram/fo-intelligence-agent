@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { rankCandidates, WEIGHTS, type PlanCandidate } from "./plan-rank.ts";
+import { rankCandidates, WEIGHTS, effectiveWeights, type PlanCandidate } from "./plan-rank.ts";
 import type { PlanSpec } from "./plan-spec.ts";
 
 const AS_OF = "2026-08-16";
@@ -192,4 +192,64 @@ test("WEIGHTS is exported and the composite equals the weighted sum of the sub-s
     WEIGHTS.recency * r.scores.recency +
     WEIGHTS.trust * r.scores.trust;
   assert.equal(r.score, expected);
+});
+// T44.5 — the two defects behind "it gives the same answer for every query".
+
+test("a boilerplate evidence chunk scores fit 0 and names the gap, instead of mid-range similarity", () => {
+  const boiler = base({
+    record_id: "no_thesis",
+    evidenceDistance: 0.45,
+    evidenceChunk: {
+      facet: "mandate",
+      content: "CHS FAMILY OFFICE's investing mandate. No investing thesis or mandate details have been confirmed for this record.",
+    },
+  });
+  const real = base({
+    record_id: "has_thesis",
+    evidenceDistance: 0.45,
+    evidenceChunk: { facet: "mandate", content: "Backs early-stage industrial decarbonization hardware." },
+  });
+  const ranked = rankCandidates([boiler, real], SPEC);
+  const b = ranked.find((r) => r.record_id === "no_thesis")!;
+  const h = ranked.find((r) => r.record_id === "has_thesis")!;
+
+  // Identical evidenceDistance: without the non-statement guard these tie exactly, which
+  // is how records with nothing on file held top places for every unrelated thesis.
+  assert.equal(b.scores.fit, 0, "a non-statement is evidence of absence, never of fit");
+  assert.ok(h.scores.fit > 0, "a real thesis still scores");
+  assert.ok(h.score > b.score, "the record with a thesis must outrank the one without");
+  assert.ok(b.gaps.includes("no investing thesis on file"));
+  assert.equal(ranked[0].record_id, "has_thesis");
+});
+
+test("a sub-score that is identical across candidates does not consume weight", () => {
+  // Only fit varies; reach/recency/trust are flat. All the weight must fall on fit, so the
+  // composite gap equals the fit gap exactly — not 0.35 of it.
+  const mk = (id: string, content: string, dist: number) =>
+    base({ record_id: id, evidenceDistance: dist, evidenceChunk: { facet: "mandate", content } });
+  const ranked = rankCandidates(
+    [mk("a", "industrial decarbonization thesis", 0.2), mk("b", "industrial decarbonization thesis", 0.9)],
+    SPEC,
+  );
+  const w = effectiveWeights(ranked.map((r) => r.scores));
+  assert.equal(w.fit, 1, "fit is the only varying sub-score, so it takes the whole weight");
+  assert.equal(w.reach, 0);
+  assert.equal(w.recency, 0);
+  assert.equal(w.trust, 0);
+
+  const [top, bottom] = ranked;
+  assert.equal(top.record_id, "a");
+  const fitGap = top.scores.fit - bottom.scores.fit;
+  assert.ok(Math.abs((top.score - bottom.score) - fitGap) < 1e-9,
+    "a flat sub-score must not compress the signal that varies");
+});
+
+test("effectiveWeights falls back to the static weights when nothing varies", () => {
+  const flat = [
+    { fit: 0.5, reach: 1, recency: 0, trust: 0.48 },
+    { fit: 0.5, reach: 1, recency: 0, trust: 0.48 },
+  ];
+  assert.deepEqual(effectiveWeights(flat), WEIGHTS);
+  // A single candidate has no ordering to inform either.
+  assert.deepEqual(effectiveWeights([{ fit: 0.5, reach: 1, recency: 0, trust: 0.48 }]), WEIGHTS);
 });
