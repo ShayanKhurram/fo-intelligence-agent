@@ -45,3 +45,40 @@ export function sseResponse(run: (emit: Emit) => Promise<void>): Response {
     },
   });
 }
+
+/** Generic twin of `sseResponse` for event unions other than `QueryStreamEvent` — the
+ * Intent Watcher's `WatchStreamEvent`. Same wire shape (`event: <type>\ndata: <json>\n\n`)
+ * and flush behaviour. `errorEvent` is the best-effort final event emitted if `run`
+ * throws after the stream has already started (a JSON error body is no longer possible
+ * at that point, just as in `sseResponse`). */
+export function sseStream<T extends { type: string }>(
+  run: (emit: (event: T) => void) => Promise<void>,
+  errorEvent?: T,
+): Response {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const emit = (event: T) => {
+        controller.enqueue(encoder.encode(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`));
+      };
+      try {
+        await run(emit);
+      } catch (e) {
+        console.error("SSE stream failed mid-run", e);
+        if (errorEvent !== undefined) {
+          try { emit(errorEvent); } catch { /* controller may already be closed */ }
+        }
+      } finally {
+        controller.close();
+      }
+    },
+  });
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
+  });
+}

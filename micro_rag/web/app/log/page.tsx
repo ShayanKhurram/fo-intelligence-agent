@@ -331,12 +331,20 @@ export default function LogPage() {
           </p>
           <h1 className="mono text-lg font-semibold text-[var(--text-hi)]">Run log</h1>
         </div>
-        <a
-          href="/"
-          className="mono rounded-[var(--r-sm)] border border-[var(--edge)] px-3 py-1.5 text-xs text-[var(--text-mid)] hover:text-[var(--text-hi)]"
-        >
-          Search
-        </a>
+        <div className="flex items-center gap-2">
+          <a
+            href="/"
+            className="mono rounded-[var(--r-sm)] border border-[var(--edge)] px-3 py-1.5 text-xs text-[var(--text-mid)] hover:text-[var(--text-hi)]"
+          >
+            Search
+          </a>
+          <a
+            href="/watch"
+            className="mono rounded-[var(--r-sm)] border border-[var(--edge)] px-3 py-1.5 text-xs text-[var(--text-mid)] hover:text-[var(--text-hi)]"
+          >
+            Watch
+          </a>
+        </div>
       </header>
 
       <main className="flex-1 py-6">

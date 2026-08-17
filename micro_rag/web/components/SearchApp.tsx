@@ -285,6 +285,14 @@ export function SearchApp() {
           ))}
         </div>
         <div className="flex items-center gap-2">
+          {/* T46 — the intent watcher: which organizations are showing activity, and what
+              that activity plausibly means. */}
+          <a
+            href="/watch"
+            className="mono rounded-[var(--r-sm)] border border-[var(--edge)] px-3 py-1.5 text-xs text-[var(--text-mid)] hover:text-[var(--text-hi)]"
+          >
+            Watch
+          </a>
           {/* T37 — the agent's run log, mirrored here from the machine that runs it. */}
           <a
             href="/log"
