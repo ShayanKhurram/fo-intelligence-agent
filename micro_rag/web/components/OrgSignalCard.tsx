@@ -85,7 +85,7 @@ export function OrgSignalCard({
     signals: WatchSignal[];
     newestAt: string | null;
   };
-  onOpenEvidence: (recordId: string, el: HTMLElement | null) => void;
+  onOpenEvidence: (recordId: string) => void;
 }) {
   const meta = metaLine([org.entity_type, org.hq_state, formatAum(org.aum_usd)]);
   const freshness = formatRelative(org.newestAt);
@@ -95,7 +95,7 @@ export function OrgSignalCard({
     <article className="rounded-[var(--r-md)] border border-[var(--edge)] bg-[var(--bg-raised)] px-4 py-3">
       <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
         <button
-          onClick={(e) => onOpenEvidence(org.record_id, e.currentTarget)}
+          onClick={() => onOpenEvidence(org.record_id)}
           className="text-left text-[15px] font-medium text-[var(--text-hi)] hover:underline decoration-[var(--edge-lit)] underline-offset-2"
         >
           {org.entity_name}

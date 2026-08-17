@@ -1,9 +1,9 @@
 "use client";
 
 import { ChevronIcon } from "./icons";
-import type { StageId, StageStatus } from "@/lib/types";
+import type { StageState } from "@/lib/thread";
 
-export type StageState = { id: StageId; label: string; status: StageStatus; detail?: string };
+export type { StageState };
 
 // ui_plan.md §5 — "Show the real pipeline." These are the actual retrieval steps, so
 // the loading state doubles as a demonstration of structured-plus-semantic retrieval,

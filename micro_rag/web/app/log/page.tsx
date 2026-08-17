@@ -322,58 +322,38 @@ export default function LogPage() {
 
   const liveRun = (runs ?? []).find((r) => r.status === "running");
 
+  // T47.1 — the route no longer builds its own container or its own nav; AppShell owns
+  // both. What is left here is the page's own heading and its content.
   return (
-    <div className="mx-auto flex min-h-screen w-full max-w-5xl flex-col px-4 sm:px-6">
-      <header className="sticky top-0 z-20 flex items-center justify-between border-b border-[var(--edge)] bg-[var(--bg-base)]/90 py-3 backdrop-blur">
-        <div>
-          <p className="mono text-[10px] uppercase tracking-[0.2em] text-[var(--text-low)]">
-            FO Intelligence Agent
-          </p>
-          <h1 className="mono text-lg font-semibold text-[var(--text-hi)]">Run log</h1>
-        </div>
-        <div className="flex items-center gap-2">
-          <a
-            href="/"
-            className="mono rounded-[var(--r-sm)] border border-[var(--edge)] px-3 py-1.5 text-xs text-[var(--text-mid)] hover:text-[var(--text-hi)]"
-          >
-            Search
-          </a>
-          <a
-            href="/watch"
-            className="mono rounded-[var(--r-sm)] border border-[var(--edge)] px-3 py-1.5 text-xs text-[var(--text-mid)] hover:text-[var(--text-hi)]"
-          >
-            Watch
-          </a>
-        </div>
-      </header>
-
-      <main className="flex-1 py-6">
-        <p className="mb-5 max-w-2xl text-sm text-[var(--text-mid)]">
+    <div className="mx-auto w-full max-w-5xl px-4 py-6 sm:px-6">
+      <header className="mb-5">
+        <h1 className="display text-xl text-[var(--text-hi)]">Run log</h1>
+        <p className="mt-1.5 max-w-2xl text-sm text-[var(--text-mid)]">
           Every run the agent has made, and for each lead it touched, how every field was
           obtained — the tool call behind it, the source it came from, the values that lost, and
           for a blank cell, why it is blank.
         </p>
+      </header>
 
-        {liveRun && <LiveBanner run={liveRun} />}
+      {liveRun && <LiveBanner run={liveRun} />}
 
-        {runs === null ? (
-          <p className="text-sm text-[var(--text-low)]">loading…</p>
-        ) : notSynced || runs.length === 0 ? (
-          <div className="rounded-[var(--r-md)] border border-[var(--edge)] bg-[var(--bg-glass)] p-4">
-            <p className="text-sm text-[var(--text-mid)]">No runs have been pushed yet.</p>
-            <p className="mono mt-2 text-[11px] text-[var(--text-low)]">
-              The agent runs locally and mirrors its log here after each run. Push manually with:
-              POST /api/log/sync on the local service.
-            </p>
-          </div>
-        ) : (
-          <div className="rounded-[var(--r-md)] border border-[var(--edge)] bg-[var(--bg-glass)] px-4">
-            {runs.map((run) => (
-              <RunRow key={run.run_id} run={run} />
-            ))}
-          </div>
-        )}
-      </main>
+      {runs === null ? (
+        <p className="text-sm text-[var(--text-low)]">loading…</p>
+      ) : notSynced || runs.length === 0 ? (
+        <div className="rounded-[var(--r-md)] border border-[var(--edge)] bg-[var(--bg-glass)] p-4">
+          <p className="text-sm text-[var(--text-mid)]">No runs have been pushed yet.</p>
+          <p className="mono mt-2 text-[11px] text-[var(--text-low)]">
+            The agent runs locally and mirrors its log here after each run. Push manually with:
+            POST /api/log/sync on the local service.
+          </p>
+        </div>
+      ) : (
+        <div className="rounded-[var(--r-md)] border border-[var(--edge)] bg-[var(--bg-glass)] px-4">
+          {runs.map((run) => (
+            <RunRow key={run.run_id} run={run} />
+          ))}
+        </div>
+      )}
     </div>
   );
 }

@@ -4,10 +4,16 @@ import { useEffect, useState } from "react";
 import type { ClaimVerifiedPayload, ProvenanceRow } from "@/lib/types";
 import { FilingRecordBlock } from "./FilingRecord";
 
-// ui_plan.md §4 — the audit view. "Every claim in the answer with its full provenance
-// chain, flat." Directly demonstrates the thing being graded, so it gets its own tab
-// rather than being buried inside per-record drawers.
-export function EvidenceTab({ claims, entityNames }: { claims: ClaimVerifiedPayload[]; entityNames: Map<string, string> }) {
+// ui_plan.md §4 — the audit view: "every claim in the answer with its full provenance
+// chain, flat." Formerly the app-global Evidence tab; T47.5 scoped it to one turn, so it
+// now audits the claims of the answer it sits under rather than of whatever was asked last.
+export function EvidenceList({
+  claims,
+  entityNames,
+}: {
+  claims: ClaimVerifiedPayload[];
+  entityNames: Map<string, string>;
+}) {
   const [rowsByRecord, setRowsByRecord] = useState<Map<string, ProvenanceRow[]>>(new Map());
 
   const uniqueRecordIds = [...new Set(claims.map((c) => c.recordId))];
@@ -22,6 +28,7 @@ export function EvidenceTab({ claims, entityNames }: { claims: ClaimVerifiedPayl
         fetch(`/api/record/${id}`)
           .then((r) => r.json())
           .then((data) => [id, (data.provenance ?? []) as ProvenanceRow[]] as const)
+          .catch(() => [id, [] as ProvenanceRow[]] as const)
       )
     ).then((results) => {
       if (cancelled) return;
@@ -38,11 +45,11 @@ export function EvidenceTab({ claims, entityNames }: { claims: ClaimVerifiedPayl
   }, [missingIds.join(",")]);
 
   if (claims.length === 0) {
-    return <p className="mt-8 text-center text-sm text-[var(--text-mid)]">No claims to audit yet — ask a question first.</p>;
+    return <p className="py-8 text-center text-sm text-[var(--text-mid)]">This answer carries no verified claims.</p>;
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       {claims.map((claim, i) => {
         const rows = rowsByRecord.get(claim.recordId);
         const row = rows?.find((r) => r.field_name === claim.field);

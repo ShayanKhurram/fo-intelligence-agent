@@ -1,13 +1,12 @@
 "use client";
 
 import { useCallback, useMemo, useReducer, useRef, useState } from "react";
-import Link from "next/link";
 import type { WatchBoard, WatchBoardOrg, WatchSignal } from "@/lib/watch";
 import type { WatchStreamEvent } from "@/lib/watch-types";
 import { KIND_ORDER, boardSummary, kindMeta } from "@/lib/watch-format";
 import { OrgSignalCard } from "./OrgSignalCard";
 import { RunControl, type RunPhase } from "./RunControl";
-import { EvidenceDrawer } from "./EvidenceDrawer";
+import { useThread } from "./ThreadProvider";
 
 // T46.4 — the Intent Watcher page body.
 //
@@ -157,8 +156,10 @@ export function IntentWatcher({ board }: { board: WatchBoard }) {
   const [kindFilter, setKindFilter] = useState<KindFilter>("all");
   const [newOnly, setNewOnly] = useState(false);
   const [visible, setVisible] = useState(PAGE);
-  const [evidence, setEvidence] = useState<string | null>(null);
-  const returnFocusRef = useRef<HTMLElement | null>(null);
+  // T47.6 — the evidence surface is owned by the shell now, so /watch gets the same three
+  // responsive forms (sheet / drawer / pinned panel) that the thread does, instead of its
+  // own private copy of the old right-hand drawer.
+  const { openEvidence } = useThread();
   const abortRef = useRef<AbortController | null>(null);
   const stoppedRef = useRef(false);
 
@@ -275,58 +276,38 @@ export function IntentWatcher({ board }: { board: WatchBoard }) {
     }
   }, [state.runId]);
 
-  function openEvidence(recordId: string, el: HTMLElement | null) {
-    returnFocusRef.current = el;
-    setEvidence(recordId);
-  }
-
   const researched = state.finishedOnce ? state.completed : 0;
   const remaining = Math.max(0, orgs.length - researched);
 
+  // T47.1 — the route no longer builds its own container or its own nav; AppShell owns
+  // both. The run control stays with this page's heading because it acts on THIS page.
   return (
-    <div className="mx-auto flex min-h-screen w-full max-w-5xl flex-col px-4 sm:px-6">
-      <header className="sticky top-0 z-20 flex flex-wrap items-center justify-between gap-3 border-b border-[var(--edge)] bg-[var(--bg-base)]/90 py-3 backdrop-blur">
-        <div>
-          <p className="mono text-[10px] uppercase tracking-[0.2em] text-[var(--text-low)]">FO Intelligence Agent</p>
-          <h1 className="display text-lg text-[var(--text-hi)]">Intent watcher</h1>
+    <div className="mx-auto w-full max-w-5xl px-4 py-6 sm:px-6">
+      <header className="mb-5 flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h1 className="display text-xl text-[var(--text-hi)]">Intent watcher</h1>
           <p className="mono mt-0.5 text-[11px] text-[var(--text-mid)]">{summary}</p>
+          <p className="mt-2 max-w-2xl text-sm text-[var(--text-mid)]">
+            Every organization in the corpus that shows signs of activity — what it did, and what that
+            activity plausibly means. Run research to re-check the stalest organizations for anything new.
+          </p>
         </div>
-        <div className="flex items-center gap-2">
-          <Link
-            href="/"
-            className="mono rounded-[var(--r-sm)] border border-[var(--edge)] px-3 py-1.5 text-xs text-[var(--text-mid)] hover:text-[var(--text-hi)]"
-          >
-            Search
-          </Link>
-          <Link
-            href="/log"
-            className="mono rounded-[var(--r-sm)] border border-[var(--edge)] px-3 py-1.5 text-xs text-[var(--text-mid)] hover:text-[var(--text-hi)]"
-          >
-            Log
-          </Link>
-          <RunControl
-            phase={state.phase}
-            scope={scope}
-            onScopeChange={setScope}
-            onStart={start}
-            onStop={stop}
-            completed={state.completed}
-            total={state.total}
-            found={state.found}
-            etaMs={state.etaMs}
-            scanning={state.scanning}
-            remainingUnresearched={remaining}
-            orgCount={orgs.length}
-            error={state.error}
-          />
-        </div>
+        <RunControl
+          phase={state.phase}
+          scope={scope}
+          onScopeChange={setScope}
+          onStart={start}
+          onStop={stop}
+          completed={state.completed}
+          total={state.total}
+          found={state.found}
+          etaMs={state.etaMs}
+          scanning={state.scanning}
+          remainingUnresearched={remaining}
+          orgCount={orgs.length}
+          error={state.error}
+        />
       </header>
-
-      <main className="flex-1 py-6">
-        <p className="mb-5 max-w-2xl text-sm text-[var(--text-mid)]">
-          Every organization in the corpus that shows signs of activity — what it did, and what that
-          activity plausibly means. Run research to re-check the stalest organizations for anything new.
-        </p>
 
         {/* Filters. Client-side over already-loaded data; never refetches. */}
         <div className="mb-5 flex flex-wrap items-center gap-1.5">
@@ -434,11 +415,6 @@ export function IntentWatcher({ board }: { board: WatchBoard }) {
             </>
           )}
         </section>
-      </main>
-
-      {evidence && (
-        <EvidenceDrawer recordId={evidence} onClose={() => setEvidence(null)} returnFocusRef={returnFocusRef} />
-      )}
     </div>
   );
 }

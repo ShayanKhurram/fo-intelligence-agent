@@ -1,43 +1,129 @@
 @import "tailwindcss";
 
-/* ui_plan.md — "Dark Glass." Supersedes micro_rag_plan.md §7's light filing-vernacular
-   palette. This is deliberately single-theme (no prefers-color-scheme light variant):
-   ui_plan.md §1 commits to dark+glass as the whole point ("colour carries meaning
-   instead of decoration"), not a toggleable preference. */
+/* ui_plan.md — "Dark Glass", as extended by T47 ("Dark Glass II").
+ *
+ * T47.8 changes ONE thing about the palette and nothing else: it is no longer
+ * single-theme. ui_plan.md §1 committed to dark-only on purpose; the counter-argument
+ * that won is that this is a professional research tool read in daylight next to
+ * spreadsheets and filings, and that system-aware theming is now the default expectation
+ * for tools with long sessions.
+ *
+ * The token NAMES are unchanged, deliberately — every component already reads
+ * var(--text-mid) / var(--bg-glass) / var(--confirmed), so re-tuning the values per theme
+ * costs nothing at the call sites and a rename would have touched all 17 of them for no
+ * benefit.
+ *
+ * Three-state architecture (a viewer has three states, not two):
+ *   :root                                   -> the COMPLETE light palette
+ *   @media (prefers-color-scheme: dark)     -> dark, guarded :root:not([data-theme="light"])
+ *   :root[data-theme="dark"]                -> dark again, so an explicit toggle wins
+ *
+ * The binding rule for every component: theme blocks define TOKENS, never colours.
+ * Components read tokens only. A colour whose sole definition lives inside a media query
+ * never applies in the un-stamped default state, which renders one theme's text on the
+ * other theme's ground.
+ *
+ * --scrim used to do two contradictory jobs: darkening the page behind the evidence
+ * drawer, and guaranteeing text contrast INSIDE a glass panel. Those want opposite
+ * directions once a light theme exists (the veil must lighten so dark text reads; the
+ * backdrop must still darken). They are now two tokens.
+ */
 :root {
-  color-scheme: dark;
+  color-scheme: light;
 
-  /* surfaces — cool slate, not neutral black */
-  --bg-base: #0d1014;
-  --bg-raised: #141a21;
-  --bg-glass: rgba(26, 33, 42, 0.68);
-  --bg-glass-hi: rgba(34, 43, 54, 0.78);
-  --scrim: rgba(13, 16, 20, 0.55);
+  /* surfaces — cool light slate, not paper white */
+  --bg-base: #eceff4;
+  --bg-raised: #ffffff;
+  --bg-glass: rgba(255, 255, 255, 0.70);
+  --bg-glass-hi: rgba(255, 255, 255, 0.86);
+  --glass-veil: rgba(255, 255, 255, 0.55); /* contrast layer inside a glass panel */
+  --scrim: rgba(16, 21, 27, 0.34);         /* modal backdrop behind the evidence surface */
 
-  --edge: rgba(255, 255, 255, 0.08);
-  --edge-soft: rgba(255, 255, 255, 0.05);
-  --edge-lit: rgba(255, 255, 255, 0.14);
+  --edge: rgba(16, 21, 27, 0.13);
+  --edge-soft: rgba(16, 21, 27, 0.07);
+  --edge-lit: rgba(16, 21, 27, 0.17);
 
   /* type */
-  --text-hi: #e9edf2;
-  --text-mid: #98a3b2;
-  --text-low: #67717f;
+  --text-hi: #10151b;
+  --text-mid: #4a5462;
+  --text-low: #5f6874;
 
   /* functional verification palette — never used decoratively */
-  --confirmed: #2fb88a;
-  --partial: #c8912f;
-  --unknown: #67717f;
-  --live: #5b9cff;
-  --urgent: #e8734a;
+  --confirmed: #0b7551;
+  --partial: #855c12;
+  --unknown: #5f6874;
+  --live: #2159bd;
+  --urgent: #ab3f19;
 
   --r-sm: 8px;
   --r-md: 12px;
   --r-lg: 18px;
   --r-pill: 999px;
-  --shadow-drawer: 0 24px 64px rgba(0, 0, 0, 0.55);
+  --shadow-drawer: 0 24px 64px rgba(16, 21, 27, 0.18);
+
+  /* T47.3 — the composer measures itself into this and the thread pads by it, so the
+     last record card is never hidden underneath the docked composer. */
+  --composer-h: 76px;
 
   --background: var(--bg-base);
   --foreground: var(--text-hi);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+
+    /* surfaces — cool slate, not neutral black */
+    --bg-base: #0d1014;
+    --bg-raised: #141a21;
+    --bg-glass: rgba(26, 33, 42, 0.68);
+    --bg-glass-hi: rgba(34, 43, 54, 0.78);
+    --glass-veil: rgba(13, 16, 20, 0.55);
+    --scrim: rgba(6, 8, 10, 0.62);
+
+    --edge: rgba(255, 255, 255, 0.08);
+    --edge-soft: rgba(255, 255, 255, 0.05);
+    --edge-lit: rgba(255, 255, 255, 0.14);
+
+    --text-hi: #e9edf2;
+    --text-mid: #98a3b2;
+    --text-low: #8b95a3;
+
+    --confirmed: #2fb88a;
+    --partial: #c8912f;
+    --unknown: #8b95a3;
+    --live: #5b9cff;
+    --urgent: #e8734a;
+
+    --shadow-drawer: 0 24px 64px rgba(0, 0, 0, 0.55);
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg-base: #0d1014;
+  --bg-raised: #141a21;
+  --bg-glass: rgba(26, 33, 42, 0.68);
+  --bg-glass-hi: rgba(34, 43, 54, 0.78);
+  --glass-veil: rgba(13, 16, 20, 0.55);
+  --scrim: rgba(6, 8, 10, 0.62);
+
+  --edge: rgba(255, 255, 255, 0.08);
+  --edge-soft: rgba(255, 255, 255, 0.05);
+  --edge-lit: rgba(255, 255, 255, 0.14);
+
+  --text-hi: #e9edf2;
+  --text-mid: #98a3b2;
+  --text-low: #8b95a3;
+
+  --confirmed: #2fb88a;
+  --partial: #c8912f;
+  --unknown: #8b95a3;
+  --live: #5b9cff;
+  --urgent: #e8734a;
+
+  --shadow-drawer: 0 24px 64px rgba(0, 0, 0, 0.55);
 }
 
 @theme inline {
@@ -52,16 +138,39 @@
   border-color: var(--edge);
 }
 
+/* T47.4 — the page is the scroller (a nested scroll region is how phone chat UIs end up
+   with two scrollbars and a composer that jumps when the keyboard opens). scroll-padding
+   keeps `scrollIntoView` from parking a turn under the sticky top bar or the docked
+   composer, whose real measured height --composer-h carries. */
+html {
+  scroll-padding-top: 4rem;
+  scroll-padding-bottom: var(--composer-h);
+}
+
 body {
   background: var(--bg-base);
   color: var(--text-hi);
   font-family: var(--font-inter), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-  font-weight: 400; /* dark-mode weight correction — 400 here reads like 450 would on light */
 }
 
+/* Dark-mode weight correction — 400 on dark reads like 450 would on light, so the
+   correction belongs to the dark theme only, not to the base. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) body { font-weight: 400; }
+  :root:not([data-theme="light"]) h1,
+  :root:not([data-theme="light"]) h2,
+  :root:not([data-theme="light"]) h3,
+  :root:not([data-theme="light"]) .display { font-weight: 550; }
+}
+:root[data-theme="dark"] body { font-weight: 400; }
+:root[data-theme="dark"] h1,
+:root[data-theme="dark"] h2,
+:root[data-theme="dark"] h3,
+:root[data-theme="dark"] .display { font-weight: 550; }
+
 h1, h2, h3, .display {
-  font-family: var(--font-display), var(--font-inter), ui-sans-serif, sans-serif;
-  font-weight: 550; /* not 600 — dark-mode weight correction */
+  font-family: var(--font-bricolage), var(--font-inter), ui-sans-serif, sans-serif;
+  font-weight: 600;
 }
 
 .mono {
@@ -84,16 +193,14 @@ h1, h2, h3, .display {
 .status-dot--partial::before { content: "◐"; color: var(--partial); }
 .status-dot--unknown::before { content: "○"; color: var(--unknown); }
 
-/* ---- glass surfaces — ui_plan.md §3. Max three on screen at once: records rail,
-   input bar, evidence drawer. Nothing else gets blur. ---- */
-/* Text on glass must never sit on blur alone — every glass surface carries the scrim as
-   a second, topmost background layer (not just the drawer) so contrast is guaranteed
-   over arbitrarily busy content behind it (ui_plan.md §3/§8). Verified against the worst
-   case in scripts/contrast-check.mjs — --text-mid on bare --bg-glass alone measured
-   2.30:1 over a bright background, well under the 4.5:1 floor; layering --scrim under it
-   the same way the drawer already did brings every checked combination well past 4.5:1. */
+/* ---- glass surfaces — ui_plan.md §3.
+   Text on glass must never sit on blur alone — every glass surface carries the veil as a
+   second, topmost background layer so contrast is guaranteed over arbitrarily busy content
+   behind it. Verified in scripts/contrast-check.mjs, which checks BOTH themes: --text-mid
+   on bare --bg-glass measured 2.30:1 over a bright background in dark, well under the
+   4.5:1 floor; the veil brings every checked combination past it. ---- */
 .glass {
-  background-image: linear-gradient(var(--scrim), var(--scrim)), linear-gradient(var(--bg-glass), var(--bg-glass));
+  background-image: linear-gradient(var(--glass-veil), var(--glass-veil)), linear-gradient(var(--bg-glass), var(--bg-glass));
   backdrop-filter: blur(20px) saturate(140%);
   -webkit-backdrop-filter: blur(20px) saturate(140%);
   border: 1px solid var(--edge);
@@ -101,7 +208,7 @@ h1, h2, h3, .display {
   border-radius: var(--r-md);
 }
 .glass-hi {
-  background-image: linear-gradient(var(--scrim), var(--scrim)), linear-gradient(var(--bg-glass-hi), var(--bg-glass-hi));
+  background-image: linear-gradient(var(--glass-veil), var(--glass-veil)), linear-gradient(var(--bg-glass-hi), var(--bg-glass-hi));
   backdrop-filter: blur(20px) saturate(140%);
   -webkit-backdrop-filter: blur(20px) saturate(140%);
   border: 1px solid var(--edge);
@@ -125,6 +232,7 @@ h1, h2, h3, .display {
   overflow: hidden;
   background: var(--bg-raised);
   border-radius: var(--r-md);
+  border: 1px solid var(--edge-soft);
 }
 .skeleton::after {
   content: "";
@@ -133,7 +241,7 @@ h1, h2, h3, .display {
   background: linear-gradient(
     115deg,
     transparent 30%,
-    rgba(255, 255, 255, 0.12) 50%,
+    color-mix(in srgb, var(--text-low) 14%, transparent) 50%,
     transparent 70%
   );
   background-size: 200% 100%;
@@ -155,7 +263,7 @@ h1, h2, h3, .display {
   animation: cursor-blink 1s step-end infinite;
 }
 
-/* ---- evidence drawer entrance — 240ms cubic-bezier(0.32,0.72,0,1), ui_plan.md §6 ---- */
+/* ---- evidence surface entrances — 240ms cubic-bezier(0.32,0.72,0,1), ui_plan.md §6 ---- */
 @keyframes drawer-in {
   from { transform: translateX(24px); opacity: 0; }
   to { transform: translateX(0); opacity: 1; }
@@ -163,10 +271,14 @@ h1, h2, h3, .display {
 .drawer-enter {
   animation: drawer-in 240ms cubic-bezier(0.32, 0.72, 0, 1);
 }
-@media (prefers-reduced-motion: reduce) {
-  .drawer-enter {
-    animation: none;
-  }
+
+/* T47.6 — the phone form of the same surface: a bottom sheet rather than a side drawer. */
+@keyframes sheet-in {
+  from { transform: translateY(16px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+.sheet-enter {
+  animation: sheet-in 240ms cubic-bezier(0.32, 0.72, 0, 1);
 }
 
 /* ---- entrances / stage pulse ---- */
@@ -177,6 +289,18 @@ h1, h2, h3, .display {
 .enter-pill {
   animation: enter-scale 140ms ease-out;
 }
+
+/* T47.2 — a turn arriving in the thread. Deliberately ONE entrance for the whole turn,
+   not a staggered cascade across its record cards: results should appear, not perform,
+   and staggering delays the last card past the point the user starts scanning. */
+@keyframes turn-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.turn-enter {
+  animation: turn-in 180ms ease-out;
+}
+
 @keyframes stage-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.35; }
@@ -185,7 +309,7 @@ h1, h2, h3, .display {
   animation: stage-pulse 1.4s ease-in-out infinite;
 }
 
-/* ---- focus ring — visible on glass, 2px --live with a 1px dark inner ring ---- */
+/* ---- focus ring — visible on glass, 2px --live with a 1px ground-coloured inner ring ---- */
 :focus-visible {
   outline: 2px solid var(--live);
   outline-offset: 2px;
@@ -197,22 +321,23 @@ h1, h2, h3, .display {
   background: color-mix(in srgb, var(--live) 35%, transparent);
 }
 
+/* T47.1 — the rail's history list scrolls without a visible scrollbar eating 15px of a
+   260px column. Keyboard and wheel scrolling are unaffected. */
+.no-scrollbar { scrollbar-width: none; }
+.no-scrollbar::-webkit-scrollbar { display: none; }
+
 /* ---- reduced motion — ui_plan.md §7 ---- */
 @media (prefers-reduced-motion: reduce) {
   .skeleton::after {
     animation: none;
-    background: rgba(255, 255, 255, 0.08);
+    background: color-mix(in srgb, var(--text-low) 10%, transparent);
   }
-  .stream-cursor {
-    animation: none;
-    opacity: 1;
-  }
-  .stage-dot--active {
-    animation: none;
-  }
-  .enter-pill {
-    animation: none;
-  }
+  .stream-cursor { animation: none; opacity: 1; }
+  .stage-dot--active { animation: none; }
+  .enter-pill { animation: none; }
+  .drawer-enter { animation: none; }
+  .sheet-enter { animation: none; }
+  .turn-enter { animation: none; }
   *, *::before, *::after {
     transition-duration: 0.01ms !important;
     animation-duration: 0.01ms !important;
