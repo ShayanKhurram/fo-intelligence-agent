@@ -71,6 +71,25 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     conn.execute(
         "UPDATE claims SET field_name='important_insight' WHERE field_name='why_now_trigger'"
     )
+    # PLAN.md T43.1: corpus-validator checkpoints. One row per (record_id, mode) — the
+    # key is composite so a 'done' for the type pass does NOT suppress the email pass on
+    # the same record. Idempotent: CREATE TABLE IF NOT EXISTS is a no-op on a DB that
+    # already has it, so init_db() twice is safe. Lives here (not in schema.sql) because
+    # it is added by a migration against the live data/foia.db, matching the pattern of
+    # every other ALTER above.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS validator_checkpoints (
+            record_id   TEXT NOT NULL,
+            mode        TEXT NOT NULL,
+            status      TEXT NOT NULL DEFAULT 'pending',
+            attempts    INTEGER NOT NULL DEFAULT 0,
+            last_error  TEXT,
+            updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            PRIMARY KEY (record_id, mode)
+        )
+        """
+    )
 
 
 @contextmanager
@@ -276,6 +295,53 @@ def get_checkpoint(conn: sqlite3.Connection, entity_id: str) -> dict[str, Any] |
         "SELECT * FROM lead_checkpoints WHERE entity_id = ?", (entity_id,)
     ).fetchone()
     return dict(row) if row else None
+
+
+def get_validator_checkpoint(
+    conn: sqlite3.Connection, record_id: str, mode: str
+) -> dict[str, Any] | None:
+    """One checkpoint row per (record_id, mode). Returns None if this record has not
+    been touched by a validator pass of this mode."""
+    row = conn.execute(
+        "SELECT * FROM validator_checkpoints WHERE record_id = ? AND mode = ?",
+        (record_id, mode),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def upsert_validator_checkpoint(
+    conn: sqlite3.Connection,
+    record_id: str,
+    mode: str,
+    status: str,
+    last_error: str | None = None,
+) -> None:
+    """Record/advance a validator checkpoint for (record_id, mode). Every call
+    increments `attempts` — including a call that flips status to 'done' — so the
+    poison-cap (attempts >= 3) reflects total work spent, not just failures. Matches
+    the rag_queue / lead_checkpoints attempt semantics."""
+    row = conn.execute(
+        "SELECT attempts FROM validator_checkpoints WHERE record_id = ? AND mode = ?",
+        (record_id, mode),
+    ).fetchone()
+    if row is None:
+        conn.execute(
+            """
+            INSERT INTO validator_checkpoints (record_id, mode, status, attempts, last_error)
+            VALUES (?, ?, ?, 1, ?)
+            """,
+            (record_id, mode, status, last_error),
+        )
+        return
+    conn.execute(
+        """
+        UPDATE validator_checkpoints
+        SET status = ?, attempts = attempts + 1, last_error = ?,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE record_id = ? AND mode = ?
+        """,
+        (status, last_error, record_id, mode),
+    )
 
 
 def get_resumable_leads(conn: sqlite3.Connection) -> list[str]:

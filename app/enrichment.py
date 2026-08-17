@@ -1134,14 +1134,33 @@ async def resolve_domain(canonical_name: str) -> str | None:
     same way it already treats a missing `domain_check` source — by skipping the tiers that
     need one rather than guessing at a domain.
     """
-    search = await serper_search_raw(f'"{canonical_name}"', max_results=5)
-    for result in search.get("results", []):
-        host = _host_from_url(result.get("url") or "")
-        if not host or _is_aggregator(host):
-            continue
-        if _domain_matches_entity(host, canonical_name):
-            return host
-    return None
+    def _first_match(search: dict[str, Any]) -> str | None:
+        for result in search.get("results", []):
+            host = _host_from_url(result.get("url") or "")
+            if not host or _is_aggregator(host):
+                continue
+            if _domain_matches_entity(host, canonical_name):
+                return host
+        return None
+
+    host = _first_match(await serper_search_raw(f'"{canonical_name}"', max_results=5))
+    if host:
+        return host
+
+    # Fallback: the quoted search is an EXACT-phrase match on the *legal* name, and these
+    # names come from Form ADV complete with "LP" / "LLC" / "INC". A firm does not brand
+    # itself that way, so its own site frequently does not contain the exact string and
+    # the SERP comes back all-SEC-and-aggregator. Measured 2026-08-16: 11 of 25 backfill
+    # rows resolved to no domain, and `BLACK MAPLE CAPITAL MANAGEMENT LP` was one of them
+    # — while an unquoted search returns `blackmaplecapital.com` as the #1 organic result.
+    #
+    # This runs ONLY when the quoted search already yielded nothing, so it cannot change
+    # an existing success, and it costs a second Serper call on exactly the rows that were
+    # about to fail anyway. The `_domain_matches_entity` gate is unchanged, so a loosened
+    # query cannot let through a host that does not belong to the entity.
+    return _first_match(
+        await serper_search_raw(f"{canonical_name} official website", max_results=5)
+    )
 
 
 # ============================================================================

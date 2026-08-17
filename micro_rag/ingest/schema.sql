@@ -31,6 +31,13 @@ CREATE TABLE IF NOT EXISTS records (
     principal_title         TEXT,
     principal_email         TEXT,
     principal_email_status  TEXT NOT NULL DEFAULT 'could_not_verify',
+    -- The firm's own inbox, kept in its own column so it is never confused with a named
+    -- principal's address. Before this existed, `firm_email` claims were written to
+    -- `provenance` and then had nowhere to land — 82 records carried one that no query
+    -- over `records` could see. It is also where the T43.7 audit demotes a misattributed
+    -- principal_email to, so the contact survives the correction.
+    firm_email              TEXT,
+    firm_email_status       TEXT NOT NULL DEFAULT 'could_not_verify',
     principal_phone         TEXT,
     principal_phone_status  TEXT NOT NULL DEFAULT 'could_not_verify',
     most_recent_signal_date DATE,

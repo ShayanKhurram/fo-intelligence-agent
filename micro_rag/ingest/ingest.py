@@ -97,6 +97,7 @@ def write_to_postgres(
     provenance_by_record: dict[str, list[dict[str, Any]]],
     *,
     prune: bool = True,
+    embed: bool = True,
 ) -> str:
     """Upserts records + chunks + provenance, writes a new dataset_meta row, returns
     the build_hash. Idempotent — safe to re-run as the live pipeline produces more rows.
@@ -109,7 +110,15 @@ def write_to_postgres(
     app/rag_sync.py drains a queue of newly-confirmed leads, a handful at a time. With
     the prune left on, the first such drain would delete every record it did not happen
     to be carrying: one confirmed lead in, twenty-nine destroyed. Removal of a
-    re-judged lead stays the batch job's responsibility."""
+    re-judged lead stays the batch job's responsibility.
+
+    `embed=False` skips the chunks delete/embed/re-insert cycle. Contact fields
+    (principal_email/principal_phone) are NEVER embedded (schema.sql says so
+    explicitly) and `entity_type` is a structural column, so a re-project that only
+    touched those needs no new embeddings — re-embedding 331 records for nothing costs
+    minutes and loads torch for nothing. The one caller that needs this is the corpus
+    validator (app/corpus_validator.py:reproject_records), which writes only contact /
+    type columns. Existing chunks are left in place untouched."""
     build_hash = f"{_git_sha()}-{len(records)}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
 
     conn = psycopg2.connect(pg_dsn)
@@ -136,13 +145,15 @@ def write_to_postgres(
                     INSERT INTO records (record_id, build_hash, entity_name, entity_type, hq_state, hq_country,
                         aum_usd, aum_basis, aum_as_of, mandates, fit_tags, check_size_min, check_size_max,
                         principal_name, principal_title, principal_email, principal_email_status,
+                        firm_email, firm_email_status,
                         principal_phone, principal_phone_status, most_recent_signal_date, urgency_tier,
                         activity_status, actionability_score, discovery_class_primary, public_list_overlap,
                         record_confidence, outcome)
                     VALUES (%(record_id)s, %(build_hash)s, %(entity_name)s, %(entity_type)s, %(hq_state)s,
                         %(hq_country)s, %(aum_usd)s, %(aum_basis)s, %(aum_as_of)s, %(mandates)s, %(fit_tags)s,
                         %(check_size_min)s, %(check_size_max)s, %(principal_name)s, %(principal_title)s,
-                        %(principal_email)s, %(principal_email_status)s, %(principal_phone)s,
+                        %(principal_email)s, %(principal_email_status)s,
+                        %(firm_email)s, %(firm_email_status)s, %(principal_phone)s,
                         %(principal_phone_status)s, %(most_recent_signal_date)s, %(urgency_tier)s,
                         %(activity_status)s, %(actionability_score)s, %(discovery_class_primary)s,
                         %(public_list_overlap)s, %(record_confidence)s, %(outcome)s)
@@ -153,6 +164,7 @@ def write_to_postgres(
                         check_size_min = EXCLUDED.check_size_min, check_size_max = EXCLUDED.check_size_max,
                         principal_name = EXCLUDED.principal_name, principal_title = EXCLUDED.principal_title,
                         principal_email = EXCLUDED.principal_email, principal_email_status = EXCLUDED.principal_email_status,
+                        firm_email = EXCLUDED.firm_email, firm_email_status = EXCLUDED.firm_email_status,
                         principal_phone = EXCLUDED.principal_phone, principal_phone_status = EXCLUDED.principal_phone_status,
                         most_recent_signal_date = EXCLUDED.most_recent_signal_date, urgency_tier = EXCLUDED.urgency_tier,
                         activity_status = EXCLUDED.activity_status, discovery_class_primary = EXCLUDED.discovery_class_primary,
@@ -162,18 +174,19 @@ def write_to_postgres(
                     r,
                 )
 
-                cur.execute("DELETE FROM chunks WHERE record_id = %s", (r["record_id"],))
-                new_chunks = build_chunks(r)
-                vectors = embed_texts([c["content"] for c in new_chunks])
-                for chunk, vec in zip(new_chunks, vectors):
-                    # pgvector's text input is a bracketed literal ("[1,2,3]"); psycopg2 has
-                    # no adapter for the vector type, so passing the raw Python list would be
-                    # coerced to a Postgres array ("{1,2,3}") and rejected. Format explicitly.
-                    vec_literal = "[" + ",".join(repr(float(x)) for x in vec) + "]"
-                    cur.execute(
-                        "INSERT INTO chunks (chunk_id, record_id, facet, content, embedding, token_count) VALUES (%s,%s,%s,%s,%s,%s)",
-                        (chunk["chunk_id"], chunk["record_id"], chunk["facet"], chunk["content"], vec_literal, len(chunk["content"].split())),
-                    )
+                if embed:
+                    cur.execute("DELETE FROM chunks WHERE record_id = %s", (r["record_id"],))
+                    new_chunks = build_chunks(r)
+                    vectors = embed_texts([c["content"] for c in new_chunks])
+                    for chunk, vec in zip(new_chunks, vectors):
+                        # pgvector's text input is a bracketed literal ("[1,2,3]"); psycopg2 has
+                        # no adapter for the vector type, so passing the raw Python list would be
+                        # coerced to a Postgres array ("{1,2,3}") and rejected. Format explicitly.
+                        vec_literal = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+                        cur.execute(
+                            "INSERT INTO chunks (chunk_id, record_id, facet, content, embedding, token_count) VALUES (%s,%s,%s,%s,%s,%s)",
+                            (chunk["chunk_id"], chunk["record_id"], chunk["facet"], chunk["content"], vec_literal, len(chunk["content"].split())),
+                        )
 
                 cur.execute("DELETE FROM provenance WHERE record_id = %s", (r["record_id"],))
                 for claim in provenance_by_record.get(r["record_id"], []):
