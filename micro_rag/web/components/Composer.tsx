@@ -92,7 +92,10 @@ export function Composer() {
           e.preventDefault();
           send();
         }}
-        className="glass mx-auto flex w-full max-w-[42rem] items-end gap-2 rounded-[var(--r-lg)] px-3 py-2.5 shadow-[var(--shadow-drawer)] focus-within:ring-2 focus-within:ring-[color-mix(in_srgb,var(--live)_40%,transparent)] lg:max-w-[46rem]"
+        // `.composer-shell` owns the focus treatment (see globals.css). The blue
+        // focus-within ring that used to live here stacked with the textarea's own
+        // outline, so clicking the box drew two nested blue rectangles.
+        className="glass composer-shell mx-auto flex w-full max-w-[42rem] items-end gap-2 rounded-[var(--r-lg)] px-3 py-2.5 shadow-[var(--shadow-drawer)] lg:max-w-[46rem]"
       >
         <textarea
           id="composer-input"
@@ -114,7 +117,9 @@ export function Composer() {
           placeholder={first ? "Ask about a family office…" : "Ask a new question…"}
           aria-label="Ask a question about a family office"
           aria-describedby="composer-hint"
-          className="mt-0.5 min-h-0 w-full flex-1 resize-none bg-transparent py-1 text-sm leading-6 text-[var(--text-hi)] placeholder:text-[var(--text-low)] focus:outline-none"
+          // No focus utilities here on purpose: `.composer-shell` in globals.css is the
+          // single place that decides what focus looks like for this control.
+          className="mt-0.5 min-h-0 w-full flex-1 resize-none bg-transparent py-1 text-sm leading-6 text-[var(--text-hi)] placeholder:text-[var(--text-low)]"
         />
         {streaming ? (
           <button

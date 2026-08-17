@@ -309,12 +309,52 @@ h1, h2, h3, .display {
   animation: stage-pulse 1.4s ease-in-out infinite;
 }
 
-/* ---- focus ring — visible on glass, 2px --live with a 1px ground-coloured inner ring ---- */
-:focus-visible {
-  outline: 2px solid var(--live);
-  outline-offset: 2px;
-  box-shadow: 0 0 0 1px var(--bg-base) inset;
-  border-radius: var(--r-sm);
+/* ---- focus ring — visible on glass, 2px --live with a 1px ground-coloured inner ring ----
+ *
+ * In @layer base ON PURPOSE. Unlayered rules beat every layered one regardless of
+ * specificity, so while this sat outside a layer it silently overrode Tailwind's
+ * `focus:outline-none` (which lands in @layer utilities) — the composer's textarea asked
+ * for no outline and got a blue one anyway. Inside base, utilities win, and
+ * `focus:outline-none` means what it says.
+ *
+ * This ring is right for buttons and links, where it is transient. It is NOT right for a
+ * text field the user sits inside for the whole session — see .composer-shell below. */
+@layer base {
+  :focus-visible {
+    outline: 2px solid var(--live);
+    outline-offset: 2px;
+    box-shadow: 0 0 0 1px var(--bg-base) inset;
+    border-radius: var(--r-sm);
+  }
+}
+
+/* ---- the composer's focus state ----
+ * A chat composer holds focus almost permanently, so a detached coloured halo around it is
+ * not a transient affordance — it is the resting appearance of the app, and two of them
+ * (the form's ring plus the textarea's own outline) was the reported defect.
+ *
+ * The box signals focus through its own surface instead: the border steps from --edge,
+ * which is barely visible, up to --text-low, which measures 4.90:1 on light and 6.29:1 on
+ * dark against the ground (scripts/contrast-check.mjs) — far past the 3:1 a focus
+ * indicator needs. The 3px neutral halo carries the indicator's area requirement without
+ * introducing a colour. Nothing here is --live: focus on the composer is a state, not an
+ * activity signal, and this palette spends colour only on meaning. */
+.composer-shell {
+  transition: border-color 140ms ease-out, box-shadow 140ms ease-out;
+}
+.composer-shell:focus-within {
+  border-color: var(--text-low);
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--text-low) 13%, transparent),
+    var(--shadow-drawer);
+}
+/* The field inside draws nothing of its own — the shell is the entire indicator. Both
+   declarations are load-bearing: the base ring sets an outline AND a 1px inset shadow, and
+   cancelling only the outline leaves a hairline rectangle floating inside the box. */
+.composer-shell textarea:focus,
+.composer-shell textarea:focus-visible {
+  outline: none;
+  box-shadow: none;
 }
 
 ::selection {
