@@ -57,3 +57,43 @@ services:
         sync: false
       - key: DATABASE_URL                 # micro-RAG Postgres; unset = RAG ingest stays queued
         sync: false
+
+  # --- second service: the Intent Watcher research sweep host (T50.5) ----------------
+  #
+  # No disk: all of the watcher's state lives in Neon Postgres (watch_runs /
+  # watch_run_targets / watch_signals / watch_org_state), UNLIKE the Python service above
+  # whose SQLite file on a Render disk pins it to exactly one instance. This service
+  # owns no files and could in principle scale horizontally — but `startRun`'s "a run is
+  # already running -> reuse it" guard is a read-then-write that two instances could race
+  # (both see no running run, both insert, two sweeps double-spend Serper credits), so
+  # numInstances stays at 1 until that guard is made atomic.
+  #
+  # It deliberately does NOT run `next build` — it serves no pages, only the three
+  # /api/watch/run endpoints. tsx runs the TypeScript service file directly.
+  - type: web
+    name: fo-watch-research
+    runtime: node
+    plan: starter
+    region: oregon
+    repo: https://github.com/ShayanKhurram/fo-intelligence-agent
+    branch: main
+    rootDir: micro_rag/web
+    numInstances: 1
+    buildCommand: npm ci
+    startCommand: npx tsx service/watch-service.ts
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: WATCH_SLICE_BUDGET_MS
+        value: "21600000"
+      - key: PORT
+        value: "10000"
+      - key: DATABASE_URL
+        sync: false
+      - key: SERPER_API_KEY
+        sync: false
+      - key: OLLAMA_API_KEY
+        sync: false
+      - key: WATCH_CORS_ORIGINS
+        sync: false

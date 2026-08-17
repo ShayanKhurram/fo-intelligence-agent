@@ -7,6 +7,7 @@ import { KIND_ORDER, boardSummary, kindMeta } from "@/lib/watch-format";
 import { OrgSignalCard } from "./OrgSignalCard";
 import { RunControl, type RunPhase } from "./RunControl";
 import { useThread } from "./ThreadProvider";
+import { researchUrl } from "@/lib/research-origin";
 
 // T46.4 — the Intent Watcher page body.
 //
@@ -194,7 +195,7 @@ export function IntentWatcher({ board }: { board: WatchBoard }) {
   /** Reads one SSE slice. Resolves "paused" when the server's 45s budget expired with
    * work remaining, "done" when terminal, "aborted" when the user pressed Stop. */
   const readSlice = useCallback(async (runId: string, signal: AbortSignal): Promise<"paused" | "done"> => {
-    const res = await fetch(`/api/watch/run?run_id=${encodeURIComponent(runId)}`, { signal });
+    const res = await fetch(researchUrl(`/api/watch/run?run_id=${encodeURIComponent(runId)}`), { signal });
     if (!res.body) throw new Error("no response body");
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -228,7 +229,7 @@ export function IntentWatcher({ board }: { board: WatchBoard }) {
     const controller = new AbortController();
     abortRef.current = controller;
     try {
-      const res = await fetch("/api/watch/run", {
+      const res = await fetch(researchUrl("/api/watch/run"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ scope }),
@@ -272,7 +273,7 @@ export function IntentWatcher({ board }: { board: WatchBoard }) {
     abortRef.current?.abort();
     dispatch({ type: "stopped" });
     if (runId) {
-      await fetch(`/api/watch/run?run_id=${encodeURIComponent(runId)}`, { method: "DELETE" }).catch(() => {});
+      await fetch(researchUrl(`/api/watch/run?run_id=${encodeURIComponent(runId)}`), { method: "DELETE" }).catch(() => {});
     }
   }, [state.runId]);
 
