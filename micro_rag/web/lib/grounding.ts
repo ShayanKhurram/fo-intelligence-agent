@@ -1,8 +1,8 @@
 // The grounding control — micro_rag_plan.md §5. Three mechanical gates, none of which
 // is a prompt. "The brief is explicit that prompt instructions do not count."
-import { getPool } from "./db";
-import { ollamaChat, ollamaChatStream } from "./ollama";
-import type { RetrievedChunk } from "./retrieval";
+import { getPool } from "./db.ts";
+import { ollamaChat, ollamaChatStream } from "./ollama.ts";
+import type { RetrievedChunk } from "./retrieval.ts";
 
 const RETRIEVAL_FLOOR = 0.01; // RRF scores are small (1/(60+rank)); tuned empirically at this corpus size
 
@@ -40,9 +40,18 @@ export function gate1(topScore: number, chunkCount: number, intentOutOfScope: bo
   return "proceed";
 }
 
-function buildGenerationPrompt(query: string, chunks: RetrievedChunk[], facts: RecordFacts): string {
+// T51.4 — the chunk header used to print `facet=<name>`, which reads exactly like the
+// `field = value` lines in the confirmed-fields block below it. The model duly cited the
+// facet as if it were a field (`[disc_x:why_now]`, `:identity`, `:activity`) — none of
+// which are provenance fields, so every such sentence failed Gate 2 and three production
+// answers were discarded at strippedFraction 1.0. The facet is a section label, not a
+// citable field, so it is rendered as one: `section: <name>`, and the confirmed-fields
+// block is the ONLY place in this prompt where a `name = value` pair appears. Deliberately
+// NOT fixed by accepting facet names as valid tags — a facet has no provenance status, so
+// making it citable would put unverified text behind a claim pill.
+export function buildGenerationPrompt(query: string, chunks: RetrievedChunk[], facts: RecordFacts): string {
   const chunkText = chunks
-    .map((c, i) => `[${i + 1}] record_id=${c.record_id} entity=${c.entity_name} facet=${c.facet}\n${c.content}`)
+    .map((c, i) => `[${i + 1}] record_id=${c.record_id} entity=${c.entity_name} (section: ${c.facet})\n${c.content}`)
     .join("\n\n");
 
   const factSheets = Object.entries(facts)
@@ -60,7 +69,8 @@ function buildGenerationPrompt(query: string, chunks: RetrievedChunk[], facts: R
 const GENERATION_SYSTEM = `You answer questions about a family-office dataset using ONLY the retrieved context and
 confirmed fields given to you. Every sentence that states a fact MUST end with a tag naming the record and field
 it rests on, in the exact format [record_id:field_name] — e.g. "Acme Capital committed $40M in March 2026. [disc_abc123:recent_fund_commitments]"
-Only use field names that appear in the "confirmed fields" list for that record_id. Never state a fact you cannot
+Only use field names that appear in the "confirmed fields" list for that record_id. The "section:" label on a
+retrieved context block is NOT a field name and must never appear in a tag. Never state a fact you cannot
 tag this way. If a field is not in the confirmed list, say it hasn't been confirmed rather than guessing. Do not
 invent record_ids or field names.`;
 
@@ -97,19 +107,98 @@ export function generateAnswerStream(query: string, chunks: RetrievedChunk[], fa
   );
 }
 
-const TAG_RE = /\[([^\]:]+):([^\]]+)\]/g;
+// Any bracket whose body contains a colon is an attempted citation tag. The colon is what
+// distinguishes a tag from an ordinary bracket the model might write (`[1]`, `[see below]`),
+// which must keep passing through untouched.
+//
+// T51.5 — this used to be /\[([^\]:]+):([^\]]+)\]/g, which captured the ENTIRE body after
+// the first colon as one field name. A model citing two fields in one bracket —
+// `[disc_x:check_size_range, disc_x:investing_thesis]`, logged in production — therefore
+// resolved to a field literally named "check_size_range, disc_x:investing_thesis", matched
+// nothing, and a correctly-grounded sentence was rejected. The body is now parsed into its
+// constituent pairs and each one validated.
+const TAG_RE = /\[([^\]]*:[^\]]*)\]/g;
+
+type TagPair = { recordId: string; field: string };
+
+/** Parses a tag body into `record_id:field` pairs. `a:b` -> one pair; `a:b, a:c` -> two;
+ * `a:b, c` -> two, the bare second part inheriting the preceding record_id (models write
+ * both forms). Returns null when the body is not a citation at all, which the caller
+ * treats as a malformed tag rather than as an untagged sentence — the model reached for a
+ * citation and produced something unusable, and that is not the same as making no claim. */
+function parseTagBody(body: string): TagPair[] | null {
+  const pairs: TagPair[] = [];
+  for (const part of body.split(/\s*[,;]\s*/)) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const idx = trimmed.indexOf(":");
+    if (idx === -1) {
+      // A bare field name continues the previous pair's record; with no previous pair
+      // there is nothing to attach it to.
+      const prev = pairs[pairs.length - 1];
+      if (!prev) return null;
+      pairs.push({ recordId: prev.recordId, field: trimmed });
+      continue;
+    }
+    const recordId = trimmed.slice(0, idx).trim();
+    const field = trimmed.slice(idx + 1).trim();
+    if (!recordId || !field || field.includes(":")) return null;
+    pairs.push({ recordId, field });
+  }
+  return pairs.length > 0 ? pairs : null;
+}
 
 // Abbreviations whose trailing period is NOT a sentence boundary. Entity names in this
 // dataset routinely end in these ("Accredited Investors Inc.", "6th Street Advisors L.P."),
 // and a naive split on "." would sever the name from its own sentence, producing a bogus
 // untagged fragment that then gets stripped. Guarded before splitting, restored after.
-const ABBREVIATIONS = ["Inc", "Ltd", "Corp", "Co", "LLC", "L.P", "LP", "L.L.C", "N.A", "S.A", "plc", "Pte", "Cos", "Bros", "St", "U.S", "No"];
+// "Ltda" (Brazilian) added after production split "Specifically, Turim 21 Investimentos
+// Ltda." off its own sentence — `\bLtd\.` cannot match it, since the "a" sits between.
+// Longer forms must precede their own prefixes for the same reason.
+const ABBREVIATIONS = ["Inc", "Ltda", "Ltd", "Corp", "Co", "LLC", "L.P", "LP", "L.L.C", "N.A", "S.A", "plc", "Pte", "Cos", "Bros", "St", "U.S", "No"];
 
 // A sentence that explicitly declines to assert an unknown fact ("... has not been
 // confirmed", "no email is available") is GOOD grounding, not a fabrication. It carries no
 // tag because it makes no citable claim — so it should neither be kept as a fact nor counted
 // against the strip threshold. Excluded from the denominator entirely.
-const NON_CLAIM_RE = /\b(not|n't|no|none|unconfirmed|unavailable|undisclosed|unknown)\b.*\b(confirmed|available|disclosed|reported|verified|provided|known|found|listed|on file|specified|identified)\b|\b(has not been|hasn't been|could not be|couldn't be|was not|were not|isn't|aren't)\b/i;
+//
+// T51.3 — the original single pattern required a negation followed by a verb from a closed,
+// fully-inflected list, and production kept producing honest sentences just outside it:
+// "no record explicitly lists a New York location" missed because the list held *listed*
+// but not *lists*, and "there is no information regarding industrial decarbonization"
+// matched nothing at all. Both were stripped as fabrications and their answers discarded.
+// The alternatives below cover the absence-of-data forms the model actually writes, and
+// match verb STEMS so inflection stops mattering. Kept deliberately negative-anchored: a
+// positive assertion ("Alpha Capital invests in real estate") still requires a tag.
+const NON_CLAIM_RE = new RegExp(
+  [
+    // "no record ...", "no information on ...", "no data available"
+    "\\bno\\s+(record|records|information|data|entry|entries|field|fields|mention|detail|details|evidence)\\b",
+    // "does not contain information", "do not list an address"
+    "\\b(does|do|did)\\s+not\\s+(contain|include|list|show|specify|mention|provide|report|indicate|state)\\b",
+    // "has not been confirmed", "could not be verified", "cannot be determined"
+    "\\b(has|have|had)\\s+not\\s+been\\b",
+    "\\b(hasn't|haven't|hadn't)\\s+been\\b",
+    "\\b(could|can|would)\\s+not\\s+be\\b",
+    "\\b(couldn't|cannot|can't)\\s+be\\b",
+    // "was not disclosed", "are not available"
+    "\\b(was|were|is|are)\\s+not\\s+(confirmed|available|disclosed|reported|verified|provided|known|found|listed|specified|identified|on file)\\b",
+    // negation anywhere, followed by a settled/known STEM in any inflection. `no` belongs
+    // in this set: "No other family office has a confirmed real estate investment" is the
+    // honest close of a list, and dropping it here quietly made that sentence a fabrication.
+    "\\b(not|n't|no|none|unconfirmed|unavailable|undisclosed|unknown)\\b.*(confirm|disclos|verif|report|specif|identif|provid|list|avail|known|found|on file)",
+  ].join("|"),
+  "i"
+);
+
+// T51.2 — a list header ("The following family offices have confirmed AUM over $500
+// million:") states no citable fact of its own; it introduces the sentences that do. It
+// carries no tag for exactly the same reason an honest non-claim carries none, so it gets
+// the same treatment: kept in the prose, no claim pill, excluded from the threshold
+// denominator. Production discarded a correct 10-item list partly on this one sentence.
+// Anchored on the trailing colon and nothing else — a sentence that ASSERTS something
+// ("Canopy Partners has AUM of $640,000,000.") ends in a period and still needs its tag.
+const LIST_HEADER_RE = /:\s*$/;
 
 export type EntailmentResult = {
   finalAnswer: string;
@@ -149,8 +238,24 @@ export function splitSentences(text: string): string[] {
   for (const abbr of ABBREVIATIONS) {
     guarded = guarded.replace(new RegExp(`\\b${abbr.replace(/\./g, "\\.")}\\.`, "g"), `${abbr}${DOT_SENTINEL}`);
   }
+  // T51.1 — the same guard, for the period in an ordinal list marker. Splitting on
+  // "(?<=[.!?])\s+" alone treats the "1." of "1. Alpha Capital has AUM of ... [tag]" as a
+  // complete sentence, so every item of a markdown numbered list contributed a phantom
+  // untagged "sentence" that Gate 2 then stripped. A fully-grounded 10-item list scored
+  // strippedFraction 0.5 and was discarded in production for having formatting. Anchored
+  // to the start of a line so a sentence that merely ends in a number ("...raised $500.
+  // 3 offices matched.") is untouched.
+  // The `**` allowance is not decoration: the model routinely bolds its list markers
+  // ("**1.** Nolet Wealth Management"), and without it the marker is not at line start,
+  // the guard misses, and the phantom-sentence bug comes straight back for that answer.
+  guarded = guarded.replace(/(^|\n)([ \t]*(?:\*\*|__|\*)?\s*\d+)\.(?=\s|\*)/g, `$1$2${DOT_SENTINEL}`);
   return guarded
-    .split(/(?<=[.!?])\s+/)
+    // Two kinds of boundary: sentence-ending punctuation, and the newline before a list
+    // marker. The second is what keeps a header and its first item apart now that the
+    // marker's own period no longer splits — and it means a list item with no terminal
+    // punctuation is still its own sentence rather than being glued to the next one.
+    // `\d+[.)\0]` matches a marker whose period is already sentinel-guarded above.
+    .split(/(?<=[.!?])\s+|\n+(?=[ \t]*(?:(?:\*\*|__|\*)?\s*\d+[.)\0]|[-*•]\s))/)
     .map((s) => s.split(DOT_SENTINEL).join("."))
     .filter((s) => s.trim().length > 0);
 }
@@ -168,19 +273,39 @@ export type SentenceCheck =
  * UI, it's never shown as raw bracket syntax). */
 export function checkSentence(sentence: string, facts: RecordFacts): SentenceCheck {
   const tags = [...sentence.matchAll(TAG_RE)];
-  const display = sentence.replace(TAG_RE, "").replace(/\s+/g, " ").trim();
+  // Removing the tag leaves the space that separated it from the sentence. Because
+  // `normalizeTagPosition` deliberately parks the tag just BEFORE the closing punctuation
+  // ("FACT [tag]."), that orphaned space always lands right in front of it — so every
+  // claim sentence rendered as "…$1,200,000,000 ." in the UI. Close the gap.
+  const display = sentence
+    .replace(TAG_RE, "")
+    .replace(/\s+/g, " ")
+    .replace(/\s+([.,;:!?])/g, "$1")
+    .trim();
 
   if (tags.length === 0) {
-    // An explicit "we don't know this" is an honest non-claim — kept in the answer but
-    // carries no pill and isn't counted toward the strip threshold; anything else
-    // untagged is a fabrication risk and gets stripped.
-    if (NON_CLAIM_RE.test(sentence)) return { kind: "neutral", display };
+    // An explicit "we don't know this", and a list header that only introduces the
+    // sentences below it, are honest non-claims — kept in the answer but they carry no
+    // pill and aren't counted toward the strip threshold; anything else untagged is a
+    // fabrication risk and gets stripped.
+    if (NON_CLAIM_RE.test(sentence) || LIST_HEADER_RE.test(sentence.trim())) {
+      return { kind: "neutral", display };
+    }
     return { kind: "invalid", reason: "untagged" };
   }
 
-  for (const [, recordId, field] of tags) {
-    const recordFacts = facts[recordId.trim()];
-    if (!recordFacts || !(field.trim() in recordFacts)) {
+  // Every pair in every bracket must resolve — a sentence citing two fields is only as
+  // grounded as its weaker citation.
+  const pairs: TagPair[] = [];
+  for (const [, body] of tags) {
+    const parsed = parseTagBody(body);
+    if (!parsed) return { kind: "invalid", reason: "malformed citation tag" };
+    pairs.push(...parsed);
+  }
+
+  for (const { recordId, field } of pairs) {
+    const recordFacts = facts[recordId];
+    if (!recordFacts || !(field in recordFacts)) {
       return { kind: "invalid", reason: "tag references an unconfirmed or nonexistent field" };
     }
   }
@@ -188,9 +313,9 @@ export function checkSentence(sentence: string, facts: RecordFacts): SentenceChe
   // One claim pill per sentence: the FIRST tag drives the pill (a sentence citing
   // multiple fields is rare in practice; the display text carries all the tagged
   // content regardless — only the pill's target record/field is singular).
-  const [, recordId, field] = tags[0];
-  const fact = facts[recordId.trim()][field.trim()];
-  return { kind: "claim", display, recordId: recordId.trim(), field: field.trim(), value: fact.value, status: fact.status };
+  const { recordId, field } = pairs[0];
+  const fact = facts[recordId][field];
+  return { kind: "claim", display, recordId, field, value: fact.value, status: fact.status };
 }
 
 /** Gate 2 — post-generation claim entailment, run in code. Splits the answer into
@@ -223,8 +348,13 @@ export function verifyEntailment(rawAnswer: string, facts: RecordFacts): Entailm
   const strippedFraction = claimSentences > 0 ? stripped.length / claimSentences : 0;
   const decision: "proceed" | "discard_over_threshold" = strippedFraction > 0.3 ? "discard_over_threshold" : "proceed";
 
+  // T51.6 — `finalAnswer` is now always the sentences that survived, whatever the verdict.
+  // It used to be blanked on discard, back when discarding meant the user saw none of them.
+  // The streaming path shows each sentence the moment it passes, and a discard no longer
+  // retracts what is on screen, so blanking this would make `query_log.final_answer`
+  // disagree with what was actually delivered. `decision` still carries the verdict.
   return {
-    finalAnswer: decision === "proceed" ? kept.join(" ") : "",
+    finalAnswer: kept.join(" "),
     strippedSentences: stripped,
     strippedFraction,
     decision,

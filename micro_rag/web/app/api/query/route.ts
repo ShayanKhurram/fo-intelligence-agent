@@ -280,22 +280,29 @@ async function runQuery(query: string, overrideFilters: ParsedFilters | undefine
     gate1_decision: "proceed", raw_answer: rawAnswer,
     stripped_sentences: entailment.strippedSentences, stripped_fraction: entailment.strippedFraction,
     gate2_decision: entailment.decision,
-    final_answer: entailment.decision === "proceed" ? entailment.finalAnswer : entailmentDiscardedMessage(),
+    final_answer: entailment.finalAnswer,
   });
 
-  if (entailment.decision === "discard_over_threshold") {
-    // The whole-answer safety net fired after individual sentences had already streamed —
-    // rare, but the already-shown text/pills are not trustworthy as a set and retract.
-    emit({
-      type: "done", records: shortlistIds, relaxedFilters: select.relaxedFilters,
-      strippedFraction: entailment.strippedFraction, discarded: true, finalAnswerFallback: entailmentDiscardedMessage(),
-    });
-    return;
-  }
-
   emit({ type: "stage", id: "checking", label: "Checking evidence", status: "done" });
+  // T51.6 — the whole-answer net is a SIGNAL, not a retraction. It used to return early
+  // here with `discarded: true` and no surviving text, and the client replaced the entire
+  // streamed answer with the fallback string — so a user watched a correct answer appear
+  // and then be wiped. That contradicted this route's own rule (step 7 above: "text is
+  // never displayed transiently only to be yanked back"), and it was wrong on the merits:
+  // per-sentence Gate 2 already refused to display any sentence whose tag didn't resolve,
+  // so what is on screen is grounded by construction. Retracting it destroyed correct work
+  // to punish sentences the user never saw. Production bore that out — 24 of 25 discards
+  // were formatting artifacts, not fabrications (see PLAN.md T51).
+  //
+  // The flag still rides along: the client keeps the streamed sentences and shows the
+  // caution beneath them, and shows the fallback ALONE only when nothing survived (a truly
+  // degenerate generation, e.g. the logged one that emitted "<pad><pad><pad>"). Logging is
+  // unchanged, so the discard rate stays measurable in `query_log`.
   emit({
     type: "done", records: shortlistIds, relaxedFilters: select.relaxedFilters,
     strippedFraction: entailment.strippedFraction,
+    ...(entailment.decision === "discard_over_threshold"
+      ? { discarded: true, finalAnswerFallback: entailmentDiscardedMessage() }
+      : {}),
   });
 }

@@ -107,7 +107,11 @@ export function Turn({ turn, focusIndex }: { turn: TurnData; focusIndex?: number
         {/* The prose. It is always visible — the view control below switches what
             accompanies it, never whether the answer itself is on screen. */}
         <div className="leading-relaxed">
-          {turn.discarded ? (
+          {/* T51.6 — a discard used to replace the whole answer with `fallbackMessage`,
+              wiping sentences the user had already read. Every sentence on screen cleared
+              per-sentence Gate 2 before it was ever shown, so it stays; the caution goes
+              below it. The fallback stands alone only when nothing survived. */}
+          {turn.discarded && turn.segments.length === 0 ? (
             <p className="text-[var(--text-mid)]">{turn.fallbackMessage}</p>
           ) : (
             <p>
@@ -129,6 +133,13 @@ export function Turn({ turn, focusIndex }: { turn: TurnData; focusIndex?: number
             </p>
           )}
         </div>
+
+        {turn.discarded && turn.segments.length > 0 && (
+          <p className="mono mt-3 text-xs text-[var(--partial)]">
+            ◐ Part of this answer couldn&apos;t be tied back to a confirmed field and was left
+            out — read it alongside the records.
+          </p>
+        )}
 
         {turn.status === "stopped" && (
           <p className="mono mt-3 text-xs text-[var(--partial)]">
