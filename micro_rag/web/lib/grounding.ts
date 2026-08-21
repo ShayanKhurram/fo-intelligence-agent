@@ -155,7 +155,12 @@ function parseTagBody(body: string): TagPair[] | null {
 // "Ltda" (Brazilian) added after production split "Specifically, Turim 21 Investimentos
 // Ltda." off its own sentence — `\bLtd\.` cannot match it, since the "a" sits between.
 // Longer forms must precede their own prefixes for the same reason.
-const ABBREVIATIONS = ["Inc", "Ltda", "Ltd", "Corp", "Co", "LLC", "L.P", "LP", "L.L.C", "N.A", "S.A", "plc", "Pte", "Cos", "Bros", "St", "U.S", "No"];
+// T52.8 — personal titles belong here too. Production split "Joe Bauers, Managing Partner
+// Sr. Financial Advisor [x:principal_name]." at the "Sr.", stripped the half carrying the
+// NAME as untagged, and showed the user the decision-maker as "Financial Advisor". That is
+// text corruption, not just a scoring artifact, so these guard the displayed answer.
+const ABBREVIATIONS = ["Inc", "Ltda", "Ltd", "Corp", "Co", "LLC", "L.P", "LP", "L.L.C", "N.A", "S.A", "plc", "Pte", "Cos", "Bros", "St", "U.S", "No",
+  "Sr", "Jr", "Mrs", "Mr", "Ms", "Dr", "Prof"];
 
 // A sentence that explicitly declines to assert an unknown fact ("... has not been
 // confirmed", "no email is available") is GOOD grounding, not a fabrication. It carries no
@@ -200,6 +205,92 @@ const NON_CLAIM_RE = new RegExp(
 // ("Canopy Partners has AUM of $640,000,000.") ends in a period and still needs its tag.
 const LIST_HEADER_RE = /:\s*$/;
 
+// T52.2 — the marker of text that ASSERTS something checkable. A dollar sign, a year, a
+// percentage, a comma-grouped figure, or a scaled amount. It is the safety guard on both
+// exemptions below: a markdown heading is only scaffolding while it carries none of these
+// ("## Tier 1 — Signals" is structure; "## Canopy Partners — $640M AUM" is a claim wearing
+// a heading), and no segment carrying one can ever be treated as authorial advice.
+// Exported so the replay harness can assert the safety property directly against the real
+// regex rather than against a copy of it that could drift.
+export const FACTUAL_TOKEN_RE =
+  /\$|\b\d{4}\b|\d+(?:\.\d+)?\s*%|\b\d{1,3}(?:,\d{3})+\b|\b\d+(?:\.\d+)?\s*(?:million|billion|trillion|bn|mm|k)\b/i;
+
+// Pure markdown scaffolding, line by line. `#` headings, thematic rules, the delimiter row
+// of a table, and a list marker left alone on its line assert nothing at all.
+const ATX_HEADING_RE = /^#{1,6}[ \t]+\S/;
+const THEMATIC_RULE_RE = /^(?:-{3,}|\*{3,}|_{3,})$/;
+const TABLE_DELIM_RE = /^\|[\s|:-]*-[\s|:-]*\|?$/;
+const BARE_MARKER_RE = /^(?:\*\*|__|\*)?\s*(?:\d+[.)]|[-*•])\s*(?:\*\*|__)?$/;
+
+function isStructuralLine(line: string): boolean {
+  const t = line.trim();
+  return t.length === 0 || ATX_HEADING_RE.test(t) || THEMATIC_RULE_RE.test(t)
+    || TABLE_DELIM_RE.test(t) || BARE_MARKER_RE.test(t);
+}
+
+/** Scaffolding that is ALSO free of any assertion. The FACTUAL_TOKEN guard has to travel
+ * with the line, not just the segment: without it a heading carrying a figure
+ * ("## Canopy Partners — $640M AUM") satisfies the hedge rule below as a "structural" line
+ * and is waved through as neutral — the exact hole T52.3 closes for tables. */
+function isScaffoldLine(line: string): boolean {
+  return isStructuralLine(line) && !FACTUAL_TOKEN_RE.test(line);
+}
+
+// T52.3 — a hedge is judged PER LINE. As a whole-segment substring test this was a
+// grounding hole: the 805-char summary table in production id 315 held five untagged
+// factual rows ("Closed $20M Series A raise") and one cell reading "No confirmed investment
+// signal", and that single phrase classified the entire table `neutral` — shipping five
+// uncited assertions to the user as verified prose.
+function isHedgeLine(line: string): boolean {
+  const t = line.trim();
+  return NON_CLAIM_RE.test(t) || LIST_HEADER_RE.test(t);
+}
+
+// T52.4 — advice and draft outreach copy. Corpus-wide this is ~60% of everything Gate 2
+// stripped ("Lead with a crypto-aligned fund thesis", "I am reaching out to see if you are
+// seeking new opportunities"). It asserts nothing about the corpus, so it CANNOT carry a
+// [record:field] tag, and Gate 2's binary ontology therefore classified the very thing the
+// user asked for — a sales strategy — as fabrication.
+const FIRST_SECOND_PERSON_RE = /\b(I|we|our|us|my|me|you|your|yours)\b/i;
+const IMPERATIVE_OPENER_RE = new RegExp(
+  "^(lead|position|reference|treat|approach|use|start|open|frame|pitch|emphasi[sz]e|target|" +
+  "prioriti[sz]e|focus|consider|highlight|mention|offer|propose|send|schedule|follow|build|" +
+  "keep|avoid|present|tailor|anchor|align|introduce|explore|engage|nurture|reach|ask|invite)\\b",
+  "i"
+);
+// The needle test below can only recognise a record by its FIELD VALUES, and `provenance`
+// carries no entity-name field — the firm's own name is never in `facts`. The replay
+// harness caught the consequence: "**Nolet Wealth Management, LLC** — target if your
+// startup is an AI infrastructure company" reads as advice, contains no figure and no fact
+// value, and was classified authorial while naming a specific firm. A corporate suffix is
+// the reliable signal for that in this domain. Deliberately case-SENSITIVE: lowercase
+// "capital", "management" and "group" are ordinary words in advice, while the capitalised
+// forms are how an organisation gets named.
+// Exported alongside FACTUAL_TOKEN_RE so the replay harness asserts the safety property
+// against the real patterns rather than against copies that could drift.
+export const ORG_NAME_RE =
+  /\b(LLC|L\.L\.C|Inc|Incorporated|Corp|Corporation|LP|L\.P|LLP|PLC|Trust|Capital|Partners|Advisors|Advisers|Management|Holdings|Ventures|Group|Associates|Foundation|Endowment|Family Office|Wealth)\b/;
+
+// Advice routinely arrives wearing a list marker and a bold label ("- **Strategy:** Lead
+// with ..."), which would hide the imperative from an anchored test.
+function stripLeadIn(text: string): string {
+  return text.replace(/^[\s>]*(?:[-*•]|\d+[.)])?[ \t]*(?:(?:\*\*|__)[^*_\n]{0,40}(?:\*\*|__)[ \t]*:?[ \t]*)?/, "");
+}
+
+/** Every fact value long enough to be a name, lowercased — the "does this sentence talk
+ * about a record?" test for T52.4. Substring matching is deliberate: it is the clause that
+ * keeps a fabricated claim about a real entity out of the authorial bucket. */
+function factValueNeedles(facts: RecordFacts): string[] {
+  const needles: string[] = [];
+  for (const fields of Object.values(facts)) {
+    for (const fact of Object.values(fields)) {
+      const v = String(fact.value ?? "").trim().toLowerCase();
+      if (v.length >= 4) needles.push(v);
+    }
+  }
+  return needles;
+}
+
 export type EntailmentResult = {
   finalAnswer: string;
   strippedSentences: { sentence: string; reason: string }[];
@@ -223,9 +314,18 @@ const DOT_SENTINEL = String.fromCharCode(0);
  * Pulls a tag that trails sentence-ending punctuation back INSIDE the sentence (before
  * the punctuation), so "FACT. [tag]" becomes "FACT [tag]." and the tag stays with the
  * sentence it annotates. Exported so the SSE route can normalize a streaming buffer the
- * same way before probing it for a finished sentence. */
+ * same way before probing it for a finished sentence.
+ *
+ * T52.7 — this matched ONE trailing tag. The model routinely cites two fields for one
+ * sentence ("...Managing Partner and Founder. [a:principal_name] [a:principal_title]"), so
+ * the second tag was left stranded after the period and split off into a segment of its
+ * own: text-free, `display` empty, yet classified a valid `claim` — five of them in
+ * production id 315, each emitting an EMPTY claim pill into the UI. Match the whole RUN. */
 export function normalizeTagPosition(text: string): string {
-  return text.replace(/([.!?])(\s*)(\[[^\]]+\])/g, " $3$1");
+  // The run must END on a tag, never on the whitespace after one: consuming that trailing
+  // space welded "…[a:x]. Beta followed" into "….Beta followed", destroying the very
+  // sentence boundary this function exists to protect.
+  return text.replace(/([.!?])[ \t]*((?:\[[^\]]+\][ \t]*)*\[[^\]]+\])/g, (_m, punct: string, tags: string) => ` ${tags}${punct}`);
 }
 
 /** Exported so the SSE route can split a live streaming buffer using the exact same
@@ -248,14 +348,23 @@ export function splitSentences(text: string): string[] {
   // The `**` allowance is not decoration: the model routinely bolds its list markers
   // ("**1.** Nolet Wealth Management"), and without it the marker is not at line start,
   // the guard misses, and the phantom-sentence bug comes straight back for that answer.
-  guarded = guarded.replace(/(^|\n)([ \t]*(?:\*\*|__|\*)?\s*\d+)\.(?=\s|\*)/g, `$1$2${DOT_SENTINEL}`);
+  // T52.1 — the prefix alternation had no room for an ATX heading, so the ordinal in
+  // "### 2. Witter Family Office" was unguarded: it split at its own period, leaving "### 2."
+  // and the orphaned entity name as two untagged segments. Two phantom strips per heading,
+  // ten in production id 315.
+  guarded = guarded.replace(/(^|\n)([ \t]*(?:#{1,6}[ \t]*)?(?:\*\*|__|\*)?\s*\d+)\.(?=\s|\*)/g, `$1$2${DOT_SENTINEL}`);
   return guarded
-    // Two kinds of boundary: sentence-ending punctuation, and the newline before a list
-    // marker. The second is what keeps a header and its first item apart now that the
-    // marker's own period no longer splits — and it means a list item with no terminal
+    // Two kinds of boundary: sentence-ending punctuation, and the newline before a line that
+    // opens a new block. The second is what keeps a header and its first item apart now that
+    // the marker's own period no longer splits — and it means a list item with no terminal
     // punctuation is still its own sentence rather than being glued to the next one.
     // `\d+[.)\0]` matches a marker whose period is already sentinel-guarded above.
-    .split(/(?<=[.!?])\s+|\n+(?=[ \t]*(?:(?:\*\*|__|\*)?\s*\d+[.)\0]|[-*•]\s))/)
+    //
+    // T52.1 adds three block openers to that lookahead: a heading, a thematic rule, and a
+    // table row. Without them markdown structure accreted onto the prose next to it — one
+    // production segment was "---\n\n## Tier 1 — Signals\n\n### 1." — and the table row
+    // boundary is load-bearing for T52.3, which judges a hedge line by line.
+    .split(/(?<=[.!?])\s+|\n+(?=[ \t]*(?:#{1,6}[ \t]|(?:-{3,}|\*{3,}|_{3,})[ \t]*$|\||(?:\*\*|__|\*)?\s*\d+[.)\0]|[-*•]\s))/m)
     .map((s) => s.split(DOT_SENTINEL).join("."))
     .filter((s) => s.trim().length > 0);
 }
@@ -263,6 +372,12 @@ export function splitSentences(text: string): string[] {
 export type SentenceCheck =
   | { kind: "claim"; display: string; recordId: string; field: string; value: string; status: string }
   | { kind: "neutral"; display: string }
+  // T52.2/T52.4 — the two kinds Gate 2 previously had no name for, and so called
+  // fabrication. `structural` is markdown scaffolding (rendered by nothing, since the UI
+  // draws flat prose) and `authorial` is the model's own advice. Both are excluded from the
+  // groundedness score: neither makes an assertion about the corpus that could be false.
+  | { kind: "structural" }
+  | { kind: "authorial"; display: string }
   | { kind: "invalid"; reason: string };
 
 /** The per-sentence half of Gate 2, factored out so both the final whole-answer
@@ -283,14 +398,42 @@ export function checkSentence(sentence: string, facts: RecordFacts): SentenceChe
     .replace(/\s+([.,;:!?])/g, "$1")
     .trim();
 
+  // T52.7 fallout: a segment that is nothing but citation tags has no text to ground. It is
+  // an artifact of tag placement, not a claim — never a pill, never a strip.
+  if (display.length === 0) return { kind: "structural" };
+
+  const lines = sentence.split("\n").filter((l) => l.trim().length > 0);
+  const hasFactualToken = FACTUAL_TOKEN_RE.test(sentence);
+
   if (tags.length === 0) {
+    // Pure scaffolding. The FACTUAL_TOKEN guard is what stops a claim from hiding inside a
+    // heading: "## Tier 1 — Signals" is structure, "## Canopy Partners — $640M AUM" is not.
+    if (!hasFactualToken && lines.every(isStructuralLine)) return { kind: "structural" };
+
     // An explicit "we don't know this", and a list header that only introduces the
     // sentences below it, are honest non-claims — kept in the answer but they carry no
-    // pill and aren't counted toward the strip threshold; anything else untagged is a
-    // fabrication risk and gets stripped.
-    if (NON_CLAIM_RE.test(sentence) || LIST_HEADER_RE.test(sentence.trim())) {
+    // pill and aren't counted toward the strip threshold. T52.3: EVERY line must be a hedge
+    // (or scaffolding), so one honest phrase can no longer whitewash a block of untagged
+    // assertions sitting beside it.
+    if (lines.every((l) => isHedgeLine(l) || isScaffoldLine(l))) {
       return { kind: "neutral", display };
     }
+
+    // T52.4 — the model's own advice. Every clause of this conjunction is a safety
+    // property, not a stylistic preference: a fabricated fact about a family office
+    // necessarily names one or states a figure, so it cannot reach this branch. Widening
+    // any single clause to make a stubborn corpus case pass would open the hole this gate
+    // exists to close.
+    if (
+      !hasFactualToken &&
+      !/\bdisc_[0-9a-f]+\b/i.test(sentence) &&
+      !ORG_NAME_RE.test(sentence) &&
+      !factValueNeedles(facts).some((n) => sentence.toLowerCase().includes(n)) &&
+      (FIRST_SECOND_PERSON_RE.test(sentence) || IMPERATIVE_OPENER_RE.test(stripLeadIn(sentence.trim())))
+    ) {
+      return { kind: "authorial", display };
+    }
+
     return { kind: "invalid", reason: "untagged" };
   }
 
@@ -330,22 +473,30 @@ export function verifyEntailment(rawAnswer: string, facts: RecordFacts): Entailm
   const sentences = splitSentences(normalized);
   const kept: string[] = [];
   const stripped: { sentence: string; reason: string }[] = [];
-  let neutralCount = 0;
+  let claimChars = 0;
+  let strippedChars = 0;
 
   for (const sentence of sentences) {
     const check = checkSentence(sentence, facts);
     if (check.kind === "invalid") {
       stripped.push({ sentence, reason: check.reason });
+      strippedChars += sentence.trim().length;
       continue;
     }
-    if (check.kind === "neutral") neutralCount++;
+    // Scaffolding is dropped rather than kept: `components/Turn.tsx` renders flat prose, so
+    // a surviving "---" or "### 2." would reach the user as literal punctuation.
+    if (check.kind === "structural") continue;
+    if (check.kind === "claim") claimChars += check.display.length;
     kept.push(sentence);
   }
 
-  // Denominator is claim-bearing sentences only (total minus honest non-claims) — a summary
-  // that's mostly "field X not confirmed" shouldn't trip the discard threshold on its honesty.
-  const claimSentences = sentences.length - neutralCount;
-  const strippedFraction = claimSentences > 0 ? stripped.length / claimSentences : 0;
+  // T52.5 — weigh CHARACTERS, not segments. Counting segments let a 6-char "### 2." outvote
+  // a 272-char cited claim, and the finer splitting introduced in T51 mechanically inflated
+  // the count on well-formatted answers: production id 315 scored 0.48 by segment count and
+  // 0.22 by mass, on identical text with identical citations. Only claim and invalid text is
+  // weighed; hedges, scaffolding and advice assert nothing and belong in neither term.
+  const denominator = claimChars + strippedChars;
+  const strippedFraction = denominator > 0 ? strippedChars / denominator : 0;
   const decision: "proceed" | "discard_over_threshold" = strippedFraction > 0.3 ? "discard_over_threshold" : "proceed";
 
   // T51.6 — `finalAnswer` is now always the sentences that survived, whatever the verdict.

@@ -246,7 +246,9 @@ test("DOT_SENTINEL is a control character, not a space", () => {
 });
 
 test("the threshold denominator excludes neutrals", () => {
-  // 1 claim + 1 stripped + 3 neutrals -> 1/2, not 1/5.
+  // 1 claim + 1 stripped + 3 neutrals. T52.5 weighs CHARACTERS, so this is the stripped
+  // sentence's length over (claim display + stripped) — but the three neutrals must still
+  // contribute to neither term, which is what this test has always been about.
   const answer = [
     "Alpha has AUM of $1.2B. [rec_a:aum_usd]",
     "Beta is in Texas.",
@@ -255,5 +257,207 @@ test("the threshold denominator excludes neutrals", () => {
     "Matching offices:",
   ].join("\n");
   const result = verifyEntailment(answer, FACTS);
-  assert.equal(result.strippedFraction, 0.5);
+  const claimChars = "Alpha has AUM of $1.2B.".length;
+  const strippedChars = "Beta is in Texas.".length;
+  assert.equal(result.strippedFraction, strippedChars / (claimChars + strippedChars));
+  assert.equal(result.strippedSentences.length, 1);
+});
+
+// ============================================================ T52: the segment ontology
+//
+// Production id 315 ("design me a sales strategy for top 5 MFOs") generated a complete,
+// well-cited answer and had it replaced by the fallback string. Replaying all 258 logged
+// answers showed the cause was not one bug but a metric and an ontology: Gate 2 scored
+// groundedness by COUNTING segments, and had only two categories — cited claim, or honest
+// hedge — so markdown scaffolding and the model's own advice were both classified as
+// fabrication. 60% of everything Gate 2 stripped corpus-wide was advice or outreach copy.
+
+// ------------------------------------------------------------------- T52.1 heading splits
+
+test("T52.1: an ATX heading keeps its ordinal and its entity name in one segment", () => {
+  // "### 2. Witter Family Office" used to split at the marker's period, yielding "### 2."
+  // and an orphaned name — two phantom untagged strips per heading, ten in id 315.
+  const segments = splitSentences("---\n\n## Tier 1 — Signals\n\n### 2. Witter Family Office\n");
+  assert.deepEqual(segments.map((s) => s.trim()), [
+    "---",
+    "## Tier 1 — Signals",
+    "### 2. Witter Family Office",
+  ]);
+});
+
+test("T52.1: a table row opens a new segment", () => {
+  const segments = splitSentences("Summary follows.\n| Rank | Entity |\n|---|---|\n| 1 | Alpha |");
+  assert.equal(segments.length, 4);
+});
+
+// ------------------------------------------------------------------ T52.2 structural kind
+
+test("T52.2: pure markdown scaffolding is structural, not a failed claim", () => {
+  for (const scaffold of ["### 2. Witter Family Office", "---", "| --- | --- |", "2.", "## Tier 1 — Signals"]) {
+    assert.equal(checkSentence(scaffold, FACTS).kind, "structural", scaffold);
+  }
+});
+
+test("T52.2: a claim wearing a heading is NOT structural", () => {
+  // The FACTUAL_TOKEN guard is the whole safety property of the structural exemption.
+  assert.equal(checkSentence("## Canopy Partners — $640M AUM", FACTS).kind, "invalid");
+  assert.equal(checkSentence("### Alpha raised 1,200,000 in 2024", FACTS).kind, "invalid");
+});
+
+test("T52.2: structural segments never reach strippedSentences", () => {
+  const result = verifyEntailment("---\n\n## Tier 1 — Signals\n\nAlpha has AUM of $1.2B. [rec_a:aum_usd]", FACTS);
+  assert.equal(result.strippedSentences.length, 0);
+  assert.equal(result.strippedFraction, 0);
+  assert.equal(result.decision, "proceed");
+});
+
+// --------------------------------------------------------------- T52.3 per-line hedging
+
+test("T52.3: one honest phrase cannot whitewash a block of untagged assertions", () => {
+  // The 805-char summary table in id 315 was classified `neutral` — and shipped to the user
+  // as verified prose — because a single cell read "No confirmed investment signal".
+  const table = [
+    "| Rank | Entity | Signal |",
+    "|---|---|---|",
+    "| 1 | Alpha Capital | Closed $20M Series A raise |",
+    "| 2 | Beta Partners | No confirmed investment signal |",
+  ].join("\n");
+  assert.equal(checkSentence(table, FACTS).kind, "invalid");
+});
+
+test("T52.3: a genuine one-line hedge is still neutral", () => {
+  assert.equal(checkSentence("No record lists a New York location.", FACTS).kind, "neutral");
+  assert.equal(checkSentence("The principal email has not been confirmed.", FACTS).kind, "neutral");
+  assert.equal(checkSentence("The following family offices have confirmed AUM:", FACTS).kind, "neutral");
+});
+
+// -------------------------------------------------------------------- T52.4 authorial kind
+
+test("T52.4: advice and outreach copy are authorial, not fabrication", () => {
+  for (const advice of [
+    "Lead with a crypto/blockchain-aligned fund thesis.",
+    "- **Strategy:** Lead with a crypto/blockchain-aligned fund thesis.",
+    "I am reaching out to see if you are currently seeking new opportunities.",
+    "Treat as a long-term relationship-building target rather than an immediate pitch.",
+    "Position your fund as a deployment vehicle for the raised capital.",
+  ]) {
+    assert.equal(checkSentence(advice, FACTS).kind, "authorial", advice);
+  }
+});
+
+test("T52.4: a fabricated fact can never reach the authorial bucket", () => {
+  // Each of these trips exactly one clause of the conjunction. This is the assertion that
+  // must never be relaxed to make a stubborn corpus case pass.
+  const facts: RecordFacts = {
+    ...FACTS,
+    rec_a: { ...FACTS.rec_a, entity_name: { value: "Alpha Capital", status: "confirmed" } },
+  };
+  for (const s of [
+    "Consider Alpha Capital, which invests in real estate.",   // names a fact value
+    "Focus on offices that raised $20M last year.",            // FACTUAL_TOKEN
+    "Target the office in disc_ff776af687f88bde.",             // disc_ id
+    "Alpha Capital is the strongest match for your round.",    // names a fact value
+    "You should approach the office with 1,200,000,000 AUM.",  // comma-grouped figure
+  ]) {
+    assert.equal(checkSentence(s, facts).kind, "invalid", s);
+  }
+});
+
+test("T52.4: authorial text is kept in the answer and scored in neither term", () => {
+  // NB "generalist" is deliberately avoided here: it is the literal value of rec_a's
+  // investing_thesis, so advice mentioning it correctly falls OUT of the authorial bucket.
+  const answer = [
+    "Alpha has AUM of $1.2B. [rec_a:aum_usd]",
+    "Keep your first call short and follow up within the week.",
+  ].join("\n");
+  const result = verifyEntailment(answer, FACTS);
+  assert.equal(result.strippedFraction, 0);
+  assert.equal(result.decision, "proceed");
+  assert.match(result.finalAnswer, /Keep your first call short/);
+});
+
+test("T52.4: advice that names an ORGANISATION is NOT authorial", () => {
+  // `provenance` has no entity-name field, so the fact-value needles cannot see a firm's own
+  // name. The replay harness caught this live on production id 295. A corporate suffix is
+  // the signal that stands in for it.
+  for (const s of [
+    "**Nolet Wealth Management, LLC** — target if your startup is an AI infrastructure company.",
+    "Approach Crescent Grove Advisors with a water-adjacent thesis.",
+    "You should start with the Witter Family Office.",
+    "Consider Canopy Partners for your next round.",
+  ]) {
+    assert.equal(checkSentence(s, FACTS).kind, "invalid", s);
+  }
+});
+
+test("T52.4: advice that names a corpus value is NOT authorial", () => {
+  // The needle test is a safety clause, and it fires on advice too. That is the intended
+  // trade: a sentence that reaches into the corpus must cite it, whatever its mood.
+  assert.equal(checkSentence("Lead with a generalist thesis.", FACTS).kind, "invalid");
+});
+
+// ------------------------------------------------------------------- T52.5 mass weighting
+
+test("T52.5: a six-character fragment cannot outvote a long cited claim", () => {
+  // The count-based metric scored this 1/2 = 0.5 and discarded the answer.
+  const answer = [
+    "Alpha Capital has confirmed assets under management of $1,200,000,000 as of the most recent filing. [rec_a:aum_usd]",
+    "Beta is in Texas.",
+  ].join("\n");
+  const result = verifyEntailment(answer, FACTS);
+  assert.ok(result.strippedFraction < 0.3, `expected < 0.3, got ${result.strippedFraction}`);
+  assert.equal(result.decision, "proceed");
+  assert.equal(result.strippedSentences.length, 1);   // still stripped, just not decisive
+});
+
+test("T52.5: a mostly-ungrounded answer is still discarded", () => {
+  const answer = [
+    "Alpha has AUM of $1.2B. [rec_a:aum_usd]",
+    "Beta Partners manages a substantial real estate portfolio across the southwest.",
+    "Gamma Trust has been investing in private credit since the early part of the decade.",
+  ].join("\n");
+  const result = verifyEntailment(answer, FACTS);
+  assert.equal(result.decision, "discard_over_threshold");
+});
+
+// ------------------------------------------------------------- T52.7 multi-tag sentences
+
+test("T52.7: every tag in a trailing run stays with its sentence", () => {
+  assert.equal(
+    normalizeTagPosition("Sherry Witter, Managing Partner and Founder. [rec_a:aum_usd] [rec_a:investing_thesis]"),
+    "Sherry Witter, Managing Partner and Founder [rec_a:aum_usd] [rec_a:investing_thesis]."
+  );
+  // ...and the boundary to the NEXT sentence survives (the run must not eat the space).
+  assert.equal(
+    normalizeTagPosition("Alpha committed $40M. [rec_a:aum_usd] Beta followed. [rec_b:aum_usd]"),
+    "Alpha committed $40M [rec_a:aum_usd]. Beta followed [rec_b:aum_usd]."
+  );
+});
+
+test("T52.7: no segment is ever a valid claim with empty display text", () => {
+  const answer = "Sherry Witter, Managing Partner and Founder. [rec_a:aum_usd] [rec_a:investing_thesis]";
+  for (const segment of splitSentences(normalizeTagPosition(answer))) {
+    const check = checkSentence(segment, FACTS);
+    if (check.kind === "claim") assert.ok(check.display.length > 0, `empty claim pill from ${JSON.stringify(segment)}`);
+  }
+  // A tag stranded on its own is scaffolding, never a pill.
+  assert.equal(checkSentence("[rec_a:aum_usd]", FACTS).kind, "structural");
+});
+
+// ------------------------------------------------------------ T52.8 personal-title splits
+
+test("T52.8: a personal title does not split a name off its own sentence", () => {
+  for (const [title, sentence] of [
+    ["Sr", "Joe Bauers, Managing Partner Sr. Financial Advisor [rec_a:aum_usd]."],
+    ["Dr", "Contact Dr. Alice Ray [rec_a:aum_usd]."],
+    ["Mr", "Reach out to Mr. Ogle [rec_a:aum_usd]."],
+    ["Mrs", "Reach out to Mrs. Ogle [rec_a:aum_usd]."],
+    ["Ms", "Reach out to Ms. Ogle [rec_a:aum_usd]."],
+    ["Jr", "Contact David Dahl Jr. at the Reno office [rec_a:aum_usd]."],
+    ["Prof", "Contact Prof. Ada Lovelace [rec_a:aum_usd]."],
+  ] as [string, string][]) {
+    const segments = splitSentences(normalizeTagPosition(sentence));
+    assert.equal(segments.length, 1, `${title}: split into ${JSON.stringify(segments)}`);
+    assert.equal(checkSentence(segments[0], FACTS).kind, "claim", title);
+  }
 });

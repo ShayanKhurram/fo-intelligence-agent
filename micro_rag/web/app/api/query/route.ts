@@ -254,9 +254,14 @@ async function runQuery(query: string, overrideFilters: ParsedFilters | undefine
           type: "claim_verified",
           claim: { sentence: check.display, recordId: check.recordId, field: check.field, value: check.value, status: check.status },
         });
-      } else if (check.kind === "neutral") {
+      } else if (check.kind === "neutral" || check.kind === "authorial") {
+        // T52.4 — advice ("Lead with a crypto-aligned thesis") reaches the reader as prose
+        // with no claim pill, exactly like an honest "not confirmed". It asserts nothing
+        // about a record, so there is nothing for a pill to point at.
         emit({ type: "token", text: check.display, kind: "neutral" });
       }
+      // "structural" is markdown scaffolding — dropped silently, since this UI renders flat
+      // prose and a literal "---" or "### 2." would only be noise.
       // "invalid" sentences are the whole point of Gate 2: never shown, silently dropped.
       finalizedCount++;
     }
